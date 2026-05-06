@@ -1,5 +1,5 @@
-# Gemini Briefing: 4× ADAU1978 — 16ch TDM Receiver on Cyclone IV FPGA
-### Full project context + step-by-step test plan — paste this into Gemini
+# 4× ADAU1978 — 16ch TDM Receiver on Cyclone IV FPGA
+### Full project context + step-by-step test plan
 
 ---
 

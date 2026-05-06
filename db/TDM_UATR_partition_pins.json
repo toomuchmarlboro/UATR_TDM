@@ -1,0 +1,25 @@
+{
+	"partitions" : [
+		{
+			"name" : "Top",
+			"pins" : [
+				{
+					"name" : "pass_led",
+					"strict" : false
+				},
+				{
+					"name" : "fail_led",
+					"strict" : false
+				},
+				{
+					"name" : "clk_18m432",
+					"strict" : false
+				},
+				{
+					"name" : "rst_n",
+					"strict" : false
+				}
+			]
+		}
+	]
+}

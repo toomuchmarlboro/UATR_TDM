@@ -1,0 +1,134 @@
+m255
+K4
+z2
+13
+!s112 1.1
+!i10d 8192
+!i10e 25
+!i10f 100
+cModel Technology
+Z0 dC:/Users/LENOVO THINKPAD T14/Documents/TDM_UATR
+Etb_tdm8_rx
+Z1 w1778048314
+Z2 DPx4 ieee 11 numeric_std 0 22 :ASDNFgHXf_ih3J@9F3Ze1
+Z3 DPx3 std 6 textio 0 22 zE1`LPoLg^DX3Oz^4Fj1K3
+Z4 DPx4 ieee 14 std_logic_1164 0 22 eNV`TJ_GofJTzYa?f<@Oe1
+R0
+Z5 8tb_tdm8_rx.vhd
+Z6 Ftb_tdm8_rx.vhd
+l0
+L5
+V98D4lNa<CiGESVdOlFP1>3
+!s100 ?5YSVVFEG7TzV?6n5hQdJ1
+Z7 OV;C;10.5b;63
+32
+Z8 !s110 1778048474
+!i10b 1
+Z9 !s108 1778048474.000000
+Z10 !s90 -reportprogress|300|-work|work|tb_tdm8_rx.vhd|
+Z11 !s107 tb_tdm8_rx.vhd|
+!i113 1
+Z12 o-work work
+Z13 tExplicit 1 CvgOpt 0
+Asim
+Z14 DPx3 std 3 env 0 22 d?`1ck@NdeD@H3RZG7FgZ2
+R2
+R3
+R4
+Z15 DEx4 work 10 tb_tdm8_rx 0 22 98D4lNa<CiGESVdOlFP1>3
+l52
+L8
+Z16 VbAOhXlOd[f9f0HMJhjz9Q3
+Z17 !s100 oOkCV`miY[M<WkGCQn?S<1
+R7
+32
+R8
+!i10b 1
+R9
+R10
+R11
+!i113 1
+R12
+R13
+Etdm8_master
+Z18 w1778048318
+R2
+R3
+R4
+R0
+Z19 8tdm8_master.vhd
+Z20 Ftdm8_master.vhd
+l0
+L5
+V4XX__21]=oLcY^c206C9>3
+!s100 9;iZQ]c7:<5O<XH^<LGnc3
+R7
+32
+R8
+!i10b 1
+R9
+Z21 !s90 -reportprogress|300|-work|work|tdm8_master.vhd|
+Z22 !s107 tdm8_master.vhd|
+!i113 1
+R12
+R13
+Artl
+R2
+R3
+R4
+DEx4 work 11 tdm8_master 0 22 4XX__21]=oLcY^c206C9>3
+l17
+L14
+V:[XMh4aidn?@Ha29<6[Qg0
+!s100 DT8T1Qa0fhHBPUF7S[7GO0
+R7
+32
+R8
+!i10b 1
+R9
+R21
+R22
+!i113 1
+R12
+R13
+Etdm8_rx
+Z23 w1778048316
+R2
+R3
+R4
+R0
+Z24 8tdm8_rx.vhd
+Z25 Ftdm8_rx.vhd
+l0
+L5
+VWVDGiSTYBZS6480Whj<jM2
+!s100 2[4bo_bWc>=Rk4f5=kmU03
+R7
+32
+R8
+!i10b 1
+R9
+Z26 !s90 -reportprogress|300|-work|work|tdm8_rx.vhd|
+Z27 !s107 tdm8_rx.vhd|
+!i113 1
+R12
+R13
+Artl
+R2
+R3
+R4
+DEx4 work 7 tdm8_rx 0 22 WVDGiSTYBZS6480Whj<jM2
+l18
+L15
+VTRO;AgnH;8SU0^Yah1]6D3
+!s100 :QAUMdXN6fYW5CA00@B?K2
+R7
+32
+R8
+!i10b 1
+R9
+R26
+R27
+!i113 1
+R12
+R13

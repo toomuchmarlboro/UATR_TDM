@@ -320,7 +320,7 @@ Write [chip_addr, 0x00, 0x01]   — PWUP=1  (LAST)
 
 ---
 
-## Key Rules for AI Agents
+## Key Rules:
 
 Always keep these in mind when helping with this project:
 

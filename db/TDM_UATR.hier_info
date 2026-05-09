@@ -1,5 +1,7 @@
 |top_loopback
 clk_18m432 => tdm8_master:u_tdm_master.clk_in
+clk_18m432 => seven_seg_driver:u_display.clk
+rst_n => seven_seg_driver:u_display.rst_n
 rst_n => fail_reg.ACLR
 rst_n => pass_reg.ACLR
 rst_n => startup_ignore[0].ACLR
@@ -32,6 +34,14 @@ rst_n => expected_count[20].ACLR
 rst_n => expected_count[21].ACLR
 rst_n => expected_count[22].ACLR
 rst_n => expected_count[23].ACLR
+rst_n => tx_bit_cnt[0].ACLR
+rst_n => tx_bit_cnt[1].ACLR
+rst_n => tx_bit_cnt[2].ACLR
+rst_n => tx_bit_cnt[3].ACLR
+rst_n => tx_bit_cnt[4].ACLR
+rst_n => tx_bit_cnt[5].ACLR
+rst_n => tx_bit_cnt[6].ACLR
+rst_n => tx_bit_cnt[7].ACLR
 rst_n => frame_counter[0].ACLR
 rst_n => frame_counter[1].ACLR
 rst_n => frame_counter[2].ACLR
@@ -251,8 +261,20 @@ rst_n => tx_shift_reg[191].ACLR
 rst_n => tdm8_master:u_tdm_master.rst
 rst_n => tdm8_rx:u_tdm_rx.rst
 rst_n => lrclk_prev.ENA
-pass_led << pass_reg.DB_MAX_OUTPUT_PORT_TYPE
-fail_led << fail_reg.DB_MAX_OUTPUT_PORT_TYPE
+pass_led <= pass_reg.DB_MAX_OUTPUT_PORT_TYPE
+fail_led <= fail_reg.DB_MAX_OUTPUT_PORT_TYPE
+dig[0] <= seven_seg_driver:u_display.dig_sel[0]
+dig[1] <= seven_seg_driver:u_display.dig_sel[1]
+dig[2] <= seven_seg_driver:u_display.dig_sel[2]
+dig[3] <= seven_seg_driver:u_display.dig_sel[3]
+seg[0] <= seven_seg_driver:u_display.seg_out[0]
+seg[1] <= seven_seg_driver:u_display.seg_out[1]
+seg[2] <= seven_seg_driver:u_display.seg_out[2]
+seg[3] <= seven_seg_driver:u_display.seg_out[3]
+seg[4] <= seven_seg_driver:u_display.seg_out[4]
+seg[5] <= seven_seg_driver:u_display.seg_out[5]
+seg[6] <= seven_seg_driver:u_display.seg_out[6]
+seg[7] <= seven_seg_driver:u_display.seg_out[7]
 
 
 |top_loopback|tdm8_master:u_tdm_master
@@ -1245,5 +1267,66 @@ ch_data_out[188] <= ch_data_out[188]~reg0.DB_MAX_OUTPUT_PORT_TYPE
 ch_data_out[189] <= ch_data_out[189]~reg0.DB_MAX_OUTPUT_PORT_TYPE
 ch_data_out[190] <= ch_data_out[190]~reg0.DB_MAX_OUTPUT_PORT_TYPE
 ch_data_out[191] <= ch_data_out[191]~reg0.DB_MAX_OUTPUT_PORT_TYPE
+
+
+|top_loopback|seven_seg_driver:u_display
+clk => refresh_clk.CLK
+clk => clk_div[0].CLK
+clk => clk_div[1].CLK
+clk => clk_div[2].CLK
+clk => clk_div[3].CLK
+clk => clk_div[4].CLK
+clk => clk_div[5].CLK
+clk => clk_div[6].CLK
+clk => clk_div[7].CLK
+clk => clk_div[8].CLK
+clk => clk_div[9].CLK
+clk => clk_div[10].CLK
+clk => clk_div[11].CLK
+clk => clk_div[12].CLK
+clk => clk_div[13].CLK
+clk => clk_div[14].CLK
+rst_n => refresh_clk.ACLR
+rst_n => clk_div[0].ACLR
+rst_n => clk_div[1].ACLR
+rst_n => clk_div[2].ACLR
+rst_n => clk_div[3].ACLR
+rst_n => clk_div[4].ACLR
+rst_n => clk_div[5].ACLR
+rst_n => clk_div[6].ACLR
+rst_n => clk_div[7].ACLR
+rst_n => clk_div[8].ACLR
+rst_n => clk_div[9].ACLR
+rst_n => clk_div[10].ACLR
+rst_n => clk_div[11].ACLR
+rst_n => clk_div[12].ACLR
+rst_n => clk_div[13].ACLR
+rst_n => clk_div[14].ACLR
+rst_n => scan_cnt[0].ACLR
+rst_n => scan_cnt[1].ACLR
+pass_in => seg_out.OUTPUTSELECT
+pass_in => seg_out.OUTPUTSELECT
+pass_in => seg_out.OUTPUTSELECT
+pass_in => Mux5.IN0
+pass_in => Mux7.IN2
+pass_in => Mux8.IN1
+pass_in => Mux9.IN1
+pass_in => Mux10.IN0
+pass_in => Mux10.IN1
+fail_in => seg_out.DATAA
+fail_in => seg_out.DATAA
+fail_in => seg_out.DATAA
+dig_sel[0] <= Mux3.DB_MAX_OUTPUT_PORT_TYPE
+dig_sel[1] <= Mux2.DB_MAX_OUTPUT_PORT_TYPE
+dig_sel[2] <= Mux1.DB_MAX_OUTPUT_PORT_TYPE
+dig_sel[3] <= Mux0.DB_MAX_OUTPUT_PORT_TYPE
+seg_out[0] <= Mux10.DB_MAX_OUTPUT_PORT_TYPE
+seg_out[1] <= Mux9.DB_MAX_OUTPUT_PORT_TYPE
+seg_out[2] <= Mux8.DB_MAX_OUTPUT_PORT_TYPE
+seg_out[3] <= Mux7.DB_MAX_OUTPUT_PORT_TYPE
+seg_out[4] <= Mux6.DB_MAX_OUTPUT_PORT_TYPE
+seg_out[5] <= Mux5.DB_MAX_OUTPUT_PORT_TYPE
+seg_out[6] <= Mux4.DB_MAX_OUTPUT_PORT_TYPE
+seg_out[7] <= <VCC>
 
 

@@ -1,6 +1,6 @@
 # UATR_TDM — 4× ADAU1978 16-Channel TDM Receiver on Cyclone IV FPGA
 
-> **For AI agents:** This document is the single source of truth for this project.
+> **Message for Readers** This document is the single source of truth for this project.
 > Read the full context section before helping with any task.
 > Current status: Steps 1–3 complete. Next task: `top_tdm.vhd` + PLL + pin assignments.
 

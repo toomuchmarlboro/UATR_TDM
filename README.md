@@ -1,5 +1,8 @@
-# 4× ADAU1978 — 16ch TDM Receiver on Cyclone IV FPGA
-### Full project context + step-by-step test plan
+# UATR_TDM — 4× ADAU1978 16-Channel TDM Receiver on Cyclone IV FPGA
+
+> **For AI agents:** This document is the single source of truth for this project.
+> Read the full context section before helping with any task.
+> Current status: Steps 1–3 complete. Next task: `top_tdm.vhd` + PLL + pin assignments.
 
 ---
 
@@ -7,513 +10,386 @@
 
 | Parameter | Value |
 |-----------|-------|
-| ADC chip | Analog Devices ADAU1978 (quad, 24-bit) |
-| Number of chips | **4** |
-| Total channels | **16** |
-| Sample rate | **96 kHz** |
-| TDM architecture | **2× TDM8 streams** (pairs of chips per stream) |
-| Slot width | **24 bits** (no zero padding, exact fit for 24-bit audio) |
-| BCLK frequency | **18.432 MHz** |
-| MCLK frequency | **12.288 MHz** (128 × 96kHz) |
-| FPGA | Altera Cyclone IV E |
+| Goal | Receive 16ch 24-bit audio from 4× ADAU1978 ADCs into Cyclone IV FPGA |
+| ADC chip | Analog Devices ADAU1978 (quad, 24-bit, 40-lead LFCSP) |
+| Number of chips | 4 |
+| Total channels | 16 (4 channels per chip) |
+| Sample rate | 96 kHz |
+| TDM architecture | 2× TDM8 streams — pairs of chips share one SDATAOUT wire each |
+| Slot width | 24 bits (Left Justified, no zero padding) |
+| BCLK | 18.432 MHz (96k × 8 slots × 24 bits) |
+| MCLK | 12.288 MHz (128 × 96kHz, MCS=001 per ADAU1978 Table 9) |
+| LRCLK | 96 kHz, 1-BCLK-wide pulse (LR_MODE=1) |
+| FPGA | Altera Cyclone IV E (e.g. EP4CE115F29C7) |
+| Board oscillator | 50 MHz |
 | Toolchain | Quartus Prime 18.1+ / ModelSim-Altera |
-| Language | VHDL |
+| Language | VHDL only |
 
 ---
 
-## Why These Choices — Architecture Decision Log
+## Architecture
 
-### Why NOT TDM16?
+### Why 2× TDM8 (not TDM16, not 4× TDM4)
 
-TDM16 puts all 16 channels on one wire. The BCLK cost is severe:
+TDM16 on one wire would require 36.864 MHz BCLK with only 3.5 ns timing margin — too risky. 4× TDM4 works but wastes 4 separate SDATAOUT pins. 2× TDM8 is the sweet spot: 18.432 MHz BCLK, 2 data wires, symmetric 8-channel receivers.
 
-| Slot width | TDM16 BCLK at 96kHz |
-|------------|---------------------|
-| 32-bit | 96k × 16 × 32 = **49.152 MHz** — difficult PCB routing, tight FPGA I/O |
-| 24-bit | 96k × 16 × 24 = **36.864 MHz** — still challenging |
-
-These are usable but create unnecessary risk. We save one wire at the cost of 2× the BCLK frequency. Not worth it for a 4-chip system.
-
-### Why NOT 4× TDM4?
-
-4 separate TDM4 streams would work and give the lowest BCLK (9.216 MHz), but uses 4 SDATAOUT input pins on the FPGA. More pins, more routing, no real benefit over TDM8 pairing.
-
-### Why 2× TDM8 with 24-bit slots?
+### Chip pairing
 
 ```
-BCLK = 96,000 × 8 slots × 24 bits = 18,432,000 Hz = 18.432 MHz
+Stream A:  Chip 0 (ch  1– 4) → TDM slots 1–4  ┐
+           Chip 1 (ch  5– 8) → TDM slots 5–8  ┘ shared SDATAOUT_A wire
+
+Stream B:  Chip 2 (ch  9–12) → TDM slots 1–4  ┐
+           Chip 3 (ch 13–16) → TDM slots 5–8  ┘ shared SDATAOUT_B wire
 ```
 
-- BCLK is clean and well within Cyclone IV capability
-- Only **2 SDATAOUT data wires** from ADC board to FPGA
-- Each receiver handles 8 channels — simple, symmetric logic
-- 24-bit slots eliminate 8 bits of zero-padding per slot vs 32-bit
-- MCLK = 12.288 MHz — standard audio clock, easy to generate with PLL
-
-### Chip pairing and slot assignment
+### Full wiring diagram
 
 ```
-Stream A:  Chip 0 (ch 1–4) → slots 1–4   }  shared SDATAOUT_A wire
-           Chip 1 (ch 5–8) → slots 5–8   }
-
-Stream B:  Chip 2 (ch 9–12)  → slots 1–4  }  shared SDATAOUT_B wire
-           Chip 3 (ch 13–16) → slots 5–8  }
-```
-
-All 4 chips share the same BCLK and LRCLK driven from the FPGA.
-
----
-
-## System Wiring Diagram
-
-```
-FPGA (master: generates BCLK + LRCLK)
+FPGA (serial port MASTER — generates all clocks)
   │
-  ├──BCLK (18.432 MHz) ──────────────────────┬──► Chip 0 BCLK
-  │                                           ├──► Chip 1 BCLK
-  │                                           ├──► Chip 2 BCLK
-  │                                           └──► Chip 3 BCLK
+  ├─ mclk_out  (12.288 MHz) ──┬──► Chip 0 MCLKIN
+  │                            ├──► Chip 1 MCLKIN
+  │                            ├──► Chip 2 MCLKIN
+  │                            └──► Chip 3 MCLKIN
   │
-  ├──LRCLK (96kHz, 1-cycle pulse) ───────────┬──► Chip 0 LRCLK
-  │                                           ├──► Chip 1 LRCLK
-  │                                           ├──► Chip 2 LRCLK
-  │                                           └──► Chip 3 LRCLK
+  ├─ bclk_out  (18.432 MHz) ──┬──► Chip 0 BCLK
+  │                            ├──► Chip 1 BCLK
+  │                            ├──► Chip 2 BCLK
+  │                            └──► Chip 3 BCLK
   │
-FPGA PLL (50MHz → 12.288 MHz) ─────────────► MCLKIN on all 4 chips
+  ├─ lrclk_out (96 kHz pulse) ┬──► Chip 0 LRCLK
+  │                            ├──► Chip 1 LRCLK
+  │                            ├──► Chip 2 LRCLK
+  │                            └──► Chip 3 LRCLK
   │
-  ├──SDATAOUT_A ◄──── Chip 0 (slots 1–4) + Chip 1 (slots 5–8)
-  └──SDATAOUT_B ◄──── Chip 2 (slots 1–4) + Chip 3 (slots 5–8)
+  ├─ sdata_in_A ◄─────────── Chip 0 SDATAOUT1 + Chip 1 SDATAOUT1
+  └─ sdata_in_B ◄─────────── Chip 2 SDATAOUT1 + Chip 3 SDATAOUT1
 
-Pull-down: 47kΩ to GND on SDATAOUT_A and SDATAOUT_B
-           (prevents floating during HIGH-Z inactive slots)
+47kΩ pull-down to GND on sdata_in_A and sdata_in_B
+(ADAU1978 output goes HIGH-Z during inactive TDM slots)
 ```
 
----
-
-## TDM Frame Structure at 96kHz / TDM8 / 24-bit slots
+### TDM frame structure
 
 ```
 LRCLK: |‾|______________________________________________|‾|__
-        1 BCLK wide pulse (HIGH for exactly one BCLK cycle)
+        1 BCLK wide pulse, marks start of slot 1
 
-BCLK:  192 cycles per frame  (8 slots × 24 bits = 192)
+BCLK:  192 cycles per frame  (8 slots × 24 bits)
 
-SDATAOUT_A:
-  [Chip0-CH1: 24b][Chip0-CH2: 24b][Chip0-CH3: 24b][Chip0-CH4: 24b]
-  [Chip1-CH1: 24b][Chip1-CH2: 24b][Chip1-CH3: 24b][Chip1-CH4: 24b]
-   ←──── slot 1 ────►←── slot 2 ──►                ←──── slot 8 ──►
+sdata_in_A:
+[Chip0-CH1: 24b][Chip0-CH2: 24b][Chip0-CH3: 24b][Chip0-CH4: 24b]
+[Chip1-CH1: 24b][Chip1-CH2: 24b][Chip1-CH3: 24b][Chip1-CH4: 24b]
+ ←── slot 1 ──→ ←── slot 2 ──→                   ←── slot 8 ──→
 
-SDATAOUT_B:
-  [Chip2-CH1][Chip2-CH2][Chip2-CH3][Chip2-CH4]
-  [Chip3-CH1][Chip3-CH2][Chip3-CH3][Chip3-CH4]
+sdata_in_B: identical structure for chips 2 and 3
 ```
 
-- **Each slot = 24 bits** — MSB first, no zero padding
-- **Frame = 192 BCLK cycles** (8 × 24)
-- Data changes on **falling BCLK edge**, valid by rising BCLK edge
-- LRCLK pulse marks the start of slot 1 — the ADAU1978 outputs first bit of slot 1 the cycle AFTER the LRCLK pulse in Left Justified mode
-- **FPGA samples on rising BCLK edge**
+- Data changes on **falling BCLK edge** (ADAU1978 BCLKEDGE=0 default)
+- FPGA samples on **rising BCLK edge**
+- LRCLK rising edge = latch completed 192-bit frame, reset bit counter
+- Left Justified: first audio bit is valid on the BCLK cycle AFTER LRCLK pulse
 
----
-
-## Clock Calculations (verified against datasheet Table 9 and Table 10)
-
-### BCLK
-```
-BCLK = fs × slots × bits_per_slot
-     = 96,000 × 8 × 24
-     = 18,432,000 Hz = 18.432 MHz
-```
-
-### MCLK (from datasheet Table 9, MCS=001)
-```
-MCS bits = 001 → 128 × fs
-MCLK = 128 × 96,000 = 12,288,000 Hz = 12.288 MHz
-```
-
-### LRCLK (= sample rate)
-```
-LRCLK = 96,000 Hz (pulse every 192 BCLK cycles)
-```
-
-### FPGA PLL targets
-```
-Input:  50 MHz (board oscillator)
-Output c0: 12.288 MHz  → MCLKIN for all 4 chips
-Output c1: 18.432 MHz  → FPGA internal BCLK generator source
-```
-
-> Verify these are achievable with your specific Cyclone IV PLL by checking
-> the ALTPLL output in Quartus. Both 12.288 and 18.432 are standard audio
-> frequencies and should be fine.
-
----
-
-## The ADAU1978 ADC — Key Hardware Details
-
-### Package and supply
-- 40-lead LFCSP, 6mm × 6mm
-- Single **3.3V analog supply** (AVDD pins)
-- Internal LDO generates **1.8V DVDD** (decouple only, no external load)
-- **IOVDD** (digital I/O level): 1.8V to 3.3V — must match FPGA I/O bank voltage
-- **Exposed pad (EP)** must be soldered to PCB ground plane — do not leave floating
-
-### Decoupling requirements (per chip)
-| Pin | Cap |
-|-----|-----|
-| AVDD1, AVDD2, AVDD3 | 100nF ceramic + 10µF bulk each |
-| DVDD (pin 10) | 100nF + 10µF MLCC X7R |
-| IOVDD | 100nF ceramic |
-| VREF (pin 2) | 100nF + 10µF in parallel |
-
-### PLL external filter at PLL_FILT (pin 3) — REQUIRED
-
-In **MCLK mode** (`CLK_S=0`, our config), connect to AVDD2 via:
+### Extracted channel mapping (per receiver)
 
 ```
-AVDD2 ──┬── 5.6nF ──┬── PLL_FILT (pin 3)
-         └── 1kΩ  ──┘
-         └── 390pF to GND
-```
-
-Place filter components as close as possible to pin 3. Use NPO/C0G capacitors for temperature stability. Without this filter the PLL will not lock correctly.
-
-### Key pin table
-| Pin | Name | Dir | Description |
-|-----|------|-----|-------------|
-| 7 | MCLKIN | I | Master clock in — 12.288 MHz from FPGA PLL |
-| 16 | BCLK | I | Bit clock in — 18.432 MHz from FPGA (slave mode) |
-| 15 | LRCLK | I | Frame sync in — 96kHz pulse from FPGA (slave mode) |
-| 13 | SDATAOUT1 | O | Serial audio output (used in TDM8 mode) |
-| 14 | SDATAOUT2 | O | Not used as data output in TDM8 mode (see SDATA_SEL bit) |
-| 6 | PD/RST | I | Active-low reset — hold LOW until supply stable |
-| 9 | SA_MODE | I | Pull HIGH (10kΩ to IOVDD) for standalone mode |
-| 3 | PLL_FILT | O | External PLL filter (see above) |
-| 2 | VREF | O | 1.5V internal reference — decouple, do not load |
-
-### Slot assignment configuration (registers 0x07 and 0x08)
-
-Each chip's 4 channels must be assigned to the correct TDM slots:
-
-**Chips 0 and 2 (slots 1–4):**
-```
-Register 0x07 (SAI_CMAP12): CMAP_C2=0001 (slot 2), CMAP_C1=0000 (slot 1) → 0x10 (default)
-Register 0x08 (SAI_CMAP34): CMAP_C4=0011 (slot 4), CMAP_C3=0010 (slot 3) → 0x32 (default)
-```
-
-**Chips 1 and 3 (slots 5–8):**
-```
-Register 0x07: CMAP_C2=0101 (slot 6), CMAP_C1=0100 (slot 5) → 0x54
-Register 0x08: CMAP_C4=0111 (slot 8), CMAP_C3=0110 (slot 7) → 0x76
+ch_data_out[191:168]  = channel 1  (slot 1, 24 MSBs)
+ch_data_out[167:144]  = channel 2
+ch_data_out[143:120]  = channel 3
+ch_data_out[119:96]   = channel 4  (from first chip on this wire)
+ch_data_out[95:72]    = channel 5  (slot 5, from second chip)
+ch_data_out[71:48]    = channel 6
+ch_data_out[47:24]    = channel 7
+ch_data_out[23:0]     = channel 8
 ```
 
 ---
 
-## ADAU1978 Configuration Registers
+## ADAU1978 Configuration
 
-### For our exact setup: TDM8, Left Justified, 24-bit slots, 24-bit data, slave, pulse LRCLK, 96kHz
+### Register settings for our exact setup
 
-| Address | Register | Value | Bit breakdown |
-|---------|----------|-------|---------------|
-| 0x00 | M_POWER | `0x01` | PWUP=1 (write LAST, after PLL locks) |
-| 0x01 | PLL_CONTROL | `0x41` | PLL_MUTE=1, CLK_S=0 (MCLK), MCS=001 (128×fs=12.288MHz) |
-| 0x04 | BLOCK_POWER_SAI | `0x3F` | LR_POL=0, BCLKEDGE=0 (data changes on falling BCLK), LDO+VREF+all 4 ADCs enabled |
-| 0x05 | SAI_CTRL0 | `0x5A` | SDATA_FMT=01 (Left Justified), SAI=011 (TDM8), FS=010 (32–96kHz range) |
-| 0x06 | SAI_CTRL1 | `0x08` | SDATA_SEL=0 (SDATAOUT1), SLOT_WIDTH=01 (24 BCLKs/slot), DATA_WIDTH=0 (24-bit), LR_MODE=1 (pulse), SAI_MSB=0 (MSB first), SAI_MS=0 (slave) |
+| Reg | Name | Value | Description |
+|-----|------|-------|-------------|
+| 0x04 | BLOCK_POWER_SAI | `0x3F` | LR_POL=0, BCLKEDGE=0, LDO+VREF+all 4 ADCs enabled |
+| 0x05 | SAI_CTRL0 | `0x5A` | SDATA_FMT=01 (LJ), SAI=011 (TDM8), FS=010 (32–96kHz) |
+| 0x06 | SAI_CTRL1 | `0x08` | SLOT_WIDTH=01 (24b), DATA_WIDTH=0 (24b), LR_MODE=1 (pulse), SAI_MS=0 (slave) |
 | 0x07 | SAI_CMAP12 | `0x10` | Chips 0,2: ch1→slot1, ch2→slot2 |
 | 0x07 | SAI_CMAP12 | `0x54` | Chips 1,3: ch1→slot5, ch2→slot6 |
 | 0x08 | SAI_CMAP34 | `0x32` | Chips 0,2: ch3→slot3, ch4→slot4 |
 | 0x08 | SAI_CMAP34 | `0x76` | Chips 1,3: ch3→slot7, ch4→slot8 |
-| 0x09 | SAI_OVERTEMP | `0xF8` | All 4 channels drive enabled, DRV_HIZ=1 (unused slots go HIGH-Z) |
+| 0x09 | SAI_OVERTEMP | `0xF8` | All 4ch drive enabled, DRV_HIZ=1 (inactive slots → HIGH-Z) |
+| 0x00 | M_POWER | `0x01` | PWUP=1 — write LAST, only after PLL_LOCK=1 |
 
-> **Register 0x05 value `0x5A` decoded:**
-> - Bits [7:6] SDATA_FMT = `01` (Left Justified)
-> - Bits [5:3] SAI = `011` (TDM8)
-> - Bits [2:0] FS = `010` (32kHz to 96kHz range — covers our 96kHz)
+### I2C addresses (set by ADDR1/ADDR0 pin strapping)
 
-### I2C address per chip (set by ADDR1/ADDR0 pin strapping)
-
-| Chip | ADDR1 | ADDR0 | 7-bit I2C Address |
-|------|-------|-------|-------------------|
+| Chip | ADDR1 | ADDR0 | Address |
+|------|-------|-------|---------|
 | 0 | 0 | 0 | 0x11 |
 | 1 | 0 | 1 | 0x31 |
 | 2 | 1 | 0 | 0x51 |
 | 3 | 1 | 1 | 0x71 |
 
-In standalone mode (`SA_MODE` HIGH), I2C is not used for audio config — but I2C is still recommended to verify PLL lock status at startup.
-
----
-
-## Power-Up Sequence (CRITICAL — do not skip)
+### Power-up sequence
 
 ```
-1. Apply 3.3V AVDD
-2. Keep PD/RST LOW
-3. Assert PD/RST HIGH
-   → Internal LDO starts charging DVDD
-   → DVDD rises toward 1.8V
-4. Wait ~200 µs (DVDD reaches 1.2V with 10µF CEXT, 3kΩ REXT)
-   → Internal POR releases
-5. Apply stable 12.288 MHz MCLK to all MCLKIN pins
-6. Wait 10 ms for PLL to lock
-   → Poll PLL_LOCK bit (bit 7 of register 0x01) via I2C until = 1
-   → OR simply wait 15 ms to be safe
-7. Write all config registers (0x04, 0x05, 0x06, 0x07, 0x08, 0x09)
-8. LAST: write PWUP=1 to register 0x00
-   → ADC and serial port become active
-9. Valid audio data appears within a few ms
-```
-
-**Why the order matters:** If PWUP is asserted before PLL locks, the state machine initialises with the wrong clock and ADC behaviour is indeterminate. This is explicitly warned in the datasheet.
-
----
-
-## FPGA Logic Required
-
-Since FPGA is the serial port master, it needs two modules:
-
-### Module 1: TDM8 Master (generates BCLK + LRCLK)
-```
-Inputs:  clk_18m432 (from PLL)
-Outputs: bclk_out, lrclk_out
-
-- Toggle bclk_out at half the input clock rate (or use clk_18m432 directly)
-- lrclk_out: goes HIGH for exactly 1 BCLK period every 192 BCLK cycles
-- Counter: 0 to 191, wraps. lrclk_out = '1' when counter = 0.
-```
-
-### Module 2: TDM8 Receiver (one instance per SDATAOUT line)
-```
-Inputs:  bclk_in, lrclk_in, sdata_in
-Outputs: ch_data_out (8 × 24 bits = 192 bits total)
-
-- Sample sdata_in on rising bclk_in edge
-- Shift into 192-bit shift register
-- When lrclk_in rising edge detected: latch shift_reg → ch_data_out
-- bit_cnt counts 0 to 191
-
-Extracted audio:
-ch1 = ch_data_out[191:168]   (slot 1, bits 23:0 of 24)
-ch2 = ch_data_out[167:144]   (slot 2)
-ch3 = ch_data_out[143:120]   (slot 3)
-ch4 = ch_data_out[119:96]    (slot 4)
-ch5 = ch_data_out[95:72]     (slot 5, from second chip on this wire)
-ch6 = ch_data_out[71:48]     (slot 6)
-ch7 = ch_data_out[47:24]     (slot 7)
-ch8 = ch_data_out[23:0]      (slot 8)
-```
-
-### Top-level connections
-```
-FPGA top level:
-  ├── u_pll         → generates 12.288 MHz (MCLK) and 18.432 MHz (BCLK source)
-  ├── u_tdm_master  → generates bclk_out, lrclk_out (shared to all 4 chips)
-  ├── u_rx_A        → receives SDATAOUT_A (chips 0+1, ch 1–8)
-  └── u_rx_B        → receives SDATAOUT_B (chips 2+3, ch 9–16)
+1. Apply 3.3V AVDD, hold PD/RST LOW
+2. Assert PD/RST HIGH → DVDD begins charging
+3. Wait ~200 µs (DVDD > 1.2V, POR releases)
+4. Apply stable 12.288 MHz MCLK to all MCLKIN pins
+5. Wait 10–15 ms for PLL lock
+6. Poll register 0x01 bit 7 (PLL_LOCK) until = 1
+7. Write registers 0x04, 0x05, 0x06, 0x07, 0x08, 0x09
+8. Write register 0x00 = 0x01 (PWUP) — LAST
 ```
 
 ---
 
-## Voltage Compatibility
+## Repository File Index
 
-| Signal | ADAU1978 (IOVDD) | Cyclone IV (3.3V bank) | Compatible? |
-|--------|------------------|------------------------|-------------|
-| BCLK FPGA→ADC | VIH = 0.7×IOVDD | VOH ≥ 2.4V | ✅ yes (at 3.3V IOVDD) |
-| LRCLK FPGA→ADC | VIH = 0.7×IOVDD | VOH ≥ 2.4V | ✅ yes |
-| SDATAOUT ADC→FPGA | VOH = IOVDD−0.6V | VIH = 1.7V min | ✅ yes |
-| MCLK FPGA→ADC | VIH = 0.7×IOVDD | VOH ≥ 2.4V | ✅ yes |
+### Source files (truth — use these)
 
-> **If your FPGA board uses 1.8V I/O banks:** Set ADAU1978 IOVDD = 1.8V.
-> The ADAU1978 supports IOVDD from 1.8V to 3.3V. Match it to your FPGA bank.
+| File | Status | Description |
+|------|--------|-------------|
+| `tdm8_master.vhd` | ✅ Complete | TDM8 clock master — generates BCLK + LRCLK from 18.432 MHz input |
+| `tdm8_rx.vhd` | ✅ Complete | TDM8 receiver — 192-bit shift reg, latches on LRCLK, samples on rising BCLK |
+| `tb_tdm8_rx.vhd` | ✅ Complete | ModelSim testbench — fake 8-channel ADAU1978, asserts ch_data_out values |
+| `top_loopback.vhd` | ✅ Complete | FPGA loopback test — master feeds serialiser into receiver, pass/fail LEDs |
+| `seven_seg_driver.vhd` | ✅ Present | 7-segment display driver (use for debug output on board) |
+| `seven_seg_monitor.vhd` | ✅ Present | Monitors channel data and drives 7-seg display |
+| `TDM_UATR.qpf` | ✅ Present | Quartus project file |
+| `TDM_UATR.qsf` | ⚠️ Partial | Pin assignments — needs new ports for top_tdm added |
+| `TDM_UATR.sdc` | ⚠️ Partial | Timing constraints — needs PLL clocks and real I/O constraints added |
+| `wave.do` | ✅ Present | ModelSim wave script |
 
----
+### Files that do NOT yet exist (next steps)
 
-## Project File Structure
+| File | Priority | Description |
+|------|----------|-------------|
+| `top_tdm.vhd` | 🔴 NEXT | Real top-level: PLL + master + 2× rx_A/rx_B + hardware ports |
+| `pll_audio.vhd` | 🔴 NEXT | Quartus ALTPLL IP: 50 MHz → 12.288 MHz (c0) + 18.432 MHz (c1) |
+| `tb_top_tdm.vhd` | 🟡 Soon | Testbench for top_tdm — simulates both SDATAOUT_A and SDATAOUT_B |
+
+### Files to ignore (duplicates / Quartus-generated)
 
 ```
-tdm_adau1978_16ch/
-├── top_tdm.vhd              ← top-level entity
-├── tdm8_master.vhd          ← generates BCLK + LRCLK (master mode)
-├── tdm8_rx.vhd              ← TDM8 receiver, 192-bit shift register
-├── pll_audio.vhd            ← Quartus IP: 50MHz → 12.288MHz + 18.432MHz
-├── tb_tdm8_rx.vhd           ← ModelSim testbench
-├── tb_loopback.vhd          ← loopback test (master feeds into receiver)
-├── tdm_adau1978.sdc         ← timing constraints
-├── tdm_adau1978.qpf         ← Quartus project
-└── tdm_adau1978.qsf         ← pin assignments
+*.bak                  — old backup versions, ignore
+seven_seg_driver.vhd vs sevenseg_driver.vhd  — use seven_seg_driver.vhd
+db/, incremental_db/, output_files/           — build artifacts, not source
+simulation/questa/, work/                     — sim artifacts
 ```
 
 ---
 
-## Step-by-Step Tests (no ADC hardware needed)
+## Completed Steps
 
----
+### ✅ Step 1 — ModelSim Simulation (2026-05-09)
 
-### STEP 1 — ModelSim Simulation
-
-Status: Complete (2026-05-09)
+TDM8 master and receiver verified in simulation. `tb_tdm8_rx.vhd` generates known 8-channel pattern, asserts `ch_data_out` values correct after 3 frames.
 
 ![Step 1 ModelSim waveform](docs/Step1.png)
 
-**Goal:** Prove TDM8 master and receiver are functionally correct.
+### ✅ Step 2 — FPGA Internal Loopback (2026-05-09)
 
-**What I need:**
-- Complete VHDL for `tdm8_master.vhd`:
-  - Input: `clk_in` (18.432 MHz from PLL)
-  - Outputs: `bclk_out`, `lrclk_out`
-  - `lrclk_out` = HIGH for 1 BCLK cycle every 192 BCLK cycles (counter = 0)
-  - `bclk_out` = directly passes `clk_in` OR uses a divided version — clarify which
-- Complete VHDL for `tdm8_rx.vhd`:
-  - Inputs: `bclk_in`, `lrclk_in`, `sdata_in`
-  - Output: `ch_data_out` (192 bits = 8 channels × 24 bits)
-  - Samples on rising `bclk_in`
-  - Latches on rising `lrclk_in`
-- Testbench `tb_tdm8_rx.vhd`:
-  - Instantiates `tdm8_master` — uses its BCLK/LRCLK
-  - Generates fake SDATAOUT with known 8-channel pattern:
-    - Ch1=0xA1A1A1, Ch2=0xB2B2B2, Ch3=0xC3C3C3, Ch4=0xD4D4D4
-    - Ch5=0xE5E5E5, Ch6=0xF6F6F6, Ch7=0x070707, Ch8=0x181818
-    - Pattern serialised MSB-first, 24 bits per slot, left justified, 8 slots per frame
-  - After 3 complete frames, asserts that `ch_data_out` contains expected values
-- ModelSim TCL commands to compile and run
-- Waveform checklist
-
-**What correct behaviour looks like:**
-- `lrclk_out` pulses exactly once every 192 BCLK cycles
-- `ch_data_out[191:168]` = 0xA1A1A1 after first complete frame
-- All 8 channels decode correctly
-- `bit_cnt` counts 0–191 and wraps without glitches
-
----
-
-### STEP 2 — FPGA Internal Loopback
-
-Status: Complete (2026-05-09)
+`top_loopback.vhd` running on Cyclone IV silicon. Pattern serialiser → `tdm8_rx` → pass/fail checker. `pass_led` confirmed solid on hardware.
 
 ![Step 2 FPGA loopback pass](docs/Step2.jpeg)
 
-**Goal:** Prove TDM8 master + receiver work on real Cyclone IV silicon.
+### ✅ Step 3 — SignalTap II Verification (2026-05-09)
 
-**What I need:**
-- `top_loopback.vhd` that:
-  - Instantiates `tdm8_master`, `tdm8_rx`
-  - Instantiates a **pattern serialiser**: takes a known 192-bit parallel pattern and shifts it out MSB-first, clocked by `bclk_out` from the master, triggered by `lrclk_out`
-  - Pattern: ch1 = frame counter (increments each frame), ch2–ch8 = fixed values
-  - Connects serialiser output directly (internal wire) to `sdata_in` of receiver
-- Pass/fail checker: drives `pass_led` HIGH after 10 consecutive correct frames, `fail_led` HIGH on any mismatch
-- Must compile and meet timing in Quartus
-
----
-
-### STEP 3 — SignalTap II Logic Analyser
-
-Status: Complete (2026-05-09)
+Internal signals captured live over JTAG. BCLK/LRCLK framing, shift_reg, and ch_data_out all confirmed correct.
 
 ![Step 3 SignalTap capture](docs/Step3.png)
 
-**Goal:** Observe internal signals in real time on hardware.
+---
 
-**What I need:**
-- Instructions to add SignalTap II to Quartus project
-- Signals to probe: `bclk_out`, `lrclk_out`, `sdata_in_A`, `bit_cnt`, `shift_reg[191:168]` (ch1 slice), `ch_data_out_A`, `pass_flag`
-- Trigger: rising edge of `lrclk_out`
-- Sample depth: 256 minimum to capture at least one full frame
-- How to read a 24-bit audio value from the waveform in hex
-- Common SignalTap mistakes to avoid
+## Next Steps
+
+### 🔴 Step 4 — `top_tdm.vhd` + PLL (current priority)
+
+**Goal:** Create the real hardware top-level entity that connects to external pins and drives/receives all 4 ADAU1978 chips.
+
+**What is needed:**
+
+**4a. Generate PLL in Quartus IP Catalog**
+- Tools → IP Catalog → search "ALTPLL"
+- Input: 50 MHz
+- Output c0: 12.288 MHz (MCLK for all 4 chips)
+- Output c1: 18.432 MHz (BCLK source for tdm8_master)
+- Save as `pll_audio.vhd`
+
+**4b. Write `top_tdm.vhd`**
+
+Entity ports needed:
+```vhdl
+entity top_tdm is
+  port (
+    clk_50m    : in  std_logic;   -- 50 MHz board oscillator
+    rst_n      : in  std_logic;   -- active-low reset (button or power-on)
+
+    -- To all 4 ADAU1978 chips
+    mclk_out   : out std_logic;   -- 12.288 MHz → all MCLKIN pins
+    bclk_out   : out std_logic;   -- 18.432 MHz → all BCLK pins
+    lrclk_out  : out std_logic;   -- 96 kHz pulse → all LRCLK pins
+
+    -- From ADAU1978 chip pairs
+    sdata_in_A : in  std_logic;   -- Chip 0 (slots 1-4) + Chip 1 (slots 5-8)
+    sdata_in_B : in  std_logic;   -- Chip 2 (slots 1-4) + Chip 3 (slots 5-8)
+
+    -- 16ch parallel output (for 7-seg monitor, downstream DSP, etc.)
+    ch_data_A  : out std_logic_vector(191 downto 0);  -- ch 1-8
+    ch_data_B  : out std_logic_vector(191 downto 0)   -- ch 9-16
+  );
+end entity top_tdm;
+```
+
+Internal structure:
+```
+u_pll       → pll_audio      (50MHz → 12.288MHz c0, 18.432MHz c1)
+u_master    → tdm8_master    (clk_in=c1, outputs bclk_int + lrclk_int)
+u_rx_A      → tdm8_rx        (sdata_in_A → ch_data_A)
+u_rx_B      → tdm8_rx        (sdata_in_B → ch_data_B)  ← second instance
+mclk_out    ← c0
+bclk_out    ← bclk_int
+lrclk_out   ← lrclk_int
+```
+
+**4c. Update `TDM_UATR.qsf`** — add pin location assignments for all new ports. Check your board's GPIO header pinout. Ports needed:
+- `clk_50m` — already exists (board clock pin)
+- `rst_n` — assign to a push button
+- `mclk_out`, `bclk_out`, `lrclk_out` — GPIO output pins
+- `sdata_in_A`, `sdata_in_B` — GPIO input pins
+- `ch_data_A[191:0]`, `ch_data_B[191:0]` — internal only (drive seven_seg_monitor)
+
+**4d. Update `TDM_UATR.sdc`** — add:
+```tcl
+create_clock -name clk_50m -period 20.000 [get_ports clk_50m]
+create_generated_clock -name clk_mclk -source [get_pins u_pll|...] ...
+create_generated_clock -name clk_bclk -source [get_pins u_pll|...] ...
+set_false_path -from [get_clocks clk_50m] -to [get_clocks clk_bclk]
+set_output_delay -clock clk_bclk -max 5.0 [get_ports {bclk_out lrclk_out mclk_out}]
+set_input_delay  -clock clk_bclk -max 18.0 [get_ports {sdata_in_A sdata_in_B}]
+```
+
+**4e. Change top-level entity in Quartus**
+- Assignments → Settings → General → Top-level entity: change from `top_loopback` to `top_tdm`
+
+**4f. Connect `seven_seg_monitor` to `ch_data_A`**
+The monitor is already written. Wire a 24-bit slice of `ch_data_A` (e.g. `ch_data_A[191:168]` = channel 1) to display live audio values on the board's 7-segment display. This gives you instant real-world verification without a logic analyser.
 
 ---
 
-### STEP 4 — Arduino as Fake ADAU1978
+### 🟡 Step 5 — Arduino as Fake ADAU1978
 
-**Goal:** Verify FPGA input pins and PCB/cable wiring before chips are connected.
+**Goal:** Verify physical pin connections and PCB/cable wiring before real chips.
 
-**What I need:**
-- Arduino (Uno or Mega) code that bit-bangs TDM8 at slow speed (~50 kHz BCLK):
-  - LRCLK: 1-cycle HIGH pulse every 192 BCLK cycles
-  - SDATAOUT: serialises known 8-channel 24-bit pattern, MSB first, left justified
-  - Repeats continuously
-- Voltage warning: Arduino = 5V, FPGA/ADAU1978 IOVDD = 3.3V — I need confirmation whether a resistor divider (e.g. 1kΩ + 2kΩ) or level shifter is required on each Arduino output line
-- FPGA-side verification via LEDs or UART: received ch1 value matches expected
-- What this proves (pin connectivity, gross logic) vs what it does NOT prove (18.432 MHz timing)
+Arduino bit-bangs a slow (~50 kHz) TDM8 frame on BCLK/LRCLK/SDATAOUT pins. FPGA receives it through `top_tdm` and displays on 7-seg. Proves pin assignments and wiring without needing ADC hardware.
+
+**Voltage note:** Arduino = 5V, FPGA/ADAU1978 IOVDD = 3.3V. Use a resistor divider (1kΩ series + 2kΩ to GND) on each Arduino output line. Never connect 5V directly to Cyclone IV I/O.
 
 ---
 
-### STEP 5 — ADAU1978 Integration Checklist
+### 🟡 Step 6 — ADAU1978 Real Hardware Integration
 
-**Goal:** Systematic verification when real chips are connected.
+**Goal:** Connect actual chips and receive live audio.
 
-**What I need:**
+Checklist before power-on:
+- [ ] Exposed pad (EP) soldered to PCB ground plane on all 4 chips
+- [ ] PLL_FILT RC filter on each chip: 1kΩ + 5.6nF + 390pF (MCLK mode)
+- [ ] 47kΩ pull-down to GND on both SDATAOUT lines
+- [ ] IOVDD voltage matches FPGA I/O bank (3.3V or 1.8V — must match)
+- [ ] ADDR1/ADDR0 strapped per chip for addresses 0x11, 0x31, 0x51, 0x71
+- [ ] PD/RST held LOW until supply stable, then HIGH
+- [ ] MCLK (12.288 MHz) stable before PD/RST goes HIGH
+- [ ] Wait 15 ms after MCLK stable before writing PWUP=1
 
-**Before powering up:**
-- [ ] Exposed pad soldered to PCB ground plane on all 4 chips
-- [ ] PLL_FILT RC filter populated on all 4 chips (1kΩ, 5.6nF, 390pF)
-- [ ] 47kΩ pull-down on SDATAOUT_A and SDATAOUT_B lines
-- [ ] IOVDD matches FPGA I/O bank voltage on all chips
-- [ ] ADDR1/ADDR0 strapped correctly for unique I2C addresses (0x11, 0x31, 0x51, 0x71)
-- [ ] SA_MODE tied HIGH via 10kΩ (if standalone) or LOW (if I2C full control)
-
-**Power-up verification:**
-- How to confirm DVDD reaches 1.8V on each chip with a multimeter
-- How to confirm MCLK is reaching all MCLKIN pins before PD/RST goes HIGH
-- Exact I2C byte sequence to read PLL_LOCK bit from register 0x01
-- Exact I2C byte sequence to write all config registers in order, then PWUP last
-
-**I2C initialisation sequence (complete, for one chip at address 0x11):**
-- Write register 0x04 = 0x3F
-- Write register 0x05 = 0x5A
-- Write register 0x06 = 0x08
-- Write register 0x07 per chip (0x10 for chips 0,2 or 0x54 for chips 1,3)
-- Write register 0x08 per chip (0x32 for chips 0,2 or 0x76 for chips 1,3)
-- Write register 0x09 = 0xF8
-- Poll register 0x01 bit 7 until PLL_LOCK = 1
-- Write register 0x00 = 0x01 (PWUP)
-
-**SignalTap integration verification:**
-- What valid SDATAOUT looks like on a scope vs misconfigured (flat line, wrong frequency, no transitions)
-- How to compare live chip output against loopback pattern to confirm FPGA receiver is working
-
-**Common ADAU1978-specific failure modes:**
-- PWUP asserted before PLL locks → indeterminate ADC behaviour, output is garbage
-- PLL_FILT filter missing or wrong values → PLL never locks (PLL_LOCK bit stays 0)
-- DRV_HIZ=0 on chips 1,3 → inactive slots are driven LOW instead of HIGH-Z, corrupts other chip's data on shared wire
-- SLOT_WIDTH and DATA_WIDTH mismatch → frame sync drifts after a few frames
-- LRCLK polarity (LR_POL) wrong → channels appear in wrong order
-- Chip 1/3 slot mapping not updated (left at default 0x10/0x32) → all chips fight over slots 1–4
+Full I2C init sequence (per chip, replace address for each):
+```
+Write [chip_addr, 0x04, 0x3F]   — power blocks, BCLK edge
+Write [chip_addr, 0x05, 0x5A]   — TDM8, Left Justified, 96kHz range
+Write [chip_addr, 0x06, 0x08]   — 24-bit slots, pulse LRCLK, slave mode
+Write [chip_addr, 0x07, 0x10]   — ch1→slot1, ch2→slot2  (chips 0,2)
+Write [chip_addr, 0x07, 0x54]   — ch1→slot5, ch2→slot6  (chips 1,3)
+Write [chip_addr, 0x08, 0x32]   — ch3→slot3, ch4→slot4  (chips 0,2)
+Write [chip_addr, 0x08, 0x76]   — ch3→slot7, ch4→slot8  (chips 1,3)
+Write [chip_addr, 0x09, 0xF8]   — drive enables, DRV_HIZ=1
+Poll  [chip_addr, 0x01] bit 7 until PLL_LOCK = 1
+Write [chip_addr, 0x00, 0x01]   — PWUP=1  (LAST)
+```
 
 ---
 
-## Key Rules — Always Apply
+## Key Rules for AI Agents
 
-1. **4× ADAU1978 = 16 channels total.** Each chip = 4 channels. 3 chips would be 12.
+Always keep these in mind when helping with this project:
 
-2. **FPGA is serial port MASTER** — FPGA generates BCLK (18.432 MHz) and LRCLK (96kHz pulse). All 4 ADAU1978 chips are serial port slaves (`SAI_MS=0`).
+1. **4 chips × 4 channels = 16 channels total.** Not 8, not 24.
 
-3. **FPGA still supplies MCLK** — 12.288 MHz to all 4 MCLKIN pins. The ADAU1978 PLL runs from this.
+2. **FPGA is serial port master** — it generates BCLK (18.432 MHz) and LRCLK (96 kHz pulse). All 4 ADAU1978 chips are serial port slaves (`SAI_MS=0`). FPGA also generates MCLK (12.288 MHz) for the ADC PLL.
 
-4. **TDM8 mode, NOT TDM16** — each chip outputs 4 channels in 8-slot frame. Two chips per wire. Frame = 192 BCLK cycles (8 × 24).
+3. **Two separate SDATAOUT lines** — `sdata_in_A` (chips 0+1) and `sdata_in_B` (chips 2+3). They are NOT wired together.
 
-5. **24-bit slots** — `SLOT_WIDTH=01` in register 0x06. Each slot is exactly 24 bits. No zero padding. Frame = 192 bits, not 256.
+4. **Frame = 192 BCLK cycles** — 8 slots × 24 bits. Bit counter runs 0–191.
 
-6. **Left Justified format** — audio MSB appears on first BCLK after LRCLK pulse (`SDATA_FMT=01`).
+5. **24-bit Left Justified slots** — no zero padding. 24 bits of audio fill the 24-bit slot exactly. `SLOT_WIDTH=01`, `DATA_WIDTH=0`, `SDATA_FMT=01`.
 
-7. **FPGA samples SDATAOUT on rising BCLK edge** — ADAU1978 outputs data on falling edge (max 18ns later), stable by the next rising edge.
+6. **LRCLK is a pulse** — 1 BCLK cycle wide HIGH (`LR_MODE=1`). NOT 50% duty cycle.
 
-8. **LRCLK = pulse mode** — single BCLK-wide HIGH pulse (`LR_MODE=1`). NOT 50% duty cycle.
+7. **Sampling edge** — ADAU1978 changes SDATAOUT on falling BCLK (max 18ns delay). FPGA samples on **rising BCLK edge**.
 
-9. **Chips 1 and 3 use different slot mapping** — registers 0x07=0x54 and 0x08=0x76, not the default. If left at default both chips try to output to slots 1–4 and corrupt each other.
+8. **Latch timing** — receiver latches the completed shift_reg when LRCLK rising edge is detected. This captures the previous frame. The new frame's first bit arrives on the NEXT falling BCLK edge after LRCLK.
 
-10. **DRV_HIZ must be 1** — register 0x09 bit 3. Unused TDM slots must go HIGH-Z, not driven low, so chips can share the wire.
+9. **DRV_HIZ must be 1** — register 0x09 bit 3. Chips 0 and 2 go HIGH-Z during slots 5–8. Chips 1 and 3 go HIGH-Z during slots 1–4. Without this, chips fight on the shared wire.
 
-11. **47kΩ pull-down on shared SDATAOUT lines** — prevents floating when both chips are in HIGH-Z simultaneously (between frames).
+10. **Chips 1 and 3 use non-default slot mapping** — register 0x07=`0x54`, register 0x08=`0x76`. If left at default (`0x10`/`0x32`), all chips output to slots 1–4 and corrupt each other.
 
-12. **PLL_FILT RC filter is mandatory hardware** — not optional. Wrong values = PLL never locks.
+11. **PWUP is written last** — after all config registers and after PLL_LOCK = 1. Writing PWUP before PLL locks causes indeterminate ADC behaviour.
 
-13. **PWUP is the last register you write** — after all other config and after PLL_LOCK = 1.
+12. **VHDL only** — no Verilog or SystemVerilog.
 
-14. **VHDL only.** **Cyclone IV E only.** **Quartus 18.1+.**
+13. **Cyclone IV E only** — no Cyclone V or later features (no hard floating point, no LVDS receivers, no PCIe hard IP).
 
-15. **Give exact register hex values** — not descriptions. Always include the full I2C write sequence with device address, register address, and data byte.
+14. **Quartus 18.1+** — do not suggest features from newer versions unless flagged.
+
+15. **Give complete VHDL** — no placeholders, no `-- your logic here`. Named port map associations. Lowercase signals with underscores. UPPERCASE generics.
+
+16. **Give exact register hex values** with full I2C byte sequences (device address + register address + data byte) when discussing ADAU1978 configuration.
+
+17. **`top_loopback.vhd` is a test scaffold** — it is NOT the final top-level. The final top-level will be `top_tdm.vhd`.
+
+18. **`tdm8_rx.vhd` is correct and complete** — do not rewrite it. Instantiate it twice in `top_tdm.vhd`.
 
 ---
 
-*ADAU1978 Rev B datasheet. 4 chips, 16 channels, 96kHz, TDM8, 24-bit slots, 18.432 MHz BCLK. Start from Step 1 unless told otherwise.*
+## Project File Structure (target state)
+
+```
+UATR_TDM/
+│
+├── tdm8_master.vhd          ✅ complete — BCLK + LRCLK generator
+├── tdm8_rx.vhd              ✅ complete — TDM8 receiver (192-bit)
+├── tb_tdm8_rx.vhd           ✅ complete — ModelSim testbench
+├── top_loopback.vhd         ✅ complete — loopback test (not final top)
+├── seven_seg_driver.vhd     ✅ present  — 7-seg display driver
+├── seven_seg_monitor.vhd    ✅ present  — channel data → 7-seg
+│
+├── pll_audio.vhd            🔴 TODO     — Quartus IP: 50MHz→12.288+18.432MHz
+├── top_tdm.vhd              🔴 TODO     — real top-level, 16ch, hardware pins
+│
+├── TDM_UATR.qpf             ✅ present  — Quartus project
+├── TDM_UATR.qsf             ⚠️ partial  — needs top_tdm port pin assignments
+├── TDM_UATR.sdc             ⚠️ partial  — needs PLL + I/O timing constraints
+│
+├── docs/
+│   ├── Step1.png            ✅ — ModelSim waveform screenshot
+│   ├── Step2.jpeg           ✅ — FPGA loopback pass photo
+│   └── Step3.png            ✅ — SignalTap capture screenshot
+│
+└── README.md                ← this file
+```
+
+---
+
+*ADAU1978 Rev B datasheet. Cyclone IV E. Quartus 18.1+. VHDL only.*
+*Steps 1–3 verified on hardware. Current task: top_tdm.vhd + PLL.*

@@ -351,6 +351,10 @@ tdm_adau1978_16ch/
 
 ### STEP 1 — ModelSim Simulation
 
+Status: Complete (2026-05-09)
+
+![Step 1 ModelSim waveform](docs/Step1.png)
+
 **Goal:** Prove TDM8 master and receiver are functionally correct.
 
 **What I need:**
@@ -384,6 +388,10 @@ tdm_adau1978_16ch/
 
 ### STEP 2 — FPGA Internal Loopback
 
+Status: Complete (2026-05-09)
+
+![Step 2 FPGA loopback pass](docs/Step2.jpeg)
+
 **Goal:** Prove TDM8 master + receiver work on real Cyclone IV silicon.
 
 **What I need:**
@@ -398,6 +406,10 @@ tdm_adau1978_16ch/
 ---
 
 ### STEP 3 — SignalTap II Logic Analyser
+
+Status: Complete (2026-05-09)
+
+![Step 3 SignalTap capture](docs/Step3.png)
 
 **Goal:** Observe internal signals in real time on hardware.
 

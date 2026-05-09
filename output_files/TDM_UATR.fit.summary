@@ -1,16 +1,16 @@
-Fitter Status : Successful - Wed May  6 20:25:38 2026
+Fitter Status : Successful - Sat May  9 21:26:17 2026
 Quartus Prime Version : 25.1std.0 Build 1129 10/21/2025 SC Lite Edition
 Revision Name : TDM_UATR
 Top-level Entity Name : top_loopback
 Family : Cyclone IV E
 Device : EP4CE6E22C8
 Timing Models : Final
-Total logic elements : 674 / 6,272 ( 11 % )
-    Total combinational functions : 360 / 6,272 ( 6 % )
-    Dedicated logic registers : 640 / 6,272 ( 10 % )
-Total registers : 640
-Total pins : 4 / 92 ( 4 % )
+Total logic elements : 3,774 / 6,272 ( 60 % )
+    Total combinational functions : 1,522 / 6,272 ( 24 % )
+    Dedicated logic registers : 3,410 / 6,272 ( 54 % )
+Total registers : 3410
+Total pins : 16 / 92 ( 17 % )
 Total virtual pins : 0
-Total memory bits : 0 / 276,480 ( 0 % )
+Total memory bits : 99,840 / 276,480 ( 36 % )
 Embedded Multiplier 9-bit elements : 0 / 30 ( 0 % )
 Total PLLs : 0 / 2 ( 0 % )

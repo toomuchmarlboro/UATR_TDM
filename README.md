@@ -469,6 +469,8 @@ Before connecting real ADAU1978 chips:
 - FPGA receives through `top_system`, UDP packets stream to PC
 - PC receiver confirms channel values match known pattern (not done)
 
+![Step 6 ESP32-WROOM-32D signal generator hardware](docs/SignalGenerator.jpeg)
+
 ---
 
 ### 🔴 Step 7 — ADAU1978 Real Hardware

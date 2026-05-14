@@ -4,11 +4,7 @@
 			"name" : "Top",
 			"pins" : [
 				{
-					"name" : "pass_led",
-					"strict" : false
-				},
-				{
-					"name" : "fail_led",
+					"name" : "lrclk_out",
 					"strict" : false
 				},
 				{
@@ -56,11 +52,15 @@
 					"strict" : false
 				},
 				{
+					"name" : "clk_50m",
+					"strict" : false
+				},
+				{
 					"name" : "rst_n",
 					"strict" : false
 				},
 				{
-					"name" : "clk_18m432",
+					"name" : "sdata_in_A",
 					"strict" : false
 				},
 				{

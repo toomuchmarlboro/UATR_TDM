@@ -2,8 +2,8 @@
 
 **16-channel 24-bit audio capture — 4× ADAU1978 → Cyclone IV FPGA → LAN8720A → Fiber → 7km Subsea → PC**
 
-> **Status:** Steps 1–3 complete and verified on hardware.
-> **Current task:** `top_tdm.vhd` + PLL (Step 4).
+> **Status:** Step 4 complete (TDM Acquisition Verified).
+> **Current task:** Step 6 (ESP32 Integration) and Step 5 (Ethernet Stack).
 
 ---
 
@@ -61,7 +61,7 @@ SUBSEA ARRAY                   TOPSIDE FPGA BOARD              TOPSIDE NETWORK
 | TDM architecture | 2× TDM8 — chip pairs share one SDATAOUT wire |
 | Slot width | 24 bits, Left Justified, no zero padding |
 | BCLK | 18.432 MHz (96k × 8 slots × 24 bits) |
-| MCLK to ADAU1978 | 12.288 MHz (128 × 96 kHz, MCS=001) |
+| MCLK to ADAU1978 | 18.432 MHz (192 × 96 kHz) |
 | LRCLK | 96 kHz, 1-BCLK-wide pulse (LR_MODE=1) |
 | FPGA | Altera Cyclone IV E, minimum system board, IO pins only |
 | Board oscillator | 50 MHz |
@@ -146,7 +146,7 @@ Stream B wire:  Chip 2  ch  9–12  → TDM slots 1–4
 ```
 FPGA output         Signal                Destination
 ───────────         ──────                ───────────
-mclk_out            12.288 MHz            all 4× MCLKIN
+mclk_out            18.432 MHz            all 4× MCLKIN
 bclk_out            18.432 MHz            all 4× BCLK
 lrclk_out           96 kHz pulse          all 4× LRCLK
 
@@ -254,7 +254,7 @@ Subsea: 9V buck regulator (e.g. LM2596) powers media converter
 1. Apply 3.3V AVDD. Hold PD/RST LOW.
 2. Assert PD/RST HIGH → internal LDO charges DVDD.
 3. Wait ~5 ms (DVDD > 1.2V, POR releases, safe margin).
-4. Apply stable 12.288 MHz MCLK (FPGA must be running).
+4. Apply stable 18.432 MHz MCLK (FPGA must be running).
 5. Wait 15 ms for PLL to lock.
 6. Poll register 0x01 bit 7 (PLL_LOCK) until = 1.
 7. Write registers: 0x04, 0x05, 0x06, 0x07, 0x08, 0x09.
@@ -273,7 +273,7 @@ Subsea: 9V buck regulator (e.g. LM2596) powers media converter
 
 ### ESP32 Role
 
-The ESP32 is used **only for substitute while ADAU1978 is not available on site yet** it is only used to simulate 2x TDM8 lines to verify FPGA logic working as intended. One ESP32 represents 2x ADAU1978 chips. WE have a total of 4x ADAU1978 that is going to be on the final board. We have 2x ESP32s for testing purposes.
+The ESP32 is used **only for substitute while ADAU1978 is not available on site yet** it is only used to simulate 2x TDM8 lines to verify FPGA logic working as intended. One ESP32 represents 2x ADAU1978 chips. WE have a total of 4x ADAU1978 that is going to be on the final board. We have 2x ESP32s for testing purposes. (for claude, this step of making a ESP32 testbed is done)
 To allow for immediate visual verification on the FPGA's 7-segment display and the PC USB receiver, the ESP32s output distinct, human-readable hexadecimal patterns rather than actual audio waveforms. Data is clocked out MSB-first, Left-Justified.
 
 **Stream A (`sdata_in_A`)**
@@ -303,9 +303,8 @@ Single ALTPLL instance `pll_audio.vhd` generates all clocks:
 
 | Output | Frequency | Purpose |
 |--------|-----------|---------|
-| c0 | 12.288 MHz | MCLK → all ADAU1978 MCLKIN pins |
-| c1 | 18.432 MHz | TDM BCLK source → `tdm8_master` |
-| c2 | 50 MHz | REF_CLK → LAN8720A (only if no onboard crystal on module) |
+| c0 | 18.432 MHz | Unified MCLK & TDM BCLK source |
+| c1 | 50 MHz | REF_CLK → LAN8720A (only if no onboard crystal on module) |
 
 ---
 
@@ -367,10 +366,10 @@ Frame budget = 83.3 µs  →  comfortable margin
 | `seven_seg_driver.vhd` | ✅ Present | 7-segment display driver |
 | `seven_seg_monitor.vhd` | ✅ Present | Routes channel slice to 7-seg for live debug |
 | `TDM_UATR.qpf` | ✅ Present | Quartus project file |
-| `TDM_UATR.qsf` | ⚠️ Partial | Needs pin assignments for all new ports |
-| `TDM_UATR.sdc` | ⚠️ Partial | Needs PLL clocks and IO timing constraints |
-| `pll_audio.vhd` | 🔴 Step 4 | ALTPLL: 50 MHz → 12.288 / 18.432 / 50 MHz |
-| `top_tdm.vhd` | 🔴 Step 4 | TDM top-level: PLL + master + 2× rx + IO ports |
+| `TDM_UATR.qsf` | ✅ Complete | Pin assignments completed (Unified 18.432 MHz on Pin 113) |
+| `TDM_UATR.sdc` |  | Needs PLL clocks and IO timing constraints |
+| `pll_audio.vhd` | ✅ Complete | Raw VHDL ALTPLL: 50 MHz → 18.432 / 50 MHz |
+| `top_tdm.vhd` | ✅ Complete | TDM top-level, synthesized and verified on hardware |
 | `packet_formatter.vhd` | 🔴 Step 5 | Latches ch_data per frame, builds 410-byte payload |
 | `rmii_tx.vhd` | 🔴 Step 5 | RMII MAC TX — preamble, data, CRC32, IFG |
 | `crc32.vhd` | 🔴 Step 5 | Ethernet FCS computation |
@@ -403,63 +402,24 @@ BCLK/LRCLK framing, shift register contents, and `ch_data_out` confirmed correct
 
 ---
 
+### ✅ Step 4 — `top_tdm.vhd` and PLL Verified
+
+**Synthesis & Routing:**
+- Resolved duplicate entities and removed simulation testbenches from synthesis.
+- Direct integration of raw VHDL for `pll_audio` bypassing `.qip` manifest.
+- Resolved I/O over-utilization by keeping TDM data internal. Final I/O footprint: 15 pins.
+- Unified BCLK and MCLK to 18.432 MHz, reducing PLL complexity. Clock routed to GPIO Pin 113.
+
+**HIL Verification:**
+- Successfully flashed `.sof` via JTAG.
+- 7-segment display correctly initialized to `0000` and configured to track most significant 16 bits of Channel 1 (`ch_data_A_int(191 downto 176)`).
+
+### ✅ Flash Configuration
+- **Permanent Configuration:** Complete the JTAG Indirect Configuration (.jic) burn to the EPCS flash to ensure subsea autonomy.
+
+---
+
 ## Remaining Steps
-
-### 🔴 Step 4 — `top_tdm.vhd` and PLL
-
-**4a — Generate `pll_audio.vhd`**
-- Quartus: Tools → IP Catalog → ALTPLL
-- Input: 50 MHz
-- c0: 12.288 MHz (MCLK)
-- c1: 18.432 MHz (BCLK source)
-- c2: 50 MHz (REF_CLK for LAN8720A — only if module has no onboard crystal)
-
-**4b — Write `top_tdm.vhd`**
-
-```vhdl
-entity top_tdm is
-  port (
-    clk_50m    : in  std_logic;
-    rst_n      : in  std_logic;
-    mclk_out   : out std_logic;
-    bclk_out   : out std_logic;
-    lrclk_out  : out std_logic;
-    sdata_in_A : in  std_logic;
-    sdata_in_B : in  std_logic;
-    ch_data_A  : out std_logic_vector(191 downto 0);
-    ch_data_B  : out std_logic_vector(191 downto 0)
-  );
-end entity top_tdm;
-```
-
-Internal instances:
-```
-u_pll     pll_audio      50 MHz → c0 12.288, c1 18.432, c2 50
-u_master  tdm8_master    c1 → bclk_int + lrclk_int
-u_rx_A    tdm8_rx        sdata_in_A → ch_data_A
-u_rx_B    tdm8_rx        sdata_in_B → ch_data_B   (second instance, same entity)
-```
-
-**4c — Update `TDM_UATR.qsf`**
-Add pin assignments for: `mclk_out`, `bclk_out`, `lrclk_out`, `sdata_in_A`, `sdata_in_B`, all RMII signals. All pins on 3.3V IO banks.
-
-**4d — Update `TDM_UATR.sdc`**
-```tcl
-create_clock -name clk_50m  -period 20.000 [get_ports clk_50m]
-create_generated_clock -name clk_mclk  ...   # c0 from PLL
-create_generated_clock -name clk_bclk  ...   # c1 from PLL
-create_generated_clock -name clk_rmii  ...   # c2 from PLL
-set_false_path -from [get_clocks clk_50m]  -to [get_clocks clk_bclk]
-set_false_path -from [get_clocks clk_bclk] -to [get_clocks clk_rmii]
-set_output_delay -clock clk_bclk -max 5.0  [get_ports {bclk_out lrclk_out mclk_out}]
-set_input_delay  -clock clk_bclk -max 18.0 [get_ports {sdata_in_A sdata_in_B}]
-```
-
-**4e — Change top-level entity**
-Assignments → Settings → General → Top-level entity: `top_tdm`
-
-**4f — Connect `seven_seg_monitor`**
-Wire `ch_data_A[191:168]` (channel 1) to the monitor for live display.
 
 ---
 
@@ -499,11 +459,12 @@ u_arp      arp_responder       handles incoming ARP
 
 ---
 
-### ✅ Step 6 — ESP32-WROOM-32D Stub Test
+### [⚠️ Partial] Step 6 — ESP32-WROOM-32D Stub Test
 
 Before connecting real ADAU1978 chips:
-- ESP32 hardware done, but not tested to FPGA
-- ESP bit-bangs slow TDM8 (~50 kHz BCLK) with known pattern on sdata_in_A and sdata_in_B
+- ESP32 hardware done, but not fully integrated to the new clock routing
+- **Action Required:** Physical rerouting of the ESP32 breadboard to match the unified 18.432 MHz clock on Pin 113.
+- ESP bit-bangs TDM8 with known pattern on sdata_in_A and sdata_in_B
 - ESP code and config available through https://github.com/toomuchmarlboro/ESP32_BitBanger
 - FPGA receives through `top_system`, UDP packets stream to PC
 - PC receiver confirms channel values match known pattern (not done)
@@ -519,7 +480,7 @@ Pre-power checklist:
 - [ ] IOVDD = 3.3V on all chips, matching FPGA IO bank
 - [ ] ADDR1/ADDR0 strapped: 0x11, 0x31, 0x51, 0x71
 - [ ] PD/RST held LOW until supplies stable, then HIGH
-- [ ] MCLK (12.288 MHz) stable before PD/RST goes HIGH
+- [ ] MCLK (18.432 MHz) stable before PD/RST goes HIGH
 - [ ] PLL_LOCK confirmed before PWUP written
 
 Common failure modes:
@@ -594,4 +555,4 @@ while True:
 ---
 
 *Analog Devices ADAU1978 Rev B. FTDI LAN8720A. Altera Cyclone IV E. Quartus Prime 18.1+.*
-*Steps 1–3 verified on hardware. Current task: Step 4 — top_tdm.vhd + pll_audio.vhd.*
+*Step 4 (TDM Acquisition) verified on hardware. Current tasks: ESP32 Integration (Step 6) and Ethernet Stack (Step 5).*

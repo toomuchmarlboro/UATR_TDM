@@ -39,13 +39,10 @@
 
 set_global_assignment -name FAMILY "Cyclone IV E"
 set_global_assignment -name DEVICE EP4CE6E22C8
-set_global_assignment -name TOP_LEVEL_ENTITY top_loopback
+set_global_assignment -name TOP_LEVEL_ENTITY top_tdm
 set_global_assignment -name ORIGINAL_QUARTUS_VERSION 25.1STD.0
 set_global_assignment -name PROJECT_CREATION_TIME_DATE "19:25:10  MAY 06, 2026"
-set_global_assignment -name LAST_QUARTUS_VERSION "25.1std.0 Lite Edition"
-set_global_assignment -name VHDL_FILE top_loopback.vhd
-set_global_assignment -name VHDL_FILE tdm8_rx.vhd
-set_global_assignment -name VHDL_FILE tdm8_master.vhd
+set_global_assignment -name LAST_QUARTUS_VERSION "25.1std.0 SP0.02std Lite Edition"
 set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
 set_global_assignment -name EDA_SIMULATION_TOOL "Questa Altera FPGA (VHDL)"
 set_global_assignment -name EDA_TIME_SCALE "1 ps" -section_id eda_simulation
@@ -54,29 +51,16 @@ set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_
 set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_symbol
 set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_signal_integrity
 set_global_assignment -name EDA_GENERATE_FUNCTIONAL_NETLIST OFF -section_id eda_board_design_boundary_scan
-set_global_assignment -name PARTITION_NETLIST_TYPE SOURCE -section_id Top
-set_global_assignment -name PARTITION_FITTER_PRESERVATION_LEVEL PLACEMENT_AND_ROUTING -section_id Top
-set_global_assignment -name PARTITION_COLOR 16764057 -section_id Top
 set_global_assignment -name MIN_CORE_JUNCTION_TEMP 0
 set_global_assignment -name MAX_CORE_JUNCTION_TEMP 85
 set_location_assignment PIN_23 -to clk_18m432
 set_location_assignment PIN_86 -to fail_led
 set_location_assignment PIN_87 -to pass_led
 set_location_assignment PIN_25 -to rst_n
-set_global_assignment -name SDC_FILE TDM_UATR.sdc
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to rst_n
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to pass_led
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to fail_led
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to clk_18m432
 set_location_assignment PIN_133 -to dig[3]
 set_location_assignment PIN_135 -to dig[2]
 set_location_assignment PIN_136 -to dig[1]
 set_location_assignment PIN_137 -to dig[0]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig[3]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig[2]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig[1]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig[0]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig
 set_location_assignment PIN_128 -to seg[0]
 set_location_assignment PIN_121 -to seg[1]
 set_location_assignment PIN_125 -to seg[2]
@@ -85,16 +69,6 @@ set_location_assignment PIN_132 -to seg[4]
 set_location_assignment PIN_126 -to seg[5]
 set_location_assignment PIN_124 -to seg[6]
 set_location_assignment PIN_127 -to seg[7]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[0]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[2]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[1]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[3]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[4]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[5]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[6]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[7]
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg
-set_global_assignment -name VHDL_FILE seven_seg_driver.vhd
 set_global_assignment -name ENABLE_SIGNALTAP ON
 set_global_assignment -name USE_SIGNALTAP_FILE output_files/stp1.stp
 set_global_assignment -name SLD_NODE_CREATOR_ID 110 -section_id auto_signaltap_0
@@ -517,7 +491,6 @@ set_global_assignment -name SLD_NODE_PARAMETER_ASSIGNMENT "SLD_TRIGGER_IN_ENABLE
 set_global_assignment -name SLD_NODE_PARAMETER_ASSIGNMENT "SLD_TRIGGER_PIPELINE=0" -section_id auto_signaltap_0
 set_global_assignment -name SLD_NODE_PARAMETER_ASSIGNMENT "SLD_COUNTER_PIPELINE=0" -section_id auto_signaltap_0
 set_global_assignment -name SLD_NODE_PARAMETER_ASSIGNMENT "SLD_TRIGGER_LEVEL_PIPELINE=1" -section_id auto_signaltap_0
-set_global_assignment -name SIGNALTAP_FILE output_files/stp1.stp
 set_instance_assignment -name CONNECT_TO_SLD_NODE_ENTITY_PORT acq_trigger_in[0] -to bclk_int -section_id auto_signaltap_0
 set_instance_assignment -name CONNECT_TO_SLD_NODE_ENTITY_PORT acq_trigger_in[1] -to lrclk_int -section_id auto_signaltap_0
 set_instance_assignment -name CONNECT_TO_SLD_NODE_ENTITY_PORT acq_trigger_in[2] -to sdata_internal -section_id auto_signaltap_0
@@ -548,6 +521,54 @@ set_global_assignment -name SLD_NODE_PARAMETER_ASSIGNMENT "SLD_SAMPLE_DEPTH=512"
 set_global_assignment -name SLD_NODE_PARAMETER_ASSIGNMENT "SLD_RAM_PIPELINE=0" -section_id auto_signaltap_0
 set_global_assignment -name SLD_NODE_PARAMETER_ASSIGNMENT "SLD_ADVANCED_TRIGGER_ENTITY=basic,1," -section_id auto_signaltap_0
 set_global_assignment -name SLD_NODE_PARAMETER_ASSIGNMENT "SLD_ENABLE_ADVANCED_TRIGGER=0" -section_id auto_signaltap_0
-set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
+set_global_assignment -name POWER_PRESET_COOLING_SOLUTION "23 MM HEAT SINK WITH 200 LFPM AIRFLOW"
+set_global_assignment -name POWER_BOARD_THERMAL_MODEL "NONE (CONSERVATIVE)"
+set_global_assignment -name VHDL_FILE top_loopback.vhd
+set_global_assignment -name VHDL_FILE tdm8_rx.vhd
+set_global_assignment -name VHDL_FILE tdm8_master.vhd
+set_global_assignment -name SDC_FILE TDM_UATR.sdc
+set_global_assignment -name VHDL_FILE seven_seg_driver.vhd
+set_global_assignment -name QIP_FILE pll_audio.qip
+set_global_assignment -name SIGNALTAP_FILE output_files/stp1.stp
+set_global_assignment -name VHDL_FILE seven_seg_monitor.vhd
+set_global_assignment -name VHDL_FILE top_tdm.vhd
+set_global_assignment -name PARTITION_NETLIST_TYPE SOURCE -section_id Top
+set_global_assignment -name PARTITION_FITTER_PRESERVATION_LEVEL PLACEMENT_AND_ROUTING -section_id Top
+set_global_assignment -name PARTITION_COLOR 16764057 -section_id Top
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to rst_n
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to pass_led
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to fail_led
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to clk_18m432
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig[3]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig[2]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig[1]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig[0]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to dig
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[0]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[2]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[1]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[3]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[4]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[5]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[6]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg[7]
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to seg
 set_instance_assignment -name IO_STANDARD "2.5 V" -to altera_reserved_tms
+
+# ==========================================
+# AUDIO INTERFACE PINS (ADAU1978 / ESP32)
+# ==========================================
+set_location_assignment PIN_113 -to bclk_out
+set_location_assignment PIN_114 -to lrclk_out
+set_location_assignment PIN_115 -to sdata_in_A
+set_location_assignment PIN_119 -to sdata_in_B
+
+# Force 3.3-V LVTTL Standard to match ESP32 logic levels
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to bclk_out
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to lrclk_out
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to sdata_in_A
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to sdata_in_B
+
+set_global_assignment -name NUM_PARALLEL_PROCESSORS ALL
+set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
 set_global_assignment -name SLD_FILE db/stp1_auto_stripped.stp

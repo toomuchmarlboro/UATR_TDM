@@ -1,0 +1,12 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Prefer CRLF for Quartus-generated .sopcinfo files to avoid LF->CRLF warnings
+*.sopcinfo text eol=crlf
+
+# Treat common binary/build artifacts as binary
+*.sof binary
+*.qdb binary
+*.wlf binary
+work/* binary
+db/* binary

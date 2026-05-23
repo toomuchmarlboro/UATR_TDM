@@ -36,7 +36,8 @@ architecture rtl of top_tdm is
             rst        : in  std_logic;
             clk_in     : in  std_logic;
             bclk_out   : out std_logic;
-            lrclk_out  : out std_logic
+            lrclk_out  : out std_logic;
+            lrclk_true : out std_logic  -- <--- ADD THIS MISSING LINE
         );
     end component;
 
@@ -68,6 +69,7 @@ architecture rtl of top_tdm is
     
     signal bclk_int    : std_logic;
     signal lrclk_int   : std_logic;
+	 signal lrclk_rx_int : std_logic;
     
     signal ch_data_A_int : std_logic_vector(191 downto 0);
     signal ch_data_B_int : std_logic_vector(191 downto 0);
@@ -75,7 +77,7 @@ architecture rtl of top_tdm is
 begin
 
     -- Hold system in reset until PLL stabilizes
-    rst_int <= (not rst_n) or (not pll_locked);
+    rst_int <= '0';
     
     -- Route internal clocks to external pins
     bclk_out  <= bclk_int;
@@ -90,16 +92,17 @@ begin
     );
 
     u_master : tdm8_master port map (
-        rst       => rst_int,
-        clk_in    => clk_18m432,
-        bclk_out  => bclk_int,
-        lrclk_out => lrclk_int
+        rst        => rst_int,   -- (Make sure this is still '0'!)
+        clk_in     => clk_18m432,
+        bclk_out   => bclk_int,
+        lrclk_out  => lrclk_int,
+        lrclk_true => lrclk_rx_int  -- <--- ADD THIS LINE
     );
 
     u_rx_A : tdm8_rx port map (
         rst         => rst_int,
         bclk_in     => bclk_int,
-        lrclk_in    => lrclk_int,
+        lrclk_in    => lrclk_rx_int, -- <--- CHANGED
         sdata_in    => sdata_in_A,
         ch_data_out => ch_data_A_int
     );
@@ -107,7 +110,7 @@ begin
     u_rx_B : tdm8_rx port map (
         rst         => rst_int,
         bclk_in     => bclk_int,
-        lrclk_in    => lrclk_int,
+        lrclk_in    => lrclk_rx_int, -- <--- CHANGED
         sdata_in    => sdata_in_B,
         ch_data_out => ch_data_B_int
     );

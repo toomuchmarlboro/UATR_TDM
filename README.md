@@ -2,8 +2,15 @@
 
 **16-channel 24-bit audio capture — 4× ADAU1978 → Cyclone IV FPGA → LAN8720A → Fiber → 7km Subsea → PC**
 
-> **Status:** Step 4 complete (TDM Acquisition Verified).
-> **Current task:** Step 6 (ESP32 Integration) and Step 5 (Ethernet Stack).
+> **Status (2026-08-08):**
+> - ✅ **Ethernet stack complete and verified on hardware** — ~11,950 packets/s, 0 FPGA-side
+>   sequence gaps, FCS and IP checksum confirmed in Wireshark.
+> - ✅ **ADAU1978 I2C bring-up complete** — all four parts answer, every register read back
+>   byte-exact and cross-checked field-by-field against the datasheet.
+> - ✅ **Analog supplies and VREF good** — 1.5 V on all four parts, ±15 V stable.
+> - 🔴 **BLOCKING: no TDM audio data.** Both LMK1C1104 clock fanout buffers (U1, U2) are
+>   damaged, so MCLK/BCLK/LRCLK never reach the ADCs at a valid logic level. See
+>   [Hardware Bring-Up Log](#hardware-bring-up-log).
 
 ---
 
@@ -357,26 +364,82 @@ Frame budget = 83.3 µs  →  comfortable margin
 
 ## File Index
 
+Everything below is in the synthesis hierarchy (`TDM_UATR.qsf`, plus the two `.qip`
+IP wrappers) except the two testbenches. Superseded step-1/2 files (`top_tdm.vhd`,
+`top_loopback.vhd`, `seven_seg*.vhd`) were removed on 2026-08-08 — recover from git
+history if ever needed.
+
+### RTL — top level
+
 | File | Status | Description |
 |------|--------|-------------|
-| `tdm8_master.vhd` | ✅ Complete | Generates BCLK + LRCLK from 18.432 MHz input |
-| `tdm8_rx.vhd` | ✅ Complete | TDM8 receiver — 192-bit shift reg, latch on LRCLK |
-| `tb_tdm8_rx.vhd` | ✅ Complete | ModelSim testbench — known pattern, frame assertions |
-| `top_loopback.vhd` | ✅ Complete | FPGA loopback test — not the final top-level |
-| `seven_seg_driver.vhd` | ✅ Present | 7-segment display driver |
-| `seven_seg_monitor.vhd` | ✅ Present | Routes channel slice to 7-seg for live debug |
-| `TDM_UATR.qpf` | ✅ Present | Quartus project file |
-| `TDM_UATR.qsf` | ✅ Complete | Pin assignments completed (Unified 18.432 MHz on Pin 113) |
-| `TDM_UATR.sdc` |  | Needs PLL clocks and IO timing constraints |
-| `pll_audio.vhd` | ✅ Complete | Raw VHDL ALTPLL: 50 MHz → 18.432 / 50 MHz |
-| `top_tdm.vhd` | ✅ Complete | TDM top-level, synthesized and verified on hardware |
-| `packet_formatter.vhd` | 🔴 Step 5 | Latches ch_data per frame, builds 410-byte payload |
-| `rmii_tx.vhd` | 🔴 Step 5 | RMII MAC TX — preamble, data, CRC32, IFG |
-| `crc32.vhd` | 🔴 Step 5 | Ethernet FCS computation |
-| `udp_tx_core.vhd` | 🔴 Step 5 | Builds Ethernet + IP + UDP headers |
-| `arp_responder.vhd` | 🔴 Step 5 | Responds to ARP so PC resolves FPGA IP |
-| `top_system.vhd` | 🔴 Step 5 | Final top-level: top_tdm + Ethernet stack |
-| `pc_receiver.py` | 🔴 Step 8 | Python UDP receiver, sync detection, sample output |
+| `top_system.vhd` | ✅ Verified | Top level. Clock/reset, staged power-up, I2C open-drain buffers, TX arbiter, build-option constants |
+
+### RTL — audio path
+
+| File | Status | Description |
+|------|--------|-------------|
+| `tdm8_master.vhd` | ✅ Verified | Generates LRCLK (1 BCLK pulse @ 96 kHz) from 18.432 MHz |
+| `tdm8_rx.vhd` | ✅ Verified | TDM8 receiver — 192-bit shift reg, latch on LRCLK |
+| `tdm16_merge.vhd` | ✅ Verified | Merges the two TDM8 streams into 16 channels |
+| `pll_audio.vhd` | ✅ Verified | ALTPLL: 50 MHz → 18.432 MHz (×80 / ÷217) |
+| `async_fifo.vhd` | ✅ Verified | Clock-domain crossing, 18.432 MHz → 50 MHz |
+
+### RTL — ADC control
+
+| File | Status | Description |
+|------|--------|-------------|
+| `i2c_master.vhd` | ✅ Verified | I2C master. Bus recovery, probe mode, repeated-START reads |
+| `adau_sequencer.vhd` | ✅ Verified | 128-address scan, soft reset, register boot, two-pass PWUP, live PLL poll |
+
+### RTL — Ethernet
+
+| File | Status | Description |
+|------|--------|-------------|
+| `crc32.vhd` | ✅ Verified | Ethernet FCS (0x04C11DB7). **Root cause of the original "Ethernet dead" fault** |
+| `rmii_tx.vhd` | ✅ Verified | RMII MAC TX — preamble, data, FCS, IFG |
+| `rmii_rx.vhd` | ⚠️ Untested | RMII MAC RX. No hardware traffic has ever exercised it |
+| `udp_tx_core.vhd` | ✅ Verified | Ethernet + IP + UDP headers, 452-byte frame |
+| `udp_rx_core.vhd` | ⚠️ Untested | UDP receive path |
+| `arp_responder.vhd` | ✅ Verified | ARP replies so the PC resolves the FPGA IP |
+| `packet_formatter.vhd` | ✅ Verified | 10-byte header + 8 × 50-byte frames = 410-byte payload |
+
+### Host tools (Python 3)
+
+| File | Description |
+|------|-------------|
+| `udp_monitor.py` | Link rate, loss, SDATA activity, per-channel statistics, `--wav`, `--align` |
+| `i2c_scan.py` | Decodes the boot-time I2C diagnostics: bus health, 128-address sweep, per-part table, register verify |
+| `check_sync.py` | Cross-checks the Python decoders against the RTL **and** the datasheet. 31 assertions |
+
+### Testbenches (not in the synthesis hierarchy)
+
+| File | Description |
+|------|-------------|
+| `tb_tdm8_rx.vhd` | ModelSim — known pattern, frame assertions |
+| `tb_tdm16.vhd` | ModelSim — 16-channel merge |
+
+---
+
+## Build Options
+
+Compile-time constants. All are documented in-place with the reasoning.
+
+`top_system.vhd`
+
+| Constant | Default | Effect |
+|----------|---------|--------|
+| `C_I2C_SWAP` | `true` | Compensates a **schematic error**: the net named `SCL` lands on ADAU pin 17, which is SDA. Do not "fix" without fixing the copper |
+| `C_LRCLK_TEST_50PCT` | `false` | Drives LRCLK as a 0.27 Hz square for continuity testing. A real LRCLK is a 54 ns pulse that reads ~17 mV on a DMM |
+| `C_ENABLE_48V` | `false` | Holds 48 V phantom power off |
+| `C_BUFFER_EN_ACTIVE_HIGH` | `true` | LMK1C1104 `1G` polarity |
+
+`adau_sequencer.vhd`
+
+| Constant | Default | Effect |
+|----------|---------|--------|
+| `C_SOFT_RESET_FIRST` | `true` | Issues S_RST before configuring, so the state machine initialises with clocks already stable |
+| `C_VERIFY_IDX` | `0` | Which ADC the register verify reads back (0=U19, 1=U20, 2=U37, 3=U38). Only one part can be verified per boot |
 
 ---
 
@@ -423,7 +486,75 @@ BCLK/LRCLK framing, shift register contents, and `ch_data_out` confirmed correct
 
 ---
 
-### 🔴 Step 5 — Ethernet Stack
+### ✅ Step 5 — Ethernet Stack (COMPLETE, verified on hardware)
+
+Measured: ~11,950 packets/s, 39 MBit/s payload, 0 FPGA-side sequence gaps, correct FCS
+and IP checksum in Wireshark, payload magic `ad a1 97 78` with incrementing sequence.
+
+The stack did not work at first, and the cause was **`crc32.vhd`** — 7 of the 32 XOR
+equations (bits 10, 11, 12, 16, 17, 22, 23) carried spurious terms. Every frame left the
+FPGA with a garbage FCS and the PC's NIC discarded all of it silently. Verified after the
+fix: `"123456789"` → `0x649C2FD3` (bit-reverse of the canonical `0xCBF43926`), RX residue
+`0xC704DD7B`. Contributing bugs fixed alongside: a `tx_start` pulse/level mismatch that
+deadlocked `udp_tx_core`, an ARP off-by-one, and a wrong IP checksum.
+
+---
+
+## Hardware Bring-Up Log
+
+Findings from bringing up the Souncard_Robomarine 1.0 PCB. Recorded because none of it
+is derivable from the RTL.
+
+### Schematic errors found
+
+| Error | Impact | Resolution |
+|-------|--------|------------|
+| **SDA/SCL crossed** — net `SCL` wires to ADAU pin 17 (really SDA), net `SDA` to pin 18 (really SCL). The KiCad symbol is correct; the wiring is not | I2C could never work as drawn | Compensated in firmware by `C_I2C_SWAP = true`. Fix the copper in the next revision |
+| **OPA1671 on +15 V** — U44–U47 (VREF→VCOM buffers) have V+ on +15 V against a **6 V absolute maximum** (recommended 1.7–5.5 V) | Destroyed all four. Their damaged inputs clamped VREF to 0–0.8 V on every ADC, and they loaded the ±15 V rail | **Removed, not replaced.** OPA1632 `VOCM` self-biases to mid-rail (0 V), which is correct on ±15 V, and the ADC inputs are AC-coupled — the buffers were never needed. Delete them in the next revision |
+| **PLL loop filter returns to GND**, not AVDD2 as Table 8 requires | None observed | Disproven as a fault: U19/U37 lock with the GND return. Component values (1 kΩ / 390 pF / 5600 pF) are correct for the MCLK option |
+
+### Firmware bugs found
+
+- **`i2c_master.vhd`** — `ena` was sampled only on quarter-bit boundaries while the
+  sequencer pulsed it for one cycle, so the pulse was missed ~99% of the time. **No I2C
+  transaction had ever run.**
+- **PWUP ordering** — the datasheet requires PWUP be asserted ≥10 ms after DVDD > 1.2 V
+  with stable clocks. Boot is now two-pass: configure everything, settle 30 ms, then PWUP.
+- **False PLL-lock reporting** — `i2c_master` pre-loads `data_rd` with `0xFF` to invalidate
+  aborted reads. The live poll took bit 7 of that blindly, so a *failed* read reported
+  `PLL_LOCK = 1`. Reported four locked PLLs on a board whose MCLK never arrived.
+- **Scan abort** — the address sweep stopped at 9 answers, collapsing "hard stuck-low SDA"
+  (128 answers) and "a few glitched bits" (9) onto one number. Now always sweeps all 128.
+
+### Measurement traps hit (all cost real time)
+
+- **LRCLK is a 54 ns pulse at 96 kHz** — 0.5% duty, so a *working* LRCLK reads **~17 mV**
+  on a multimeter. Use `C_LRCLK_TEST_50PCT`, or a scope.
+- **18 MHz on a handheld DMM** reads as a meaningless fraction of a volt. MCLK/BCLK cannot
+  be checked with a meter at all.
+- **Scope frequency counters quantise.** An 18.432 MHz clock (54.25 ns) on a 100 MSa/s
+  timebase alternates between "20 MHz" (50 ns) and "16.6 MHz" (60 ns). Both are the same
+  correct clock.
+- **Resistance to GND across bulk capacitance is meaningless** — the meter charges the cap
+  and the reading climbs. A rail also reads "shorted" on a continuity beeper because of the
+  substrate diodes in every IC on it; reverse the probes and the asymmetry gives it away.
+- **A `.sof` is volatile.** Power-cycling boots the `.jic` in flash instead — usually an
+  older build. Power-sequencing changes cannot be tested with a `.sof` at all.
+
+### Outstanding
+
+🔴 **Both LMK1C1104 clock buffers (U1, U2) are damaged.** Confirmed with a 10× probe:
+their inputs load the FPGA's 3.3 V outputs down to 2.0 V, and their outputs produce
+0.9 V (U1) and millivolts (U2). The ADAU1978 needs **VIH = 0.7 × IOVDD = 2.31 V**, so the
+ADCs never see a valid clock, never frame, and leave SDATAOUT high-Z. Everything upstream
+and downstream is verified good — the FPGA drives a clean 3.3 V when jumpered directly.
+
+Fix: replace both, or bypass in place by bridging pin 1 to pins 3/5/7/8 on each footprint
+(the FPGA can drive these loads directly; the 49.9 Ω series resistors stay).
+
+---
+
+### 🔴 Step 5 (historical notes) — Ethernet Stack
 
 **5a — `crc32.vhd`**
 Standard Ethernet CRC32 (polynomial 0x04C11DB7). Takes data stream, outputs 4-byte FCS appended to frame.

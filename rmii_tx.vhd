@@ -7,11 +7,20 @@ entity rmii_tx is
         clk_50m      : in  std_logic;
         rst          : in  std_logic;
         
-        -- Interface from udp_tx_core
+        -- Interface from udp_tx_core / arp_responder
+        --
+        -- HANDSHAKE CONTRACT (important):
+        --   tx_start is a LEVEL. Hold it high from before the first byte until
+        --   the last byte has been consumed; drop it to terminate the frame.
+        --   tx_ready is an ACKNOWLEDGE, not a request. When tx_ready is high we
+        --   latch whatever is on tx_data IN THAT SAME CYCLE. The producer must
+        --   therefore already be presenting byte N when tx_ready rises, and may
+        --   only advance to byte N+1 at the end of that cycle.
         tx_start     : in  std_logic;
         tx_data      : in  std_logic_vector(7 downto 0);
         tx_ready     : out std_logic;
-        
+        tx_busy      : out std_logic; -- '1' from PREAMBLE through end of IFG
+
         -- Physical Pins to LAN8720A
         rmii_tx_en   : out std_logic;
         rmii_txd     : out std_logic_vector(1 downto 0)
@@ -44,6 +53,10 @@ architecture rtl of rmii_tx is
     signal crc_value : std_logic_vector(31 downto 0);
 
 begin
+
+    -- The arbiter in top_system must not hand the line to another client while
+    -- we are still emitting the FCS or serving out the inter-frame gap.
+    tx_busy <= '0' when state = IDLE else '1';
 
     u_crc : crc32 port map (
         clk     => clk_50m,

@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""
+TDM_UATR receive-side monitor.
+
+Captures the FPGA's UDP audio stream, then reports link throughput, packet loss
+and per-channel audio quality. Standard library only.
+
+    python udp_monitor.py                 # 5 second capture, full report
+    python udp_monitor.py -s 10           # longer capture
+    python udp_monitor.py --wav out       # also write out_ch01.wav .. out_ch16.wav
+    python udp_monitor.py --align         # scan for TDM bit-alignment offset
+
+Packet format produced by packet_formatter.vhd (410 byte payload):
+    header, 10 bytes   AD A1 97 78 | seq_num(4, BE) | frame_count(2, BE) = 8
+    then 8 frames of 50 bytes each:
+        frame_index(2, BE) | 48 bytes audio
+    the 48 bytes are 16 channels x 24-bit signed big-endian, channel 1 first
+"""
+
+import argparse
+import math
+import socket
+import struct
+import sys
+import time
+import wave
+
+MAGIC        = bytes([0xAD, 0xA1, 0x97, 0x78])
+HDR_LEN      = 10
+FRAME_LEN    = 50
+FRAMES_PKT   = 8
+PAYLOAD_LEN  = HDR_LEN + FRAMES_PKT * FRAME_LEN      # 410
+WIRE_LEN     = 452                                    # incl. eth+ip+udp headers
+CHANNELS     = 16
+SAMPLE_BYTES = 3
+FULL_SCALE   = 1 << 23                                # 24-bit signed
+SAMPLE_RATE   = 96000
+EXPECTED_PPS = SAMPLE_RATE / FRAMES_PKT               # 12000
+
+
+# ----------------------------------------------------------------- capture ---
+def capture(port, seconds, bind):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:                       # big buffer so the kernel does not drop on us
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 << 20)
+    except OSError:
+        pass
+    actual = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    s.bind((bind, port))
+    s.settimeout(3.0)
+
+    print("listening on %s:%d for %.1f s  (rcvbuf %.1f MB)"
+          % (bind or "0.0.0.0", port, seconds, actual / 1e6))
+
+    pkts = []
+    try:
+        first = s.recv(2048)
+    except socket.timeout:
+        print("\nNo packets received in 3 s.")
+        print("  - is the FPGA powered and the link up?")
+        print("  - is this PC on 192.168.1.0/24?")
+        print("  - Windows Firewall will silently drop inbound UDP: allow python,")
+        print("    or test with the firewall off on the private profile.")
+        return None, 0.0
+    pkts.append(first)
+
+    t0 = time.perf_counter()
+    deadline = t0 + seconds
+    while time.perf_counter() < deadline:
+        try:
+            pkts.append(s.recv(2048))
+        except socket.timeout:
+            break
+    elapsed = time.perf_counter() - t0
+    s.close()
+    return pkts, elapsed
+
+
+# ------------------------------------------------------------------ parse ----
+def parse(pkts):
+    """-> (samples[ch][n], stats dict). samples are ints, -2^23..2^23-1"""
+    samples = [[] for _ in range(CHANNELS)]
+    seqs = []
+    bad_magic = bad_len = bad_index = 0
+
+    for p in pkts:
+        if len(p) != PAYLOAD_LEN:
+            bad_len += 1
+            continue
+        if p[0:4] != MAGIC:
+            bad_magic += 1
+            continue
+        seqs.append(struct.unpack(">I", p[4:8])[0])
+
+        off = HDR_LEN
+        for f in range(FRAMES_PKT):
+            # byte 0 of each frame is the I2C status byte, byte 1 the index
+            if p[off + 1] != f:
+                bad_index += 1
+            a = off + 2
+            for c in range(CHANNELS):
+                b = a + c * SAMPLE_BYTES
+                samples[c].append(
+                    int.from_bytes(p[b:b + SAMPLE_BYTES], "big", signed=True))
+            off += FRAME_LEN
+
+    return samples, {"seqs": seqs, "bad_magic": bad_magic,
+                     "bad_len": bad_len, "bad_index": bad_index}
+
+
+def loss_report(seqs):
+    """-> (expected, received, lost, resets)"""
+    if len(seqs) < 2:
+        return 0, len(seqs), 0, 0
+    lost = resets = 0
+    expected = 0
+    for a, b in zip(seqs, seqs[1:]):
+        d = (b - a) & 0xFFFFFFFF
+        if d == 1:
+            expected += 1
+        elif 1 < d < 1000:
+            lost += d - 1
+            expected += d
+        else:
+            resets += 1          # restart or huge gap, do not count as loss
+    return expected + 1, len(seqs), lost, resets
+
+
+# ------------------------------------------------------------------ stats ----
+def chan_stats(x):
+    n = len(x)
+    if n == 0:
+        return None
+    mn, mx = min(x), max(x)
+    mean = sum(x) / n
+    var = sum((v - mean) ** 2 for v in x) / n
+    rms = math.sqrt(var)                       # AC-coupled RMS
+    peak = max(abs(mn), abs(mx))
+    # first-difference energy: low ratio => sample-to-sample correlation (real audio)
+    if n > 1:
+        d = sum(abs(x[i] - x[i - 1]) for i in range(1, n)) / (n - 1)
+    else:
+        d = 0.0
+    distinct = len(set(x[:4000]))
+    return {"min": mn, "max": mx, "mean": mean, "rms": rms, "peak": peak,
+            "diff": d, "distinct": distinct, "n": n}
+
+
+def classify(st):
+    if st is None:
+        return "no data"
+    if st["distinct"] == 1:
+        v = st["min"]
+        if v == 0:
+            return "STUCK at 0"
+        if v == -1:
+            return "STUCK at -1 (all ones)"
+        return "STUCK at %d" % v
+    if st["peak"] >= FULL_SCALE - 2 and st["rms"] > FULL_SCALE * 0.4:
+        return "RAILED / clipping"
+    if st["rms"] < 8:
+        return "silent (near zero)"
+    if st["distinct"] < 8:
+        return "quantised, %d levels" % st["distinct"]
+    # random bit garbage decorrelates: mean |diff| approaches the RMS scale
+    if st["rms"] > 0 and st["diff"] / st["rms"] > 1.2:
+        return "NOISE / misaligned?"
+    return "active"
+
+
+def dbfs(v):
+    return -math.inf if v <= 0 else 20 * math.log10(v / FULL_SCALE)
+
+
+def fmt_db(v):
+    d = dbfs(v)
+    return " -inf " if d == -math.inf else "%6.1f" % d
+
+
+# -------------------------------------------------------------- alignment ----
+def alignment_scan(pkts, span=24):
+    """
+    The ADAU1978's TDM data can sit a bit or two off from where tdm8_rx snapshots,
+    which rotates every channel. Rebuild the raw 384-bit word, rotate it, and pick
+    the offset that makes samples most correlated sample-to-sample.
+    """
+    words = []
+    for p in pkts[:400]:
+        if len(p) != PAYLOAD_LEN or p[0:4] != MAGIC:
+            continue
+        off = HDR_LEN
+        for f in range(FRAMES_PKT):
+            words.append(int.from_bytes(p[off + 2:off + 50], "big"))
+            off += FRAME_LEN
+    if len(words) < 32:
+        return None
+
+    W = 384
+    results = []
+    for k in range(-span, span + 1):
+        chans = [[] for _ in range(CHANNELS)]
+        for w in words:
+            r = ((w << (k % W)) | (w >> (W - (k % W)))) & ((1 << W) - 1) if k else w
+            for c in range(CHANNELS):
+                v = (r >> (W - 24 * (c + 1))) & 0xFFFFFF
+                chans[c].append(v - (1 << 24) if v & 0x800000 else v)
+        ratios = []
+        for x in chans:
+            m = sum(x) / len(x)
+            rms = math.sqrt(sum((v - m) ** 2 for v in x) / len(x))
+            if rms < 8:
+                continue
+            d = sum(abs(x[i] - x[i - 1]) for i in range(1, len(x))) / (len(x) - 1)
+            ratios.append(d / rms)
+        if ratios:
+            ratios.sort()
+            results.append((ratios[len(ratios) // 2], k, len(ratios)))
+    if not results:
+        return None
+    results.sort()
+    return results
+
+
+# ------------------------------------------------------------------- wav -----
+def write_wavs(samples, prefix):
+    written = 0
+    for c, x in enumerate(samples):
+        if not x:
+            continue
+        with wave.open("%s_ch%02d.wav" % (prefix, c + 1), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(3)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(b"".join(
+                (v & 0xFFFFFF).to_bytes(3, "little") for v in x))
+        written += 1
+    print("\nwrote %d WAV files as %s_chNN.wav (%d-bit, %d Hz)"
+          % (written, prefix, 24, SAMPLE_RATE))
+
+
+# ------------------------------------------------------------------- main ----
+def main():
+    ap = argparse.ArgumentParser(description="TDM_UATR UDP stream monitor")
+    ap.add_argument("-p", "--port", type=int, default=5005)
+    ap.add_argument("-s", "--seconds", type=float, default=5.0)
+    ap.add_argument("-b", "--bind", default="")
+    ap.add_argument("--wav", metavar="PREFIX", help="write per-channel WAV files")
+    ap.add_argument("--align", action="store_true",
+                    help="scan for a TDM bit-alignment offset")
+    args = ap.parse_args()
+
+    pkts, elapsed = capture(args.port, args.seconds, args.bind)
+    if not pkts:
+        return 1
+
+    samples, info = parse(pkts)
+    exp, got, lost, resets = loss_report(info["seqs"])
+
+    # ---------------- link ----------------
+    pps = len(pkts) / elapsed
+    mbps_payload = len(pkts) * PAYLOAD_LEN * 8 / elapsed / 1e6
+    mbps_wire = len(pkts) * (WIRE_LEN + 8 + 4 + 12) * 8 / elapsed / 1e6
+    nsamp = len(samples[0]) if samples[0] else 0
+
+    print("\n" + "=" * 62)
+    print("LINK")
+    print("=" * 62)
+    print("  packets captured   %d in %.2f s" % (len(pkts), elapsed))
+    print("  packet rate        %.0f /s   (expected %.0f)" % (pps, EXPECTED_PPS))
+    print("  payload throughput %.2f Mbit/s" % mbps_payload)
+    print("  wire throughput    %.2f Mbit/s  (%.0f%% of 100BASE-TX)"
+          % (mbps_wire, mbps_wire))
+    print("  effective fs       %.0f Hz per channel  (nominal %d)"
+          % (pps * FRAMES_PKT, SAMPLE_RATE))
+    print("  audio frames       %d  (%.3f s)" % (nsamp, nsamp / SAMPLE_RATE))
+
+    print("\n" + "=" * 62)
+    print("INTEGRITY")
+    print("=" * 62)
+    print("  sequence gaps      %d lost of %d expected  (%.4f%%)"
+          % (lost, exp, 100.0 * lost / exp if exp else 0.0))
+    if resets:
+        print("  sequence restarts  %d  (FPGA reset, or capture gap)" % resets)
+    print("  bad magic word     %d" % info["bad_magic"])
+    print("  wrong length       %d" % info["bad_len"])
+    print("  frame index errors %d" % info["bad_index"])
+    if pps < EXPECTED_PPS * 0.97 and lost == 0:
+        print("  NOTE: rate is low but no sequence gaps -> the FPGA is under-running,")
+        print("        not the network. Check LRCLK / the audio clock chain.")
+    if lost:
+        print("  NOTE: real loss. At ~44 Mbit/s this is usually the receiving host")
+        print("        (socket buffer, or a slow disk if something is recording).")
+
+    # ---------------- SDATA line activity ----------------
+    # I2C diagnostics live in i2c_scan.py now; this file covers the link,
+    # packet integrity and the audio itself.
+    if pkts and len(pkts[0]) == PAYLOAD_LEN:
+        a_act = pkts[0][HDR_LEN + 5 * FRAME_LEN]
+        b_act = pkts[0][HDR_LEN + 6 * FRAME_LEN]
+        print("\n" + "=" * 62)
+        print("SDATA LINE ACTIVITY   (edges per 65536 BCLK, 255 = saturated)")
+        print("=" * 62)
+        for nm, v, who in (("TDM1", a_act, "U19+U20 -> ch 1-8"),
+                           ("TDM2", b_act, "U37+U38 -> ch 9-16")):
+            print("    %s  %-18s %3d  %s" % (nm, who, v,
+                  "TOGGLING - an ADC is driving it"
+                  if v > 0 else "*** STATIC - nothing driving ***"))
+
+    print("\n" + "=" * 62)
+    print("CHANNELS   (24-bit signed, full scale = %d)" % FULL_SCALE)
+    print("=" * 62)
+    print("  ch    min        max        DC offset     RMS    peak dBFS  state")
+    print("  " + "-" * 68)
+    for c in range(CHANNELS):
+        st = chan_stats(samples[c])
+        if st is None:
+            print("  %2d    (no data)" % (c + 1))
+            continue
+        print("  %2d  %9d  %9d  %11.1f  %8.1f    %s   %s"
+              % (c + 1, st["min"], st["max"], st["mean"], st["rms"],
+                 fmt_db(st["peak"]), classify(st)))
+
+    src = "ADC A (U19/U20 via TDM1)", "ADC B (U37/U38 via TDM2)"
+    print("\n  channels 1-8  = %s" % src[0])
+    print("  channels 9-16 = %s" % src[1])
+
+    # ---------------- alignment ----------------
+    if args.align:
+        print("\n" + "=" * 62)
+        print("TDM BIT ALIGNMENT SCAN")
+        print("=" * 62)
+        res = alignment_scan(pkts)
+        if not res:
+            print("  not enough non-silent data to judge alignment")
+        else:
+            print("  lower score = more sample-to-sample correlation = more like audio")
+            for score, k, nch in res[:8]:
+                mark = "  <== current" if k == 0 else ""
+                print("    rotate %+3d bits : score %.3f  (%d live channels)%s"
+                      % (k, score, nch, mark))
+            best = res[0]
+            if best[1] != 0:
+                print("\n  Best offset is %+d bits, not 0. That means tdm8_rx is latching"
+                      % best[1])
+                print("  the shift register off the true TDM slot boundary - adjust the")
+                print("  lrclk_in snapshot point in tdm8_rx.vhd by that many BCLKs.")
+            else:
+                print("\n  Current alignment is best. No rotation needed.")
+
+    if args.wav:
+        write_wavs(samples, args.wav)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

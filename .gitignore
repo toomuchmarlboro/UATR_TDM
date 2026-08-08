@@ -1,2 +1,46 @@
-# Ignore generated IP folder
-/db/ip/sldc734b212/
+# Quartus build output. All regenerable from the sources; ~33 MB and 293 of the
+# 331 files that used to be tracked, which made every "git status" unreadable.
+db/
+incremental_db/
+output_files/
+greybox_tmp/
+simulation/
+.qsys_edit/
+*.qws
+*.rpt
+*.summary
+*.smsg
+*.pin
+*.jdi
+*.sld
+*.done
+*.qarlog
+
+# ModelSim
+work/
+transcript
+vsim.wlf
+*.vstf
+
+# Programming images - build artifacts, regenerate with quartus_cpf
+*.jic
+*.pof
+*.sof
+
+# Editor backups
+*.bak
+
+# Packet captures - 739 MB and regenerable
+Wireshark/
+*.pcapng
+*.pcap
+
+# Python
+__pycache__/
+*.pyc
+
+# More Quartus output
+*.map
+*.rpd
+*.cmp.rdb
+TDM_UATR.csv

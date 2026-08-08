@@ -11,6 +11,19 @@ entity packet_formatter is
         tdm16_valid  : in  std_logic;
         tdm16_data   : in  std_logic_vector(383 downto 0);
 
+        -- Diagnostic bytes placed in the packet header. Static after ADC boot,
+        -- already synchronised into this clock domain by the caller.
+        dbg_byte0    : in  std_logic_vector(7 downto 0);
+        dbg_byte1    : in  std_logic_vector(7 downto 0);
+        dbg_status   : in  std_logic_vector(7 downto 0);
+        dbg_status2  : in  std_logic_vector(7 downto 0);
+        dbg_status3  : in  std_logic_vector(7 downto 0);
+        dbg_status4  : in  std_logic_vector(7 downto 0);
+        dbg_status5  : in  std_logic_vector(7 downto 0);
+        dbg_status6  : in  std_logic_vector(7 downto 0);
+        dbg_status7  : in  std_logic_vector(7 downto 0);
+        dbg_status8  : in  std_logic_vector(7 downto 0);
+
         -- Async FIFO Interface (Write Side)
         fifo_wr_en   : out std_logic;
         fifo_wr_data : out std_logic_vector(7 downto 0);
@@ -78,8 +91,10 @@ begin
                         when 5 => fifo_wr_data <= std_logic_vector(seq_num(23 downto 16));
                         when 6 => fifo_wr_data <= std_logic_vector(seq_num(15 downto 8));
                         when 7 => fifo_wr_data <= std_logic_vector(seq_num(7 downto 0));
-                        when 8 => fifo_wr_data <= x"00"; -- Frame count MSB
-                        when 9 => fifo_wr_data <= x"08"; -- Frame count LSB (8 frames)
+                        -- Frame count was a constant 0x0008 that nothing reads,
+                        -- so these two bytes now carry ADC register readbacks.
+                        when 8 => fifo_wr_data <= dbg_byte0; -- ADAU 0x01 PLL_CONTROL
+                        when 9 => fifo_wr_data <= dbg_byte1; -- ADAU 0x05 SAI_CTRL0
                         when others => fifo_wr_data <= x"00";
                     end case;
 
@@ -94,7 +109,18 @@ begin
                     fifo_wr_en <= '1';
 
                     if byte_cnt = 0 then
-                        fifo_wr_data <= x"00"; -- Frame Index MSB
+                        -- Frame index never exceeds 7, so this MSB byte was
+                        -- always zero. It now carries the I2C status bits.
+                        case frame_count is
+                            when 1 => fifo_wr_data <= dbg_status2;
+                            when 2 => fifo_wr_data <= dbg_status3;
+                            when 3 => fifo_wr_data <= dbg_status4;
+                            when 4 => fifo_wr_data <= dbg_status5;
+                            when 5 => fifo_wr_data <= dbg_status6;
+                            when 6 => fifo_wr_data <= dbg_status7;
+                            when 7 => fifo_wr_data <= dbg_status8;
+                            when others => fifo_wr_data <= dbg_status;
+                        end case;
                     elsif byte_cnt = 1 then
                         fifo_wr_data <= std_logic_vector(to_unsigned(frame_count, 8)); -- Frame Index LSB
                     else

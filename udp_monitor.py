@@ -34,7 +34,7 @@ WIRE_LEN     = 452                                    # incl. eth+ip+udp headers
 CHANNELS     = 16
 SAMPLE_BYTES = 3
 FULL_SCALE   = 1 << 23                                # 24-bit signed
-SAMPLE_RATE   = 96000
+SAMPLE_RATE   = 48000
 EXPECTED_PPS = SAMPLE_RATE / FRAMES_PKT               # 12000
 
 
@@ -299,13 +299,46 @@ def main():
         a_act = pkts[0][HDR_LEN + 5 * FRAME_LEN]
         b_act = pkts[0][HDR_LEN + 6 * FRAME_LEN]
         print("\n" + "=" * 62)
-        print("SDATA LINE ACTIVITY   (edges per 65536 BCLK, 255 = saturated)")
+        print("FAULT COUNTERS   (since power-up, saturate at 255)")
         print("=" * 62)
-        for nm, v, who in (("TDM1", a_act, "U19+U20 -> ch 1-8"),
-                           ("TDM2", b_act, "U37+U38 -> ch 9-16")):
-            print("    %s  %-18s %3d  %s" % (nm, who, v,
-                  "TOGGLING - an ADC is driving it"
-                  if v > 0 else "*** STATIC - nothing driving ***"))
+        # dbg_status6/7 used to be SDATA edge counters, which contradicted the
+        # channel data often enough to be worthless. They now carry fault
+        # counts instead: how often the FPGA PLL lost lock, and how often that
+        # re-asserted adc_rst_n and reset all four ADCs for 100 ms.
+        # dbg_status6 = [7:4] config drift ever, [3:0] ADC clip ever, per part.
+        # Every register used to be checked once at boot and never again, so a
+        # part that silently lost its configuration went quiet unnoticed.
+        parts = ("U19", "U20", "U37", "U38")
+        drift, clip = (a_act >> 4) & 0xF, a_act & 0xF
+        print("    runtime register check   (0x00, 0x05, 0x06 re-read continuously)")
+        for i, nm in enumerate(parts):
+            print("      %-4s %-28s clip seen: %s"
+                  % (nm,
+                     "*** CONFIG DRIFTED ***" if (drift >> i) & 1 else "config holding",
+                     "yes" if (clip >> i) & 1 else "no"))
+        if drift:
+            print()
+            print("    A part whose registers no longer match what was written has")
+            print("    lost its configuration at runtime - it will have reverted to")
+            print("    stereo mode and stopped driving its TDM slots.")
+        # dbg_status7 now carries runtime overtemperature: [7:4] ever tripped,
+        # [3:0] tripped right now, one bit per part. 0x09 bit 0 is OT, and it
+        # was previously only read once at boot - so a part heating up, muting
+        # and recovering was invisible.
+        parts = ("U19", "U20", "U37", "U38")
+        ever, now = (b_act >> 4) & 0xF, b_act & 0xF
+        print("    ADAU1978 overtemperature")
+        for i, nm in enumerate(parts):
+            e, n_ = (ever >> i) & 1, (now >> i) & 1
+            print("      %-4s %s" % (nm,
+                  "*** OT NOW ***" if n_ else
+                  "*** OT SEEN since power-up ***" if e else "normal"))
+        if ever:
+            print()
+            print("    Overtemperature mutes the part. Table 8: the exposed pad is the")
+            print("    only thermal path - \"THE EXPOSED PAD MUST BE CONNECTED TO THE")
+            print("    GROUND PLANE\" - so a degraded pad joint after repeated reflow")
+            print("    gives exactly this: intermittent dropouts that worsen with time.")
 
     print("\n" + "=" * 62)
     print("CHANNELS   (24-bit signed, full scale = %d)" % FULL_SCALE)

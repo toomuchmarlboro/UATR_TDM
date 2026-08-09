@@ -56,7 +56,9 @@ entity adau1978_sequencer is
         -- Results of the power-on bus scan across all 128 addresses
         dbg_scan_cnt  : out std_logic_vector(7 downto 0); -- how many answered
         dbg_scan_addr : out std_logic_vector(7 downto 0); -- first one that did
-        dbg_scan_mask : out std_logic_vector(7 downto 0); -- which of 11/31/51/71
+        dbg_scan_mask : out std_logic_vector(7 downto 0);
+        dbg_ot        : out std_logic_vector(7 downto 0);
+        dbg_health    : out std_logic_vector(7 downto 0); -- which of 11/31/51/71
         dbg_vfy_mask  : out std_logic_vector(7 downto 0)  -- which regs verified
     );
 end entity adau1978_sequencer;
@@ -93,9 +95,9 @@ architecture rtl of adau1978_sequencer is
     type vfy_list_t is array (0 to 5) of std_logic_vector(15 downto 0);
     constant VFY_LIST : vfy_list_t := (
         0 => x"0001",  -- M_POWER        PWUP
-        1 => x"0103",  -- PLL_CONTROL    bit7 is PLL_LOCK status, masked below
+        1 => x"0101",  -- PLL_CONTROL    bit7 is PLL_LOCK status, masked below
         2 => x"043F",  -- BLOCK_POWER_SAI
-        3 => x"055B",  -- SAI_CTRL0
+        3 => x"055A",  -- SAI_CTRL0
         4 => x"0608",  -- SAI_CTRL1      bit7 SDATA_SEL picks SDATAOUT1 vs 2
         5 => x"09F8"   -- SAI_OVERTEMP   bit0 is OT status, masked below
     );
@@ -140,6 +142,17 @@ architecture rtl of adau1978_sequencer is
     -- The FPGA's decode will be garbage in this mode (its LRCLK/BCLK are not
     -- synchronous to U19's). Ignore the channel table. The only meaningful
     -- number is the SDATA edge counter in udp_monitor.py.
+    -- DIAGNOSTIC: force one part's four post-ADC gains to a chosen value at
+    -- boot, leaving the other three at 0 dB. Used to answer "is this converter
+    -- producing samples at all" without touching the board: at +60 dB (0x00) a
+    -- working converter's noise floor lifts by three orders of magnitude, and a
+    -- dead one does not move. Cleaner than master mode, which cannot avoid
+    -- 66 mA of contention against the clock buffers through the 49.9 ohm
+    -- series resistors unless those are lifted.
+    --   -1 = off, 0=U19 1=U20 2=U37 3=U38
+    constant C_GAIN_PROBE_IDX  : integer range -1 to 3 := -1;
+    constant C_GAIN_PROBE_BYTE : std_logic_vector(7 downto 0) := x"00";  -- +60 dB
+
     constant C_MASTER_TEST : boolean := false;
     -- Which part gets master mode: 0=U19 1=U20 2=U37 3=U38.
     -- U20 is the control: its PLL loop filter was reworked to return to AVDD2 as
@@ -186,6 +199,38 @@ architecture rtl of adau1978_sequencer is
     -- PLL_LOCK read back from each of the four parts in rotation
     signal pll_mask : std_logic_vector(3 downto 0) := "0000";
 
+    -- Runtime overtemperature watch. 0x09 bit 0 is OT, "1 = Overtemperature
+    -- Fault", and until now it was only read once at boot - so a part that
+    -- heats up, trips OT, mutes and recovers was completely invisible. That is
+    -- exactly the signature of the intermittent, worsening dropouts seen on
+    -- 2026-08-09, and Table 8 warns the exposed pad is the part's only thermal
+    -- path: "THE EXPOSED PAD MUST BE CONNECTED TO THE GROUND PLANE".
+    -- ot_now  : OT bit as last read, per part
+    -- ot_ever : sticky - set once and never cleared, so a brief trip between
+    --           polls is still caught
+    -- Runtime poll list. Every register was previously checked once at boot and
+    -- never again, so a part that silently lost its configuration - glitch,
+    -- brownout, stray S_RST - went quiet with nothing to notice. This walks all
+    -- four parts across six registers continuously.
+    --   0x01 PLL_LOCK      read-only status
+    --   0x09 OT            read-only status
+    --   0x19 ASDC_CLIP     read-only status, is the converter seeing signal
+    --   0x00 / 0x05 / 0x06 configuration, compared against what was written
+    type poll_t is array (0 to 5) of std_logic_vector(15 downto 0);
+    constant POLL_LIST : poll_t := (
+        0 => x"0100",   -- PLL_CONTROL, bit 7 captured, value ignored
+        1 => x"0900",   -- SAI_OVERTEMP, bit 0 captured
+        2 => x"1900",   -- ASDC_CLIP, bits 3:0 captured
+        3 => x"0001",   -- M_POWER      expect 0x01
+        4 => x"055A",   -- SAI_CTRL0    expect as written
+        5 => x"0608");  -- SAI_CTRL1    expect as written
+    signal poll_reg : unsigned(2 downto 0) := "000";
+    signal clip_ever : std_logic_vector(3 downto 0) := "0000";
+    signal cfg_bad   : std_logic_vector(3 downto 0) := "0000";
+    signal poll_ot  : std_logic := '0';        -- retained, unused
+    signal ot_now   : std_logic_vector(3 downto 0) := "0000";
+    signal ot_ever  : std_logic_vector(3 downto 0) := "0000";
+
     constant LAST_REG : unsigned(3 downto 0) := to_unsigned(11, 4);
 
     -- ==========================================
@@ -216,8 +261,8 @@ architecture rtl of adau1978_sequencer is
         -- 384 x fS) and then moves the goalposts to 64-96 kHz underneath it.
         -- The datasheet: "the PLL be disabled, reprogrammed with the new
         -- setting, and then reenabled".
-        0  => x"0103", -- 0x01 PLL_CONTROL:  CLK_S=0 MCLKIN, MCS=011 = 256 x fS at 96 kHz
-        1  => x"055B", -- 0x05 SAI_CTRL0:    left-just, TDM8, FS=011 64-96 kHz
+        0  => x"0101", -- 0x01 PLL_CONTROL:  CLK_S=0 MCLKIN, MCS=011 = 256 x fS at 96 kHz
+        1  => x"055A", -- 0x05 SAI_CTRL0:    left-just, TDM8, FS=011 64-96 kHz
                        -- SDATA_FMT changed 00 (I2S) -> 01 (left justified).
                        -- I2S delays data one BCLK from the LRCLK edge, but with
                        -- SLOT_WIDTH=24 BCLK and DATA_WIDTH=24-bit the slot is
@@ -270,6 +315,8 @@ begin
     dbg_scan_cnt  <= std_logic_vector(found_cnt);
     -- upper nibble = PLL locked per part, lower nibble = answered the scan
     dbg_scan_mask <= pll_mask & adr_mask;
+    dbg_ot        <= ot_ever & ot_now;
+    dbg_health    <= cfg_bad & clip_ever;
     dbg_vfy_mask  <= scan_bad & '0' & vfy_mask;
     boot_done     <= boot_done_i;
     -- Report the address the verify actually targeted, so the readback table is
@@ -303,6 +350,12 @@ begin
             pwup_pass    <= '0';
             poll_cnt     <= 0;
             poll_idx     <= "00";
+            poll_ot      <= '0';
+            poll_reg     <= "000";
+            clip_ever    <= "0000";
+            cfg_bad      <= "0000";
+            ot_now       <= "0000";
+            ot_ever      <= "0000";
             polling      <= '0';
             pll_mask     <= "0000";
             dbg_rd_pll   <= (others => '0');
@@ -421,6 +474,17 @@ begin
                         current_boot_word(0) := '1';
                     end if;
 
+                    -- gain probe: override 0x0A-0x0D on one part only
+                    if C_GAIN_PROBE_IDX >= 0
+                       and adc_idx = to_unsigned(C_GAIN_PROBE_IDX, 2)
+                       and (current_boot_word(15 downto 8) = x"0A"
+                         or current_boot_word(15 downto 8) = x"0B"
+                         or current_boot_word(15 downto 8) = x"0C"
+                         or current_boot_word(15 downto 8) = x"0D") then
+                        current_boot_word := current_boot_word(15 downto 8)
+                                           & C_GAIN_PROBE_BYTE;
+                    end if;
+
                     if adc_idx(0) = '1' then
                         -- keyed on the register address so ROM order can change
                         if current_boot_word(15 downto 8) = x"07" then
@@ -525,7 +589,7 @@ begin
                     end if;
                     i2c_rd_mode <= '1';
                     if polling = '1' then
-                        i2c_reg_addr <= x"01";   -- live PLL_LOCK poll
+                        i2c_reg_addr <= POLL_LIST(to_integer(poll_reg))(15 downto 8);
                     else
                         i2c_reg_addr <= VFY_LIST(to_integer(vfy_idx))(15 downto 8);
                     end if;
@@ -555,9 +619,34 @@ begin
                             if i2c_addr_nack = '0'
                                and i2c_data_rd /= x"FF"
                                and i2c_data_rd /= x"00" then
-                                pll_mask(to_integer(poll_idx)) <= i2c_data_rd(7);
-                            else
+                                case to_integer(poll_reg) is
+                                    when 0 =>          -- 0x01 PLL_LOCK
+                                        pll_mask(to_integer(poll_idx)) <= i2c_data_rd(7);
+                                    when 1 =>          -- 0x09 OT
+                                        ot_now(to_integer(poll_idx)) <= i2c_data_rd(0);
+                                        if i2c_data_rd(0) = '1' then
+                                            ot_ever(to_integer(poll_idx)) <= '1';
+                                        end if;
+                                    when 2 =>          -- 0x19 ASDC_CLIP
+                                        if i2c_data_rd(3 downto 0) /= "0000" then
+                                            clip_ever(to_integer(poll_idx)) <= '1';
+                                        end if;
+                                    when others =>     -- configuration readback
+                                        if i2c_data_rd
+                                           /= POLL_LIST(to_integer(poll_reg))(7 downto 0) then
+                                            cfg_bad(to_integer(poll_idx)) <= '1';
+                                        end if;
+                                end case;
+                            elsif poll_reg = 0 then
                                 pll_mask(to_integer(poll_idx)) <= '0';
+                            end if;
+                            -- walk all four parts, then advance the register
+                            if poll_idx = 3 then
+                                if poll_reg = 5 then
+                                    poll_reg <= "000";
+                                else
+                                    poll_reg <= poll_reg + 1;
+                                end if;
                             end if;
                             poll_idx    <= poll_idx + 1;
                             polling     <= '0';
@@ -589,7 +678,7 @@ begin
                                 dbg_rd_sai <= i2c_data_rd;
                             end if;
                             if vfy_idx = 3 then
-                                if i2c_data_rd = x"5B" then
+                                if i2c_data_rd = x"5A" then
                                     cfg_ok_i <= '1';
                                 end if;
                             elsif vfy_idx = 1 then

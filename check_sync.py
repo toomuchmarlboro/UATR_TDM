@@ -93,8 +93,13 @@ divi = int(re.search(which + r'_divide_by\s*=>\s*(\d+)',   pll).group(1))
 bclk = 50_000_000 * mult / divi
 div  = int(re.search(r'if bit_cnt = (\d+) then', tm).group(1)) + 1
 fs   = bclk / div
-chk("SAMPLE_RATE", pyconst(mon, "SAMPLE_RATE"), round(fs / 1000) * 1000,
-    "BCLK %.4f MHz / %d = %.1f Hz" % (bclk / 1e6, div, fs))
+# Not every rate is a round number of kHz: 44.1 kHz cannot be generated exactly
+# from 50 MHz (needs 3528/15625) and the closest ALTPLL ratio lands +64 ppm off.
+# Compare within 0.1% rather than rounding to the nearest kHz.
+_want = pyconst(mon, "SAMPLE_RATE")
+chk("SAMPLE_RATE", abs(_want - fs) / fs < 1e-3, True,
+    "BCLK %.4f MHz / %d = %.1f Hz, udp_monitor says %d (%+.0f ppm)"
+    % (bclk / 1e6, div, fs, _want, (_want - fs) / fs * 1e6))
 
 # slot width and data width are no longer the same: 32 BCLK slots carry 24-bit
 # samples, so the shift register (frame in BCLKs) is wider than the data output.
@@ -148,12 +153,12 @@ chk("device addresses", scn_addrs, addrs, "get_i2c_addr vs i2c_scan DEVICES")
 # -------------------------------------------------------------- 7. datasheet -
 # values that must match the ADAU1978 datasheet, not the RTL
 DS = {0x00: (0x01, "PWUP=1"),
-      0x01: (0x03, "CLK_S=0 MCLKIN, MCS=011 = 256 x fS at 96 kHz"),
+      0x01: (0x01, "CLK_S=0 MCLKIN, MCS=001 = 256 x fS at 48 kHz"),
       # bit 7 LR_POL and bit 6 BCLKEDGE are design choices tied to how the FPGA
       # drives LRCLK/BCLK, not datasheet-mandated values, so mask them here.
       # Bits [5:0] (LDO_EN, VREF_EN, ADC_EN4..1) are the ones that must be set.
       0x04: (0x3F, "LDO+VREF+ADC1-4 enabled", 0x3F),
-      0x05: (0x5B, "left-justified, SAI=011 TDM8, FS=011 64-96kHz"),
+      0x05: (0x5A, "left-justified, SAI=011 TDM8, FS=010 32-48kHz"),
       0x06: (0x08, "SDATAOUT1, 32 BCLK/slot, 24-bit, LRCLK pulse, MSB, slave"),
       0x09: (0xF8, "drive C1-C4, DRV_HIZ=1")}
 for reg, spec in sorted(DS.items()):

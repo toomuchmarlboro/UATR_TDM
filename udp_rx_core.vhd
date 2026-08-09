@@ -20,7 +20,11 @@ entity udp_rx_core is
         udp_ack      : in  std_logic;
         udp_adc_sel  : out std_logic_vector(1 downto 0);
         udp_ch_sel   : out std_logic_vector(1 downto 0);
-        udp_gain     : out std_logic_vector(7 downto 0)
+        udp_gain     : out std_logic_vector(7 downto 0);
+        -- Optional 3rd payload byte. bit 0 = 48V phantom enable. A 2-byte
+        -- packet still works and simply leaves the flags unchanged, so the
+        -- original gain-only protocol is preserved.
+        udp_flags    : out std_logic_vector(7 downto 0)
     );
 end entity udp_rx_core;
 
@@ -36,6 +40,8 @@ architecture rtl of udp_rx_core is
     signal int_adc_sel : std_logic_vector(1 downto 0) := "00";
     signal int_ch_sel  : std_logic_vector(1 downto 0) := "00";
     signal int_gain    : std_logic_vector(7 downto 0) := x"00";
+    signal int_flags   : std_logic_vector(7 downto 0) := x"00";
+    signal have_flags  : std_logic := '0';
 
 begin
 
@@ -50,6 +56,8 @@ begin
                 udp_adc_sel  <= "00";
                 udp_ch_sel   <= "00";
                 udp_gain     <= x"A0"; -- Default gain
+                udp_flags    <= x"00"; -- 48V off until commanded
+                have_flags   <= '0';
             else
                 case state is
                     
@@ -105,13 +113,27 @@ begin
                             -- Assuming Byte 43 contains Volume/Gain mapping
                             elsif byte_cnt = 43 then
                                 int_gain <= rx_data;
+                            -- Byte 44, if the sender supplies it: control flags.
+                            elsif byte_cnt = 44 then
+                                int_flags  <= rx_data;
+                                have_flags <= '1';
                             end if;
 
-                            if byte_cnt = 43 then
+                            -- Run to byte 44 rather than stopping at 43, so a
+                            -- 3-byte payload is captured. rx_end in WAIT_END
+                            -- still fires the trigger, so a 2-byte payload
+                            -- behaves exactly as before - it just never sets
+                            -- have_flags and the previous flag state persists.
+                            if byte_cnt = 44 then
                                 state <= WAIT_END;
                             else
                                 byte_cnt <= byte_cnt + 1;
                             end if;
+                        end if;
+
+                        -- a 2-byte payload ends here, before byte 44
+                        if rx_end = '1' then
+                            state <= WAIT_END;
                         end if;
 
                     when WAIT_END =>
@@ -129,6 +151,9 @@ begin
                         udp_adc_sel <= int_adc_sel;
                         udp_ch_sel  <= int_ch_sel;
                         udp_gain    <= int_gain;
+                        if have_flags = '1' then
+                            udp_flags <= int_flags;
+                        end if;
                         udp_req     <= '1';
                         state       <= IDLE;
 

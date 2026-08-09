@@ -152,18 +152,30 @@ def chan_stats(x):
     # converter dithers, so any long run means the part stopped producing new
     # samples - which is a different fault from tri-stating, where the pull-down
     # gives exact zeros. Reported so "held" can be distinguished from "absent".
-    hold_len, hold_val, run, prev = 1, x[0], 1, x[0]
-    for v in x[1:]:
+    # Also WHERE the longest hold starts, how many separate holds there are, and
+    # what fraction of the capture is zero. Length alone cannot distinguish one
+    # long gap at the very start - which is a capture or boot artefact, not board
+    # behaviour - from repeated dropouts spread through the run.
+    hold_len, hold_val, hold_at = 1, x[0], 0
+    run, prev, run_start = 1, x[0], 0
+    holds = 0
+    for i, v in enumerate(x[1:], start=1):
         if v == prev:
             run += 1
             if run > hold_len:
-                hold_len, hold_val = run, v
+                hold_len, hold_val, hold_at = run, v, run_start
         else:
-            run = 1
+            if run >= 64:
+                holds += 1
+            run, run_start = 1, i
         prev = v
+    if run >= 64:
+        holds += 1
+    zero_frac = 100.0 * sum(1 for v in x if v == 0) / n
     return {"min": mn, "max": mx, "mean": mean, "rms": rms, "peak": peak,
             "diff": d, "distinct": distinct, "n": n,
-            "hold_len": hold_len, "hold_val": hold_val}
+            "hold_len": hold_len, "hold_val": hold_val, "hold_at": hold_at,
+            "holds": holds, "zero_frac": zero_frac}
 
 
 def classify(st):
@@ -189,9 +201,12 @@ def classify(st):
     # run means the part held its output: framing survived but conversion
     # stopped. Distinct from tri-stating, which reads as exact zeros.
     if st["hold_len"] >= 64:
-        return "held %d samples (%.0f ms) at %d" % (
-            st["hold_len"], 1000.0 * st["hold_len"] / SAMPLE_RATE,
-            st["hold_val"])
+        where = "at start" if st["hold_at"] < 64 else \
+                "from %.2f s" % (st["hold_at"] / float(SAMPLE_RATE))
+        return "%s %.0f ms %s, %d gap%s, %.0f%% zero" % (
+            "ZERO" if st["hold_val"] == 0 else "HELD %d" % st["hold_val"],
+            1000.0 * st["hold_len"] / SAMPLE_RATE, where,
+            st["holds"], "" if st["holds"] == 1 else "s", st["zero_frac"])
     return "active"
 
 

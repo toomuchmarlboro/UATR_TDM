@@ -35,7 +35,7 @@ CHANNELS     = 16
 SAMPLE_BYTES = 3
 FULL_SCALE   = 1 << 23                                # 24-bit signed
 SAMPLE_RATE   = 48000
-EXPECTED_PPS = SAMPLE_RATE / FRAMES_PKT               # 12000
+EXPECTED_PPS = SAMPLE_RATE / FRAMES_PKT               # 6000 at 48 kHz
 
 
 # ----------------------------------------------------------------- capture ---
@@ -142,9 +142,28 @@ def chan_stats(x):
         d = sum(abs(x[i] - x[i - 1]) for i in range(1, n)) / (n - 1)
     else:
         d = 0.0
-    distinct = len(set(x[:4000]))
+    # distinct over the WHOLE capture, not x[:4000]. With 4000 samples that is
+    # 83 ms of a 5 s capture, so a channel that happened to be held for the
+    # first 83 ms was labelled "STUCK at <value>" while its own min/max/RMS
+    # showed it varying. It made healthy channels flip between "active" and
+    # "STUCK" from run to run depending only on where the capture started.
+    distinct = len(set(x))
+    # Longest run of identical consecutive samples, and what it held. A real
+    # converter dithers, so any long run means the part stopped producing new
+    # samples - which is a different fault from tri-stating, where the pull-down
+    # gives exact zeros. Reported so "held" can be distinguished from "absent".
+    hold_len, hold_val, run, prev = 1, x[0], 1, x[0]
+    for v in x[1:]:
+        if v == prev:
+            run += 1
+            if run > hold_len:
+                hold_len, hold_val = run, v
+        else:
+            run = 1
+        prev = v
     return {"min": mn, "max": mx, "mean": mean, "rms": rms, "peak": peak,
-            "diff": d, "distinct": distinct, "n": n}
+            "diff": d, "distinct": distinct, "n": n,
+            "hold_len": hold_len, "hold_val": hold_val}
 
 
 def classify(st):
@@ -166,6 +185,13 @@ def classify(st):
     # random bit garbage decorrelates: mean |diff| approaches the RMS scale
     if st["rms"] > 0 and st["diff"] / st["rms"] > 1.2:
         return "NOISE / misaligned?"
+    # A converter that dithers never repeats a sample many times over. A long
+    # run means the part held its output: framing survived but conversion
+    # stopped. Distinct from tri-stating, which reads as exact zeros.
+    if st["hold_len"] >= 64:
+        return "held %d samples (%.0f ms) at %d" % (
+            st["hold_len"], 1000.0 * st["hold_len"] / SAMPLE_RATE,
+            st["hold_val"])
     return "active"
 
 

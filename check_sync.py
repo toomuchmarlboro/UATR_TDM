@@ -184,11 +184,24 @@ chk("LRCLK shape agrees", (written.get(0x06, 0) >> 3) & 1, 1 if lr_pulse else 0,
 # this, and when 0x06 changed from 0x00 to 0x08 the BOOT_ROM, i2c_scan and the
 # datasheet table were all updated while VFY_LIST was left stale - so the verify
 # reported a false mismatch on a register that was written correctly.
-vfy = {int(r, 16): int(v, 16) for r, v in
-       re.findall(r'\d\s*=>\s*x"([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})"', seq)[:6]}
+pairs = re.findall(r'\d\s*=>\s*x"([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})"', seq)
+vfy = {int(r, 16): int(v, 16) for r, v in pairs[:6]}
 for reg, want in sorted(vfy.items()):
     chk("VFY_LIST 0x%02X" % reg, want, written.get(reg),
         "adau_sequencer VFY_LIST vs BOOT_ROM")
+
+# POLL_LIST is the RUNTIME check and has its own copy of the expected values.
+# Entries 0..2 are read-only status registers whose expected byte is ignored;
+# 3..5 are configuration compared against what was written. VFY_LIST was fixed
+# when 0x06 changed and this one was missed, so the runtime check reported
+# CONFIG DRIFTED on all four parts - a false alarm indistinguishable from the
+# real fault being chased.
+poll = [(int(r, 16), int(v, 16)) for r, v in pairs[6:12]]
+for idx, (reg, want) in enumerate(poll):
+    if idx < 3:
+        continue                     # status register, value not compared
+    chk("POLL_LIST 0x%02X" % reg, want, written.get(reg),
+        "adau_sequencer POLL_LIST vs BOOT_ROM (runtime check)")
 
 # The edge tdm8_master launches LRCLK on must be the OPPOSITE of the ADAU1978's
 # active edge, or LRCLK changes at the instant the part samples it and setup time

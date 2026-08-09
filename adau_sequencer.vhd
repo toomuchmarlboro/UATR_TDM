@@ -230,7 +230,13 @@ architecture rtl of adau1978_sequencer is
         2 => x"1900",   -- ASDC_CLIP, bits 3:0 captured
         3 => x"0001",   -- M_POWER      expect 0x01
         4 => x"055A",   -- SAI_CTRL0    expect as written
-        5 => x"0600");  -- SAI_CTRL1    expect as written
+        5 => x"0608");  -- SAI_CTRL1    expect as written
+    -- Entries 3..5 are compared against BOOT_ROM; 0..2 are read-only status and
+    -- their expected byte is ignored. check_sync.py enforces that pairing, added
+    -- after this list was left at 0x06 = 0x00 when BOOT_ROM moved to 0x08 - which
+    -- made the runtime check report CONFIG DRIFTED on all four parts at once.
+    -- A cry-wolf diagnostic is worse than none: it says the ADCs lost their
+    -- configuration, which is exactly the symptom being chased.
     signal poll_reg : unsigned(2 downto 0) := "000";
     signal clip_ever : std_logic_vector(3 downto 0) := "0000";
     signal cfg_bad   : std_logic_vector(3 downto 0) := "0000";

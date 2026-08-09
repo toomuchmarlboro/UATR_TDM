@@ -414,6 +414,18 @@ architecture rtl of top_system is
     -- which is a shared cause, and both of these are gated on pll_locked.
     signal pll_lock_d : std_logic := '0';
     signal pll_drop   : unsigned(7 downto 0) := (others => '0');
+    -- Sticky "the audio PLL has lost lock at least once since power-up",
+    -- published in status bit 5. Raised in the clk_50m_board domain and read in
+    -- clk_18m, so it goes through the 2-FF chain below like every other
+    -- cross-domain byte.
+    signal pll_ever_lost : std_logic := '0';
+    signal pll_lost_meta, pll_lost_sync : std_logic := '0';
+    -- dbg_health/dbg_ot come from the sequencer in the rmii_ref_clk domain and
+    -- were wired STRAIGHT into packet_formatter, which runs on clk_18m, while
+    -- the other eight debug bytes went through synchronisers. Two independent
+    -- 50 MHz oscillators and a 12.288 MHz PLL output, three unrelated domains.
+    signal dbgy_meta, dbgy_sync : std_logic_vector(7 downto 0) := (others => '0');
+    signal dbgz_meta, dbgz_sync : std_logic_vector(7 downto 0) := (others => '0');
     signal rst_n_d    : std_logic := '0';
     signal rst_seen   : std_logic := '0';
     signal rst_drop   : unsigned(7 downto 0) := (others => '0');
@@ -735,6 +747,13 @@ begin
             pll_lock_d <= pll_locked;
             if pll_lock_d = '1' and pll_locked = '0' and pll_drop /= 255 then
                 pll_drop <= pll_drop + 1;
+                -- Sticky, and unlike pll_drop this one is actually published.
+                -- pll_drop counted lock losses and was read by nothing, so the
+                -- design had no visibility into audio PLL stability at all -
+                -- the one clock everything else is derived from. A whole day of
+                -- framing debug rested on "the PLL is stable", inferred from a
+                -- steady packet rate rather than measured.
+                pll_ever_lost <= '1';
             end if;
 
             rst_n_d <= adc_rst_n_int;
@@ -928,8 +947,8 @@ begin
         dbg_status3  => dbgu_sync,
         dbg_status4  => dbgv_sync,
         dbg_status5  => dbgw_sync,
-        dbg_status6  => dbg_health_int,
-        dbg_status7  => dbg_ot_int,
+        dbg_status6  => dbgy_sync,
+        dbg_status7  => dbgz_sync,
         dbg_status8  => dbgx_sync,
         fifo_wr_en   => fifo_wr_en_int,
         fifo_wr_data => fifo_wr_data_int,
@@ -1089,7 +1108,14 @@ begin
         if rising_edge(clk_18m) then
             dbg0_meta <= dbg_rd_pll_int;  dbg0_sync <= dbg0_meta;
             dbg1_meta <= dbg_rd_sai_int;  dbg1_sync <= dbg1_meta;
-            dbgs_meta <= dbg_status_int;  dbgs_sync <= dbgs_meta;
+            -- status bit 5 was unused by i2c_scan (it decodes 0x80, 0x10, 0x08,
+            -- 0x04, 0x02, 0x01), so the audio PLL flag goes there.
+            pll_lost_meta <= pll_ever_lost; pll_lost_sync <= pll_lost_meta;
+            dbgs_meta <= dbg_status_int(7 downto 6) & pll_lost_sync
+                       & dbg_status_int(4 downto 0);
+            dbgs_sync <= dbgs_meta;
+            dbgy_meta <= dbg_health_int; dbgy_sync <= dbgy_meta;
+            dbgz_meta <= dbg_ot_int;     dbgz_sync <= dbgz_meta;
             dbgt_meta <= dbg_status2_int; dbgt_sync <= dbgt_meta;
             dbgu_meta <= dbg_scan_cnt_int;  dbgu_sync <= dbgu_meta;
             dbgv_meta <= dbg_scan_addr_int; dbgv_sync <= dbgv_meta;

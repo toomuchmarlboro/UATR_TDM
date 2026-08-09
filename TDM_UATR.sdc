@@ -14,8 +14,23 @@ derive_clock_uncertainty
 # 3. Asynchronous Domains: We don't want the compiler failing the build 
 # trying to synchronize the 50 MHz logic with the 18.432 MHz logic.
 # We tell it to ignore paths between them.
+# THREE groups, not two. clk_50m and rmii_clk were in the SAME group, which
+# declares them synchronous to each other - but clk_50m_board is the dev board's
+# own 50 MHz crystal and rmii_ref_clk is REF_CLK out of the LAN8720A, off its own
+# crystal. Two unrelated oscillators that happen to share a nominal frequency.
+# Grouped together, any register-to-register path between them is analysed
+# against a fictitious 20 ns relationship and reported as met, when it is really
+# an unsynchronised clock domain crossing.
+#
+# There is no such path in the design today - the clk_50m_board domain holds only
+# the heartbeat divider, the reset and power sequencers and the PLL/reset fault
+# counters, and everything it sends elsewhere is either a false-pathed output pin
+# or goes through a 2-FF synchroniser. Separating the groups keeps it that way:
+# add a path between them later and the timing analyser will now say so instead
+# of quietly passing it.
 set_clock_groups -asynchronous \
-    -group [get_clocks {clk_50m rmii_clk}] \
+    -group [get_clocks {clk_50m}] \
+    -group [get_clocks {rmii_clk}] \
     -group [get_clocks {u_pll|altpll_component|auto_generated|pll1|clk[*]}]
 
 # 4. ADAU1978 I/O Delays: 

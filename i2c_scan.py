@@ -151,6 +151,14 @@ def main():
         print("    any NACK seen         %s" % ("YES" if status & 0x01 else "no"))
         print("    boot sequence         %s"
               % ("completed" if status & 0x10 else "still running or retrying"))
+        # bit 5: sticky, set if the FPGA's audio PLL has ever lost lock since
+        # power-up. Everything downstream - MCLK, BCLK, LRCLK, the whole TDM
+        # frame - is derived from that one PLL, so a drop here invalidates any
+        # conclusion drawn about the ADCs. The design counted these internally
+        # and published them nowhere until 2026-08-10.
+        print("    audio PLL lock        %s"
+              % ("*** HAS LOST LOCK since power-up ***" if status & 0x20
+                 else "never lost since power-up"))
     if recovered:
         print("    NOTE: bus recovery had to clock a jammed slave free")
 

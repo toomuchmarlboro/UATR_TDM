@@ -171,6 +171,43 @@ for reg, spec in sorted(DS.items()):
 # TDM8 with 24-bit slots must give BCLK = 192 x fS  (datasheet Table 10)
 chk("Table 10 BCLK ratio", div, 8 * 32, "TDM8 x 32 BCLK slots = 256 x fS")
 
+# The FPGA's LRCLK shape and the ADC's LR_MODE must agree. Nothing checked this
+# before, and they drifted apart: tdm8_master sent 50% duty while tdm16_merge
+# still level-tested a signal it expected to be one clock wide, so it latched
+# 128 times per frame. Table 21 bit 3: 0 = 50% duty, 1 = one-BCLK pulse.
+lr_pulse = re.search(r'C_LR_PULSE\s*:\s*boolean\s*:=\s*(true|false)', tm).group(1) == "true"
+chk("LRCLK shape agrees", (written.get(0x06, 0) >> 3) & 1, 1 if lr_pulse else 0,
+    "tdm8_master C_LR_PULSE=%s vs 0x06 bit 3 LR_MODE" % lr_pulse)
+
+# The sequencer's own VFY_LIST is what the boot verify compares the readback
+# against, so it must agree with BOOT_ROM register for register. Nothing checked
+# this, and when 0x06 changed from 0x00 to 0x08 the BOOT_ROM, i2c_scan and the
+# datasheet table were all updated while VFY_LIST was left stale - so the verify
+# reported a false mismatch on a register that was written correctly.
+vfy = {int(r, 16): int(v, 16) for r, v in
+       re.findall(r'\d\s*=>\s*x"([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})"', seq)[:6]}
+for reg, want in sorted(vfy.items()):
+    chk("VFY_LIST 0x%02X" % reg, want, written.get(reg),
+        "adau_sequencer VFY_LIST vs BOOT_ROM")
+
+# The edge tdm8_master launches LRCLK on must be the OPPOSITE of the ADAU1978's
+# active edge, or LRCLK changes at the instant the part samples it and setup time
+# is zero. 0x04 bit 6 BCLKEDGE: 0 = the part acts on the falling edge, so the
+# FPGA must launch on rising; 1 = acts on rising, so launch on falling.
+bclkedge = (written.get(0x04, 0) >> 6) & 1
+launch_rising = bool(re.search(r'elsif\s+rising_edge\(clk_in\)', tm))
+chk("LRCLK launch edge opposes BCLKEDGE", launch_rising, bclkedge == 0,
+    "0x04 bit 6 BCLKEDGE=%d (part acts on %s), tdm8_master launches on %s"
+    % (bclkedge, "falling" if bclkedge == 0 else "rising",
+       "rising" if launch_rising else "falling"))
+
+# Whatever the shape, both consumers must edge-detect it rather than test the
+# level - a level test is only correct for the one-BCLK pulse.
+for name, src in (("tdm8_rx", trx), ("tdm16_merge", rd("tdm16_merge.vhd"))):
+    chk("%s edge-detects sync" % name,
+        bool(re.search(r"=\s*'1'\s+and\s+\w+\s*=\s*'0'", src)), True,
+        "must not level-test LRCLK")
+
 # --------------------------------------------------------------- report ------
 w = max(len(n) for n, *_ in OK + [(f[0],) for f in FAIL])
 print("=" * 78)

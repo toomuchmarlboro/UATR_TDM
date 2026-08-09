@@ -326,13 +326,20 @@ def main():
         # was previously only read once at boot - so a part heating up, muting
         # and recovering was invisible.
         parts = ("U19", "U20", "U37", "U38")
-        ever, now = (b_act >> 4) & 0xF, b_act & 0xF
-        print("    ADAU1978 overtemperature")
+        ever, lost = (b_act >> 4) & 0xF, b_act & 0xF
+        print("    sticky faults            (latched, survive between polls)")
         for i, nm in enumerate(parts):
-            e, n_ = (ever >> i) & 1, (now >> i) & 1
-            print("      %-4s %s" % (nm,
-                  "*** OT NOW ***" if n_ else
-                  "*** OT SEEN since power-up ***" if e else "normal"))
+            f = []
+            if (ever >> i) & 1:
+                f.append("OVERTEMPERATURE")
+            if (lost >> i) & 1:
+                f.append("*** PLL LOST LOCK ***")
+            print("      %-4s %s" % (nm, ", ".join(f) if f else "no faults latched"))
+        if lost:
+            print()
+            print("    A PLL that unlocks stops the serial port framing, so SDATAOUT")
+            print("    goes high-Z and the pull-down reads as exact zeros - which is")
+            print("    what the timeline shows. Look at MCLK reaching those parts.")
         if ever:
             print()
             print("    Overtemperature mutes the part. Table 8: the exposed pad is the")

@@ -169,7 +169,7 @@ BEGIN
 		clk2_duty_cycle => 50,
 		clk2_multiply_by => 1536,
 		clk2_phase_shift => "0",
-		compensate_clock => "CLK2",
+		compensate_clock => "CLK0",
 		inclk0_input_frequency => 20000,
 		intended_device_family => "Cyclone IV E",
 		lpm_hint => "CBX_MODULE_PREFIX=pll_audio",

@@ -98,7 +98,7 @@ architecture rtl of adau1978_sequencer is
         1 => x"0101",  -- PLL_CONTROL    bit7 is PLL_LOCK status, masked below
         2 => x"043F",  -- BLOCK_POWER_SAI
         3 => x"055A",  -- SAI_CTRL0
-        4 => x"0608",  -- SAI_CTRL1      bit7 SDATA_SEL picks SDATAOUT1 vs 2
+        4 => x"0608",  -- SAI_CTRL1      bit3 LR_MODE = 1, one-BCLK pulse
         5 => x"09F8"   -- SAI_OVERTEMP   bit0 is OT status, masked below
     );
     signal vfy_mask : std_logic_vector(5 downto 0) := (others => '0');
@@ -150,8 +150,15 @@ architecture rtl of adau1978_sequencer is
     -- 66 mA of contention against the clock buffers through the 49.9 ohm
     -- series resistors unless those are lifted.
     --   -1 = off, 0=U19 1=U20 2=U37 3=U38
+    -- Currently used as a SLOT IDENTITY tag, not a liveness probe. Two parts
+    -- share each SDATA line and the decoded channel group they land in has been
+    -- shown to shift by 4 slots when the LRCLK shape changed, so "ch 5-8 is
+    -- U20" is an assumption, not a measurement. Raising one part's gain by a
+    -- known amount labels its four channels unambiguously: whichever group
+    -- moves is that part. +30 dB (0x50) rather than +60 dB (0x00) so the hotter
+    -- group cannot clip and become unreadable - gain = 60 - 0.375*N.
     constant C_GAIN_PROBE_IDX  : integer range -1 to 3 := -1;
-    constant C_GAIN_PROBE_BYTE : std_logic_vector(7 downto 0) := x"00";  -- +60 dB
+    constant C_GAIN_PROBE_BYTE : std_logic_vector(7 downto 0) := x"50";  -- +30 dB
 
     constant C_MASTER_TEST : boolean := false;
     -- Which part gets master mode: 0=U19 1=U20 2=U37 3=U38.
@@ -223,10 +230,16 @@ architecture rtl of adau1978_sequencer is
         2 => x"1900",   -- ASDC_CLIP, bits 3:0 captured
         3 => x"0001",   -- M_POWER      expect 0x01
         4 => x"055A",   -- SAI_CTRL0    expect as written
-        5 => x"0608");  -- SAI_CTRL1    expect as written
+        5 => x"0600");  -- SAI_CTRL1    expect as written
     signal poll_reg : unsigned(2 downto 0) := "000";
     signal clip_ever : std_logic_vector(3 downto 0) := "0000";
     signal cfg_bad   : std_logic_vector(3 downto 0) := "0000";
+    -- Sticky "this part's PLL has been unlocked at some point since boot".
+    -- The instantaneous pll_mask is useless for catching brief events: with six
+    -- registers in the poll list, any one part's 0x01 is only re-read every
+    -- ~12 s, so a 250 ms unlock falls between samples. OT and config drift are
+    -- already sticky; this makes lock loss sticky too.
+    signal pll_lost  : std_logic_vector(3 downto 0) := "0000";
     signal poll_ot  : std_logic := '0';        -- retained, unused
     signal ot_now   : std_logic_vector(3 downto 0) := "0000";
     signal ot_ever  : std_logic_vector(3 downto 0) := "0000";
@@ -275,6 +288,15 @@ architecture rtl of adau1978_sequencer is
                        --                       i.e. 18.432 MHz at 96 kHz
         2  => x"0608", -- 0x06 SAI_CTRL1:    SDATAOUT1, 32 BCLK slots, 24-bit,
                        --                    LRCLK pulse, MSB first, slave
+                       -- LR_MODE (bit 3) SET = "single BCLK cycle wide pulse"
+                       -- (Table 21). 50% duty was tried instead, because an
+                       -- 81 ns pulse averages 13 mV and no meter can see it
+                       -- while a square averages 1.65 V. It cost channels: a
+                       -- 256-BCLK frame puts the 50% falling edge at BCLK 128,
+                       -- the slot 4 / slot 5 boundary, exactly where the part
+                       -- owning slots 5-8 takes over the line. Both parts
+                       -- holding slots 5-8 dropped out; both holding slots 1-4
+                       -- did better. tdm8_master must match - C_LR_PULSE there.
         3  => x"0710", -- 0x07 SAI_CMAP12:   slots 1,2   (0x54 on the B parts)
         4  => x"0832", -- 0x08 SAI_CMAP34:   slots 3,4   (0x76 on the B parts)
         5  => x"09F8", -- 0x09 SAI_OVERTEMP: drive C1-C4, DRV_HIZ=1
@@ -297,6 +319,34 @@ architecture rtl of adau1978_sequencer is
     constant CMAP12_SLOTS_5_6 : std_logic_vector(15 downto 0) := x"0754";
     constant CMAP34_SLOTS_7_8 : std_logic_vector(15 downto 0) := x"0876";
 
+    -- DIAGNOSTIC: exchange which part of each pair owns the upper slots.
+    --
+    -- Normally adc_idx(0) = '1' takes slots 4-7, so U19 and U37 hold slots 0-3
+    -- and U20/U38 hold 4-7. On both TDM lines the part holding slots 0-3 is the
+    -- unreliable one and the part holding 4-7 is the good one - U19 ~30/40
+    -- windows against U20 at 40/40, and the same ordering on TDM2 before its
+    -- wiring fault took over. Slot 0 begins at the frame boundary, immediately
+    -- after the LRCLK edge and at the instant the other part releases the line,
+    -- so it has the least margin of any slot. That is a plausible reason for the
+    -- ordering - but so is "U19 is simply the weaker part", and nothing measured
+    -- so far separates them.
+    --
+    -- With this true, U19/U37 take slots 4-7 and U20/U38 take slots 0-3. The
+    -- decoded channels follow the SLOTS, not the parts, so read the result as:
+    --      channels 1-4  = slots 0-3 = U20 / U38
+    --      channels 5-8  = slots 4-7 = U19 / U37
+    --
+    --   intermittency stays on channels 1-4 -> it follows the SLOT, so the frame
+    --       boundary is the problem and it is ours to fix in firmware.
+    --   intermittency moves to channels 5-8 -> it follows the PART, so it is U19
+    --       itself or its LRCLK/BCLK wiring (R7, R14, pins 15/16) and firmware
+    --       has nothing left to give.
+    --
+    -- Set back to false once answered.
+    constant C_SWAP_SLOTS : boolean := false;   -- answered 2026-08-10: intermittency
+    -- followed U19, not the slot. U20 held slots 0-3 and stayed 40/40 steady, so
+    -- the frame boundary is fine and the fault is U19 or its LRCLK/BCLK wiring.
+
     -- Helper Function to resolve 7-bit I2C Address based on ADC index
     function get_i2c_addr(idx : unsigned(1 downto 0)) return std_logic_vector is
     begin
@@ -315,7 +365,9 @@ begin
     dbg_scan_cnt  <= std_logic_vector(found_cnt);
     -- upper nibble = PLL locked per part, lower nibble = answered the scan
     dbg_scan_mask <= pll_mask & adr_mask;
-    dbg_ot        <= ot_ever & ot_now;
+    -- ot_now dropped in favour of the sticky lock-loss flag: an
+    -- instantaneous reading cannot catch a 250 ms event.
+    dbg_ot        <= ot_ever & pll_lost;
     dbg_health    <= cfg_bad & clip_ever;
     dbg_vfy_mask  <= scan_bad & '0' & vfy_mask;
     boot_done     <= boot_done_i;
@@ -354,6 +406,7 @@ begin
             poll_reg     <= "000";
             clip_ever    <= "0000";
             cfg_bad      <= "0000";
+            pll_lost     <= "0000";
             ot_now       <= "0000";
             ot_ever      <= "0000";
             polling      <= '0';
@@ -485,7 +538,8 @@ begin
                                            & C_GAIN_PROBE_BYTE;
                     end if;
 
-                    if adc_idx(0) = '1' then
+                    -- C_SWAP_SLOTS inverts which of the pair takes slots 4-7.
+                    if (adc_idx(0) = '1') /= C_SWAP_SLOTS then
                         -- keyed on the register address so ROM order can change
                         if current_boot_word(15 downto 8) = x"07" then
                             current_boot_word := CMAP12_SLOTS_5_6;
@@ -622,6 +676,9 @@ begin
                                 case to_integer(poll_reg) is
                                     when 0 =>          -- 0x01 PLL_LOCK
                                         pll_mask(to_integer(poll_idx)) <= i2c_data_rd(7);
+                                        if i2c_data_rd(7) = '0' and boot_done_i = '1' then
+                                            pll_lost(to_integer(poll_idx)) <= '1';
+                                        end if;
                                     when 1 =>          -- 0x09 OT
                                         ot_now(to_integer(poll_idx)) <= i2c_data_rd(0);
                                         if i2c_data_rd(0) = '1' then

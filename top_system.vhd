@@ -256,6 +256,8 @@ architecture rtl of top_system is
             dbg_scan_cnt  : out std_logic_vector(7 downto 0);
             dbg_scan_addr : out std_logic_vector(7 downto 0);
             dbg_scan_mask : out std_logic_vector(7 downto 0);
+            dbg_ot        : out std_logic_vector(7 downto 0);
+            dbg_health    : out std_logic_vector(7 downto 0);
             dbg_vfy_mask  : out std_logic_vector(7 downto 0)
         );
     end component;
@@ -274,7 +276,8 @@ architecture rtl of top_system is
             udp_ack      : in  std_logic;
             udp_adc_sel  : out std_logic_vector(1 downto 0);
             udp_ch_sel   : out std_logic_vector(1 downto 0);
-            udp_gain     : out std_logic_vector(7 downto 0)
+            udp_gain     : out std_logic_vector(7 downto 0);
+            udp_flags    : out std_logic_vector(7 downto 0)
         );
     end component;
 
@@ -317,6 +320,7 @@ architecture rtl of top_system is
     signal pwr_cnt    : unsigned(26 downto 0) := (others => '0');
     signal en_15v_int : std_logic := '0';
     signal en_48v_int : std_logic := '0';
+    signal udp_flags_int : std_logic_vector(7 downto 0) := (others => '0');
 
     -- TX Arbiter State Lock
     signal active_tx   : std_logic_vector(1 downto 0) := "00"; -- "00"=Idle, "01"=ARP, "10"=UDP
@@ -389,6 +393,21 @@ architecture rtl of top_system is
     signal sd_a_d, sd_b_d   : std_logic := '0';
     signal act_a, act_b     : unsigned(7 downto 0) := (others => '0');
     signal act_a_l, act_b_l : unsigned(7 downto 0) := (others => '0');
+
+    -- Fault counters, in the 50 MHz board-clock domain so they survive anything
+    -- that happens to the audio PLL. Both saturate at 255.
+    --   pll_drop : times the FPGA PLL lost lock after first achieving it
+    --   rst_drop : times adc_rst_n was re-asserted after the initial release,
+    --              i.e. how often all four ADCs were reset at runtime
+    -- The timeline showed U19 and U20 going dead in exactly the same windows,
+    -- which is a shared cause, and both of these are gated on pll_locked.
+    signal pll_lock_d : std_logic := '0';
+    signal pll_drop   : unsigned(7 downto 0) := (others => '0');
+    signal rst_n_d    : std_logic := '0';
+    signal rst_seen   : std_logic := '0';
+    signal rst_drop   : unsigned(7 downto 0) := (others => '0');
+    signal dbg_ot_int : std_logic_vector(7 downto 0);
+    signal dbg_health_int : std_logic_vector(7 downto 0);
     signal act_win          : unsigned(15 downto 0) := (others => '0');
     signal i2c_data_rd_int  : std_logic_vector(7 downto 0);
     signal adc_pll_lock_int : std_logic;
@@ -453,7 +472,12 @@ architecture rtl of top_system is
 
     -- DIAGNOSTIC: false holds 48V phantom power off entirely, to test whether
     -- the +/-15V rail collapse originates in the phantom path.
-    constant C_ENABLE_48V : boolean := false;
+    -- 48 V phantom power for the hydrophones. Held off through the whole
+    -- bring-up while the +/-15V rail was suspect; that turned out to be the
+    -- OPA1671s on a 15 V rail, not the phantom path, which is current-limited
+    -- to ~7 mA per pin by 32 x 6k81 feed resistors and could never have loaded
+    -- the rail. Enabled 1000 ms after PLL lock, 500 ms after +/-15V.
+    constant C_ENABLE_48V : boolean := true;
 
     -- The schematic net named /SCL lands on ADAU pin 17, which the datasheet
     -- calls SDA, so the pin assignment was crossed to compensate. That relies on
@@ -674,6 +698,24 @@ begin
         end if;
     end process;
 
+    -- Fault counters
+    process(clk_50m_board)
+    begin
+        if rising_edge(clk_50m_board) then
+            pll_lock_d <= pll_locked;
+            if pll_lock_d = '1' and pll_locked = '0' and pll_drop /= 255 then
+                pll_drop <= pll_drop + 1;
+            end if;
+
+            rst_n_d <= adc_rst_n_int;
+            if adc_rst_n_int = '1' then
+                rst_seen <= '1';                  -- initial release happened
+            elsif rst_seen = '1' and rst_n_d = '1' and rst_drop /= 255 then
+                rst_drop <= rst_drop + 1;         -- a later re-assertion
+            end if;
+        end if;
+    end process;
+
     adc_rst_n <= adc_rst_n_int;
 
 
@@ -719,7 +761,11 @@ begin
     end process;
 
     en_15v <= en_15v_int;
-    en_48v <= en_48v_int when C_ENABLE_48V else '0';
+    -- 48V needs the staged power-up to have reached it, the build to permit it,
+    -- and the host to have asked for it (udp_flags bit 0). The runtime flag
+    -- defaults to 0, so phantom power never comes up on its own after a reset -
+    -- it always takes a deliberate command from the GUI.
+    en_48v <= en_48v_int and udp_flags_int(0) when C_ENABLE_48V else '0';
     
     -- Output physical clocks to the outside world
     bclk_out     <= lrclk_test when C_BCLK_TEST_SLOW else clk_18m;
@@ -797,9 +843,9 @@ begin
     u_pll : pll_audio port map (
         areset => '0',    
         inclk0 => clk_50m_board,
-        c0     => open,         -- 12.288 MHz -> 48 kHz (breaks U37/U38)
-        c1     => open,         -- 18.432 MHz -> 72 kHz
-        c2     => clk_18m,      -- 24.576 MHz -> 96 kHz, MCS=011, 32-BCLK slots
+        c0     => clk_18m,      -- 12.288 MHz -> 48 kHz, MCS=001, 32-BCLK slots
+        c1     => open,         -- 18.432 MHz -> 72 kHz, MCS=011
+        c2     => open,         -- 24.576 MHz -> 96 kHz, MCS=011
         locked => pll_locked
     );
 
@@ -848,8 +894,8 @@ begin
         dbg_status3  => dbgu_sync,
         dbg_status4  => dbgv_sync,
         dbg_status5  => dbgw_sync,
-        dbg_status6  => std_logic_vector(act_a_l),
-        dbg_status7  => std_logic_vector(act_b_l),
+        dbg_status6  => dbg_health_int,
+        dbg_status7  => dbg_ot_int,
         dbg_status8  => dbgx_sync,
         fifo_wr_en   => fifo_wr_en_int,
         fifo_wr_data => fifo_wr_data_int,
@@ -999,6 +1045,8 @@ begin
         dbg_scan_cnt  => dbg_scan_cnt_int,
         dbg_scan_addr => dbg_scan_addr_int,
         dbg_scan_mask => dbg_scan_mask_int,
+        dbg_ot        => dbg_ot_int,
+        dbg_health    => dbg_health_int,
         dbg_vfy_mask  => dbg_vfy_mask_int
     );
 
@@ -1032,7 +1080,8 @@ begin
         udp_ack      => udp_rx_ack_int,
         udp_adc_sel  => udp_adc_sel_int,
         udp_ch_sel   => udp_ch_sel_int,
-        udp_gain     => udp_gain_int
+        udp_gain     => udp_gain_int,
+        udp_flags    => udp_flags_int
     );
 
 end architecture rtl;

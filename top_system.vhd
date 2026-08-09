@@ -290,7 +290,18 @@ architecture rtl of top_system is
     -- pll_audio generates BOTH audio clocks exactly from 50 MHz:
     --   c0 = 768/3125  = 12.288 MHz  -> 48 kHz  (256 BCLK/frame, MCS=001)
     --   c1 = 1152/3125 = 18.432 MHz  -> 72 kHz  (256 BCLK/frame, MCS=011)
-    -- Both are exact, not approximations. MCLK and BCLK share a net on this
+    -- NOT exact, despite what this comment said until 2026-08-10. The ALTPLL
+    -- cannot realise 768/3125 - 3125 is 5^5 and gcd(768,3125)=1, so M would have
+    -- to be 768 or a multiple, past the counter limit. Quartus approximates it as
+    -- 73/297 = 12.289562 MHz, +127 ppm, which makes fS 48006.1 Hz and not 48000.
+    -- The board measures 48010 Hz, which agrees with 48006 rather than 48000.
+    -- Harmless for audio and for channel-to-channel timing, since all 16 channels
+    -- come off this one clock. It matters only against an EXTERNAL time reference:
+    -- 127 ppm is 127 us per second of drift, so time-of-arrival work referenced to
+    -- GPS needs either the correction applied or an audio-rate oscillator instead
+    -- of deriving from 50 MHz. Note check_sync validates the REQUESTED ratio, so
+    -- it reports 48000 and cannot see this.
+    -- MCLK and BCLK share a net on this
     -- board, so fS is fixed by whichever of these feeds the TDM logic.
     -- Switching rate is this constant plus MCS/FS in adau_sequencer.
     -- To switch rate, change WHICH PLL OUTPUT is mapped to clk_18m below:
@@ -487,6 +498,25 @@ architecture rtl of top_system is
     --   false: i2c_scl port drives SCL (pin 76), i2c_sda drives SDA (pin 84)
     --   true : the two are crossed inside the FPGA
     constant C_I2C_SWAP : boolean := true;
+
+    -- DIAGNOSTIC: point the TDM2 receiver at the TDM1 pin.
+    --
+    -- The firmware is symmetric across the two lines - one entity instantiated
+    -- twice, same BCLK, same LRCLK, same register writes, same A/B slot split -
+    -- and TDM1 has a part running at 100%, so the logic demonstrably works. So
+    -- nothing in this file can single out TDM2 unless the FPGA's own input path
+    -- for PIN_119 is at fault. This separates those two cases with no soldering.
+    --
+    --   channels 9-16 mirror channels 1-8 -> PIN_119's input path and instance
+    --       u_rx_B are both fine, so nothing is arriving on the /TDM2 net. That
+    --       is copper: J19.4/J21.4, R122, U37.13, U38.13, U43.67.
+    --   channels 9-16 still dead          -> the fault is inside the FPGA - the
+    --       pin, the bank, or the instance - and it really is firmware.
+    --
+    -- Set back to false once answered. While true, channels 9-16 are a copy of
+    -- TDM1 and say nothing whatever about U37/U38.
+    constant C_TDM2_FROM_TDM1 : boolean := false;   -- answered 2026-08-10: ch9-16 mirrored ch1-8, so PIN_119 and u_rx_B are good and /TDM2 carries nothing
+    signal   sdata_b_sel      : std_logic;
     signal   lrclk_test : std_logic := '0';
     signal   lrclk_div  : unsigned(25 downto 0) := (others => '0');
 
@@ -864,11 +894,15 @@ begin
         ch_data_out => ch_data_A_int
     );
 
+    -- DIAGNOSTIC: while C_TDM2_FROM_TDM1 is true this feeds the TDM2 receiver
+    -- from the TDM1 pin. See the constant's declaration for what it proves.
+    sdata_b_sel <= sdata_in_A when C_TDM2_FROM_TDM1 else sdata_in_B;
+
     u_rx_B : tdm8_rx port map (
         rst         => sys_rst,
         bclk_in     => clk_18m,
         lrclk_in    => lrclk_int,
-        sdata_in    => sdata_in_B,
+        sdata_in    => sdata_b_sel,
         ch_data_out => ch_data_B_int
     );
 

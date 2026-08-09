@@ -31,18 +31,55 @@ set_clock_groups -asynchronous \
 # Hardcoding one meant these constraints were silently DROPPED whenever the rate
 # changed - "Ignored set_input_delay ... empty collection" - leaving the audio
 # domain completely unconstrained in timing analysis.
-set bclk_net [get_clocks -nowarn u_pll|altpll_component|auto_generated|pll1|clk[0]]
-foreach idx {1 2} {
-    if {[get_collection_size $bclk_net] == 0} {
-        set bclk_net [get_clocks -nowarn u_pll|altpll_component|auto_generated|pll1|clk[$idx]]
+# Resolve the INDEX once, then build both the clock and the pin path from it.
+# create_generated_clock -source needs a pin/port/node, not a clock collection,
+# so a clock object alone is not enough - passing one gets the whole constraint
+# silently dropped with "Argument -source is a collection that is not of port,
+# pin, reg, kpr, net, comb or node type".
+set audio_idx -1
+foreach idx {0 1 2} {
+    set c [get_clocks -nowarn "u_pll|altpll_component|auto_generated|pll1|clk\[$idx\]"]
+    if {[get_collection_size $c] > 0} {
+        set audio_idx $idx
+        break
     }
 }
-if {[get_collection_size $bclk_net] == 0} {
+if {$audio_idx < 0} {
     post_message -type error "SDC: no PLL audio clock resolved - check top_system port map"
+} else {
+    post_message -type info "SDC: audio clock is PLL clk\[$audio_idx\]"
 }
+set bclk_node "u_pll|altpll_component|auto_generated|pll1|clk\[$audio_idx\]"
+set bclk_net  [get_clocks $bclk_node]
 
-set_input_delay  -clock $bclk_net -max 18.0 [get_ports {sdata_in_A sdata_in_B}]
-set_input_delay  -clock $bclk_net -min  0.0 [get_ports {sdata_in_A sdata_in_B}]
+# BCLK leaves the FPGA as a forwarded copy of the audio clock (top_system does
+# bclk_out <= clk_18m). Declare it as a generated clock on the port, otherwise
+# neither it nor LRCLK is analysed at all - and until 2026-08-10 neither was.
+# There was no set_output_delay on bclk_out or lrclk_out anywhere in this file,
+# so the fitter placed the two with arbitrary relative delay. That skew comes
+# straight off the LRCLK setup budget at the ADC, which is the margin the whole
+# TDM framing depends on.
+create_generated_clock -name bclk_pin -source [get_pins $bclk_node] -divide_by 1 \
+    [get_ports {bclk_out}]
+
+# LRCLK is DATA with respect to BCLK, and the ADAU1978 acts on the FALLING edge
+# of BCLK because BCLKEDGE (0x04 bit 6) = 0 - see Table 19. tdm8_master launches
+# LRCLK on the rising edge, so this is deliberately a half-cycle path and must
+# be analysed against the falling edge; -clock_fall is what says so.
+#
+# The numbers are placeholders: the ADAU1978 serial-port setup/hold table is in
+# a figure that does not extract cleanly from the PDF, so 10 ns setup / 0 ns hold
+# is a conservative stand-in. Replace with the datasheet values when read - but
+# constrained with approximate numbers beats unconstrained, because the fitter
+# now has to control the skew instead of leaving it to chance.
+set_output_delay -clock bclk_pin -clock_fall -max 10.0 [get_ports {lrclk_out}]
+set_output_delay -clock bclk_pin -clock_fall -min  0.0 [get_ports {lrclk_out}]
+
+# SDATA is launched by the ADC on the falling edge of BCLK, for the same
+# BCLKEDGE = 0 reason, and tdm8_rx captures it on the rising edge. This was
+# referenced to the rising edge, which analysed the path half a BCLK out.
+set_input_delay  -clock $bclk_net -clock_fall -max 18.0 [get_ports {sdata_in_A sdata_in_B}]
+set_input_delay  -clock $bclk_net -clock_fall -min  0.0 [get_ports {sdata_in_A sdata_in_B}]
 
 # 5. RMII PHY Interface (LAN8720A)
 # The FPGA and the PHY are both clocked by rmii_ref_clk, so these are real

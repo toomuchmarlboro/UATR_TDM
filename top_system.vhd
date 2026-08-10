@@ -892,9 +892,9 @@ begin
     u_pll : pll_audio port map (
         areset => '0',    
         inclk0 => clk_50m_board,
-        c0     => clk_18m,      -- 12.288 MHz -> 48 kHz, MCS=001, 32-BCLK slots
-        c1     => open,         -- 18.432 MHz -> 72 kHz, MCS=011
-        c2     => open,         -- 24.576 MHz -> 96 kHz, MCS=011
+        c0     => open,         -- 12.288 MHz -> 48 kHz, MCS=001, 32-BCLK slots
+        c1     => open,         -- 18.432 MHz -> 96 kHz at 192 BCLK/frame, MCS=010
+        c2     => clk_18m,      -- 24.576 MHz -> 96 kHz at 256 BCLK/frame, MCS=011
         locked => pll_locked
     );
 

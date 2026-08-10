@@ -52,6 +52,11 @@ architecture rtl of tdm8_master is
     -- occurs on the transition into bit_cnt = 0.
     constant C_LR_PULSE_BCLKS : integer range 1 to 16 := 4;
 
+    -- 96 kHz via 192 x fS: 8 slots x 24 BCLKs. BCLK = MCLK = 18.432 MHz.
+    -- 256 x fS was the old 96 kHz config but needs 24.576 MHz, which leaves
+    -- only a 20.3 ns capture window against the ADAU1978's 18 ns clock-to-out
+    -- plus the U2 buffer and cable - negative margin. 192 x fS gives 27.1 ns.
+    constant C_FRAME_BCLKS : integer := 256;
     signal bit_cnt : integer range 0 to 255 := 0;
 begin
 
@@ -84,7 +89,7 @@ begin
         -- check_sync.py enforces the pairing.
         elsif rising_edge(clk_in) then
             
-            if bit_cnt = 255 then
+            if bit_cnt = C_FRAME_BCLKS - 1 then
                 bit_cnt <= 0;
             else
                 bit_cnt <= bit_cnt + 1;
@@ -93,7 +98,7 @@ begin
             -- Either shape puts the frame boundary on the same BCLK: LRCLK is
             -- driven high on the transition into bit_cnt = 0. Only the falling
             -- edge differs - after one BCLK, or after 128.
-            if bit_cnt = 255 then
+            if bit_cnt = C_FRAME_BCLKS - 1 then
                 lrclk_out <= '1';
             elsif C_LR_PULSE then
                 -- falls on the transition into bit_cnt = C_LR_PULSE_BCLKS, so
@@ -102,7 +107,7 @@ begin
                 if bit_cnt = C_LR_PULSE_BCLKS - 1 then
                     lrclk_out <= '0';
                 end if;
-            elsif bit_cnt = 127 then
+            elsif bit_cnt = C_FRAME_BCLKS/2 - 1 then
                 lrclk_out <= '0';
             end if;
             

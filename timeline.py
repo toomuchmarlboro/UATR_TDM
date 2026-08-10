@@ -89,14 +89,23 @@ def capture(port, bind, seconds, window):
 
 
 def rms_db(blocks):
-    """(rms_dbfs, all_exact_zero) for one window."""
+    """(rms_dbfs, all_exact_zero, fraction_of_samples_that_are_zero).
+
+    The zero FRACTION is what matters, not just all-or-nothing. A window is
+    24000 samples at 96 kHz, so np.all(x == 0) is only true if the part was
+    silent for the entire quarter second. A part that drops out for 50 ms inside
+    the window still left 200 ms of audio, so it counted as fully live and the
+    channel was reported "steady" - while a level meter updating every 10 ms
+    plainly showed it cutting in and out. That understated U19 for a long time.
+    """
     if not blocks:
-        return None, False
+        return None, False, None
     x = np.concatenate(blocks, axis=0).astype(np.float64)
     zero = np.all(x == 0, axis=0)
+    zfrac = np.mean(x == 0, axis=0)
     r = np.sqrt(np.mean(x * x, axis=0))
     db = np.where(r > 0, 20.0 * np.log10(np.maximum(r, 1e-12) / um.FULL_SCALE), -999.0)
-    return db, zero
+    return db, zero, zfrac
 
 
 def main():
@@ -113,11 +122,13 @@ def main():
         print("no packets received - is the board streaming?")
         sys.exit(2)
 
-    cols, zeros = [], []
+    cols, zeros, zfracs = [], [], []
     for b in bins:
-        db, z = rms_db([blk for blk in (ctrl.decode(d) for d in b) if blk is not None])
+        db, z, zf = rms_db([blk for blk in (ctrl.decode(d) for d in b)
+                            if blk is not None])
         cols.append(db)
         zeros.append(z)
+        zfracs.append(zf)
 
     # 40 columns at 6 chars each overruns any normal terminal and the cells run
     # together, so print in blocks that fit.
@@ -136,11 +147,24 @@ def main():
             return "%5s" % "."
         if db[c] < SILENT_DB:
             return "%5s" % "~"
+        # partially silent: show how much of the window was zero. This is the
+        # case the old all-or-nothing test could not see at all.
+        if zfracs[k] is not None and zfracs[k][c] > 0.02:
+            return "%4.0f%%" % (100.0 * zfracs[k][c])
         return "%5.0f" % db[c]
 
+    # "live" now also requires the window to be free of partial silence. A
+    # channel that streams for 200 ms and drops for 50 ms is not steady, and
+    # counting it as such is what made timeline disagree with the level meter.
     live = [sum(1 for k in range(n)
-                if cols[k] is not None and not zeros[k][c] and cols[k][c] >= SILENT_DB)
+                if cols[k] is not None and not zeros[k][c]
+                and cols[k][c] >= SILENT_DB
+                and (zfracs[k] is None or zfracs[k][c] <= 0.02))
             for c in range(um.CHANNELS)]
+    # worst partial-silence fraction seen on each channel, for the verdict
+    worst_z = [max((zfracs[k][c] for k in range(n)
+                    if zfracs[k] is not None and not zeros[k][c]), default=0.0)
+               for c in range(um.CHANNELS)]
 
     for lo in range(0, n, PER):
         hi = min(n, lo + PER)
@@ -164,8 +188,13 @@ def main():
             v = "steady"
         else:
             v = "*** INTERMITTENT %d/%d ***" % (live[c], n)
+            if worst_z[c] > 0.02:
+                v += "   (up to %.0f%% of a window silent - sub-window"                      " dropouts)" % (100.0 * worst_z[c])
         print("  %2d  %-4s %-5s %s" % (c + 1, OWNER[c], ADDR[c], v))
     print()
+    print("  NN% = that percentage of the window was exactly zero, i.e. the part")
+    print("        dropped out INSIDE the window. A quarter second is 24000")
+    print("        samples at 96 kHz, so a 50 ms dropout used to be invisible.")
     print("  . = every sample exactly zero    ~ = dither only, below %.0f dBFS"
           % SILENT_DB)
     print("  Check the pkts row before reading a gap as board behaviour - a")

@@ -747,7 +747,19 @@ begin
                                 dbg_rd_sai <= i2c_data_rd;
                             end if;
                             if vfy_idx = 3 then
-                                if i2c_data_rd = x"5A" then
+                                -- Compare against VFY_LIST, not a literal. This
+                                -- was hardcoded x"5A" and 0x05 became 0x5B for
+                                -- 96 kHz (FS 010 -> 011), so cfg_ok_i could
+                                -- never be set: the boot verify declared the
+                                -- configuration failed and retried the whole
+                                -- sequence MAX_BOOT_TRIES times. Each pass is
+                                -- ~167 ms and rewrites 0x01 PLL_CONTROL to all
+                                -- four parts, which the datasheet warns disturbs
+                                -- a locked PLL - so every retry knocked the ADCs
+                                -- off framing for exactly 167 ms. That is the
+                                -- tightly-clustered dropout udp_monitor found,
+                                -- and why U19 and U37 latched PLL LOST LOCK.
+                                if i2c_data_rd = VFY_LIST(3)(7 downto 0) then
                                     cfg_ok_i <= '1';
                                 end if;
                             elsif vfy_idx = 1 then

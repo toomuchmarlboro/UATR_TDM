@@ -95,10 +95,10 @@ architecture rtl of adau1978_sequencer is
     type vfy_list_t is array (0 to 5) of std_logic_vector(15 downto 0);
     constant VFY_LIST : vfy_list_t := (
         0 => x"0001",  -- M_POWER        PWUP
-        1 => x"0101",  -- PLL_CONTROL    bit7 is PLL_LOCK status, masked below
+        1 => x"0103",  -- PLL_CONTROL    bit7 is PLL_LOCK status, masked below
         2 => x"043F",  -- BLOCK_POWER_SAI
-        3 => x"055A",  -- SAI_CTRL0
-        4 => x"0608",  -- SAI_CTRL1      bit3 LR_MODE = 1, one-BCLK pulse
+        3 => x"055B",  -- SAI_CTRL0
+        4 => x"0608",  -- SAI_CTRL1      SLOT_WIDTH=00 32 BCLK, LR_MODE=1
         5 => x"09F8"   -- SAI_OVERTEMP   bit0 is OT status, masked below
     );
     signal vfy_mask : std_logic_vector(5 downto 0) := (others => '0');
@@ -229,7 +229,7 @@ architecture rtl of adau1978_sequencer is
         1 => x"0900",   -- SAI_OVERTEMP, bit 0 captured
         2 => x"1900",   -- ASDC_CLIP, bits 3:0 captured
         3 => x"0001",   -- M_POWER      expect 0x01
-        4 => x"055A",   -- SAI_CTRL0    expect as written
+        4 => x"055B",   -- SAI_CTRL0    expect as written
         5 => x"0608");  -- SAI_CTRL1    expect as written
     -- Entries 3..5 are compared against BOOT_ROM; 0..2 are read-only status and
     -- their expected byte is ignored. check_sync.py enforces that pairing, added
@@ -280,8 +280,14 @@ architecture rtl of adau1978_sequencer is
         -- 384 x fS) and then moves the goalposts to 64-96 kHz underneath it.
         -- The datasheet: "the PLL be disabled, reprogrammed with the new
         -- setting, and then reenabled".
-        0  => x"0101", -- 0x01 PLL_CONTROL:  CLK_S=0 MCLKIN, MCS=011 = 256 x fS at 96 kHz
-        1  => x"055A", -- 0x05 SAI_CTRL0:    left-just, TDM8, FS=011 64-96 kHz
+        0  => x"0103", -- 0x01 PLL_CONTROL:  CLK_S=0 MCLKIN, MCS=011 = 256 x fS,
+                       -- i.e. 24.576 MHz at 96 kHz (Table 9). 256 is also what
+                       -- the part assumes from its own reset defaults (MCS=001,
+                       -- FS=010 -> 256 x fS), so the PLL locks on the ratio it
+                       -- boots with and never has to re-acquire. 192 x fS would
+                       -- change the ratio mid-configuration, which the datasheet
+                       -- warns against and which left 3 of 4 PLLs unlocked.
+        1  => x"055B", -- 0x05 SAI_CTRL0:    left-just, TDM8, FS=011 64-96 kHz
                        -- SDATA_FMT changed 00 (I2S) -> 01 (left justified).
                        -- I2S delays data one BCLK from the LRCLK edge, but with
                        -- SLOT_WIDTH=24 BCLK and DATA_WIDTH=24-bit the slot is

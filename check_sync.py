@@ -82,8 +82,11 @@ chk("WIRE_LEN", pyconst(mon, "WIRE_LEN"), hdr_bytes + utx_payload,
     "eth+ip+udp header %d + payload %d" % (hdr_bytes, utx_payload))
 
 # ------------------------------------------------------------ 2. audio rate ---
-# which PLL output is wired to the audio clock in top_system's port map:
-#   c0 = 12.288 MHz -> 48 kHz     c1 = 18.432 MHz -> 72 kHz
+# which PLL output is wired to the audio clock in top_system's port map, and the
+# frame length from tdm8_master. The two together fix fS, because MCLK and BCLK
+# share a net on this board:
+#   c0 12.288 MHz / 256 BCLK = 48 kHz      c1 18.432 MHz / 192 BCLK = 96 kHz
+#   c1 18.432 MHz / 256 BCLK = 72 kHz      c2 24.576 MHz / 256 BCLK = 96 kHz
 top = rd("top_system.vhd")
 m = re.search(r'c([012])\s*=>\s*clk_18m', top)
 assert m, "cannot tell which PLL output drives clk_18m"
@@ -91,7 +94,14 @@ which = "clk%s" % m.group(1)
 mult = int(re.search(which + r'_multiply_by\s*=>\s*(\d+)', pll).group(1))
 divi = int(re.search(which + r'_divide_by\s*=>\s*(\d+)',   pll).group(1))
 bclk = 50_000_000 * mult / divi
-div  = int(re.search(r'if bit_cnt = (\d+) then', tm).group(1)) + 1
+# The frame length is C_FRAME_BCLKS if tdm8_master declares one, otherwise the
+# old hardcoded wrap value. Reading only the literal broke the moment the frame
+# became a named constant.
+_fr = re.search(r'C_FRAME_BCLKS\s*:\s*integer\s*:=\s*(\d+)', tm)
+if _fr:
+    div = int(_fr.group(1))
+else:
+    div = int(re.search(r'if bit_cnt = (\d+) then', tm).group(1)) + 1
 fs   = bclk / div
 # Not every rate is a round number of kHz: 44.1 kHz cannot be generated exactly
 # from 50 MHz (needs 3528/15625) and the closest ALTPLL ratio lands +64 ppm off.
@@ -112,8 +122,16 @@ chk("channels x bits", pyconst(mon, "CHANNELS") * pyconst(mon, "SAMPLE_BYTES") *
 adj = int(re.search(r'C_BIT_ADJ\s*:\s*integer\s*:=\s*(-?\d+)', trx).group(1))
 chk("shift reg holds a frame", shift_w >= div + abs(adj), True,
     "tdm8_rx %d bits >= %d BCLK frame + %d adj" % (shift_w, div, abs(adj)))
-chk("capture window in range", 0 <= 232 + adj - 32*7 and 255 + adj <= shift_w - 1, True,
-    "C_BIT_ADJ = %+d keeps all 8 slot slices inside the register" % adj)
+# 8 TDM slots, so the slot width follows the frame length: 256 BCLK -> 32, and
+# 192 BCLK -> 24. At 24 the 24-bit sample fills the slot exactly, leaving no pad
+# bits and so no slack at all for C_BIT_ADJ - the lowest slice index reduces to
+# adj itself, and a negative value would be an illegal VHDL range.
+slotw = div // 8
+lo = (div - 24) + adj - slotw * 7
+hi = (div - 1) + adj
+chk("capture window in range", 0 <= lo and hi <= shift_w - 1, True,
+    "C_BIT_ADJ = %+d -> slice %d..%d inside 0..%d, %d-BCLK slots leave %d spare "
+    "bits per slot" % (adj, lo, hi, shift_w - 1, slotw, slotw - 24))
 
 # --------------------------------------------------------------- 3. magic ----
 mg = re.findall(r'when [0-3] => fifo_wr_data <= x"([0-9A-Fa-f]{2})"', pf)[:4]
@@ -153,12 +171,12 @@ chk("device addresses", scn_addrs, addrs, "get_i2c_addr vs i2c_scan DEVICES")
 # -------------------------------------------------------------- 7. datasheet -
 # values that must match the ADAU1978 datasheet, not the RTL
 DS = {0x00: (0x01, "PWUP=1"),
-      0x01: (0x01, "CLK_S=0 MCLKIN, MCS=001 = 256 x fS at 48 kHz"),
+      0x01: (0x03, "CLK_S=0 MCLKIN, MCS=011 = 256 x fS at 96 kHz"),
       # bit 7 LR_POL and bit 6 BCLKEDGE are design choices tied to how the FPGA
       # drives LRCLK/BCLK, not datasheet-mandated values, so mask them here.
       # Bits [5:0] (LDO_EN, VREF_EN, ADC_EN4..1) are the ones that must be set.
       0x04: (0x3F, "LDO+VREF+ADC1-4 enabled", 0x3F),
-      0x05: (0x5A, "left-justified, SAI=011 TDM8, FS=010 32-48kHz"),
+      0x05: (0x5B, "left-justified, SAI=011 TDM8, FS=011 64-96kHz"),
       0x06: (0x08, "SDATAOUT1, 32 BCLK/slot, 24-bit, LRCLK pulse, MSB, slave"),
       0x09: (0xF8, "drive C1-C4, DRV_HIZ=1")}
 for reg, spec in sorted(DS.items()):
@@ -169,7 +187,8 @@ for reg, spec in sorted(DS.items()):
         why + ("" if mask == 0xFF else "  (mask %02X)" % mask))
 
 # TDM8 with 24-bit slots must give BCLK = 192 x fS  (datasheet Table 10)
-chk("Table 10 BCLK ratio", div, 8 * 32, "TDM8 x 32 BCLK slots = 256 x fS")
+chk("Table 10 BCLK ratio", div, 8 * slotw,
+    "TDM8 x %d BCLK slots = %d x fS" % (slotw, div))
 
 # The FPGA's LRCLK shape and the ADC's LR_MODE must agree. Nothing checked this
 # before, and they drifted apart: tdm8_master sent 50% duty while tdm16_merge

@@ -46,9 +46,9 @@ DEVICES = [(0x11, "U19", "TDM1 slot 1-4", "ch  1-4"),
 
 # register, name, value written, datasheet reset value
 VERIFY = [(0x00, "M_POWER",         0x01, 0x00),
-          (0x01, "PLL_CONTROL",     0x01, 0x41),
+          (0x01, "PLL_CONTROL",     0x03, 0x41),
           (0x04, "BLOCK_POWER_SAI", 0x3F, 0x3F),
-          (0x05, "SAI_CTRL0",       0x5A, 0x02),
+          (0x05, "SAI_CTRL0",       0x5B, 0x02),
           (0x06, "SAI_CTRL1",       0x08, 0x00),
           (0x09, "SAI_OVERTEMP",    0xF8, 0xF0)]
 

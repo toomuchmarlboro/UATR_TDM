@@ -12,23 +12,16 @@ entity tdm8_rx is
 end entity tdm8_rx;
 
 architecture rtl of tdm8_rx is
-    -- BCLKs to shift the capture window, tunable -7..+8 (the register carries
-    -- slack either side). NEGATIVE moves the window later in the frame.
-    -- -1 was found empirically: at 0 channels 9-16 showed full-scale 8388607
-    -- spikes and power-of-two minima; at -1 they read a clean -66..-78 dBFS
-    -- noise floor. +1 made it worse, railing channels 1-4.
+    -- 96 kHz via 192 x fS: 8 slots x 24 BCLKs, 24-bit data filling each slot
+    -- exactly. That geometry has ZERO slack - 8 x 24 = 192 bits in a 192-BCLK
+    -- frame - so unlike the 32-BCLK case there are no pad bits to slide into and
+    -- C_BIT_ADJ has exactly one legal, working value. sim_chain.py sweeps it:
+    -- only (ADC launch offset 0, adj +1) decodes, and no offset >= 1 has any
+    -- solution at all, because the part cannot fit 192 data bits into 192 BCLKs
+    -- if it starts even one BCLK late.
     --
-    -- Judge this by the channel statistics, not by --align. With no phantom
-    -- power and floating inputs there is no signal for a sample-to-sample
-    -- correlation metric to work with, and the scan ties across many offsets.
-    -- +7, derived from the raw capture rather than guessed. With the window at
-    -- -1 the 8 pad BCLKs of slot 4 were active in 100% of frames while slot 4's
-    -- 24 data BCLKs were active in only 10.7% - impossible if the part owning
-    -- slot 4 drives both. Those pad BCLKs were carrying the next slot's data,
-    -- i.e. the ADCs place data 8 BCLKs EARLIER than this window looked. Larger
-    -- adj indexes older bits, so -1 + 8 = +7. Every one of the twelve
-    -- data/pad activity figures on TDM1 is consistent with that offset and no
-    -- other. Confirm with "udp_monitor.py --align": best offset should be 0.
+    -- There is therefore nothing to tune here. Confirm on hardware by injecting a
+    -- known tone: it must appear at full amplitude on exactly one channel.
     constant C_BIT_ADJ : integer := -1;
 
     -- RAW CAPTURE MODE. Instead of extracting 24 bits from each 32-BCLK slot,
@@ -46,7 +39,45 @@ architecture rtl of tdm8_rx is
     -- trigger would re-latch on every one of them. Edge detection is correct
     -- for both shapes, so the receiver no longer cares which the master sends.
     signal lrclk_d : std_logic := '0';
+
+    -- Capture one clock AFTER the sync edge, not on it.
+    --
+    -- With 24-BCLK slots the 24-bit sample exactly fills the slot, so unlike the
+    -- 32-BCLK case there are no pad bits to borrow and C_BIT_ADJ has no slack: at
+    -- k=7 the slice bottom is C_BIT_ADJ itself, so any negative value asks for
+    -- shift_reg(22 downto -1), an illegal range. The alignment the ADAU1978
+    -- actually needs is one bit later than that bound allows, because slot 7's
+    -- last bit is only sampled ON the next sync edge - at the instant the edge is
+    -- detected it has not been shifted in yet.
+    --
+    -- Delaying the capture by one clock brings it in and moves the working
+    -- C_BIT_ADJ from -1 to 0, inside the legal range. Same trick tdm16_merge uses.
+    signal lrclk_d2 : std_logic := '0';
+
+    -- SDATA is registered on the FALLING edge of BCLK before entering the shift
+    -- register, which buys a full BCLK period for the round trip instead of half.
+    --
+    -- The ADAU1978 launches SDATA on the falling edge (BCLKEDGE = 0). Capturing on
+    -- the rising edge gives only half a period: 20.35 ns at 24.576 MHz, against
+    -- the part's 18 ns clock-to-out. Quartus measured 2.8-3.6 ns of slack, and
+    -- that excludes the U2 buffer (1.5-2.5 ns) and the cable, which it cannot see
+    -- - so the real margin is about zero. Capturing on the falling edge instead
+    -- makes it falling-to-falling, a full 40.7 ns period, and the 18 ns fits with
+    -- room to spare.
+    --
+    -- Only the DATA path moves. LRCLK edge detection stays on the rising edge, so
+    -- the frame reference is unchanged. The extra register delays the stream by
+    -- one bit, which sim_chain.py accounts for in C_BIT_ADJ.
+    signal sdata_f : std_logic := '0';
 begin
+
+    -- Half-cycle input register. See sdata_f above.
+    process(bclk_in)
+    begin
+        if falling_edge(bclk_in) then
+            sdata_f <= sdata_in;
+        end if;
+    end process;
 
     process(bclk_in, rst)
     begin
@@ -54,22 +85,24 @@ begin
             shift_reg   <= (others => '0');
             ch_data_out <= (others => '0');
             lrclk_d     <= '0';
+            lrclk_d2    <= '0';
         elsif rising_edge(bclk_in) then
 
-            lrclk_d <= lrclk_in;
+            lrclk_d  <= lrclk_in;
+            lrclk_d2 <= lrclk_d;
 
             -- 1. Always shift the new bit in (moving everything left)
-            shift_reg <= shift_reg(262 downto 0) & sdata_in;
+            shift_reg <= shift_reg(262 downto 0) & sdata_f;
             
-            -- 2. When the Sync pulse arrives, the PREVIOUS 192 bits 
-            --    are perfectly aligned in the register. Take a snapshot!
-            -- 32 BCLK per slot, 24-bit left-justified data: each slot holds
-            -- 24 data bits followed by 8 pad bits, so take the top 24 of every
-            -- 32. Slot width and data width are no longer the same number.
-            if lrclk_in = '1' and lrclk_d = '0' and C_RAW_CAPTURE then
+            -- 2. One clock after the sync edge the previous frame's 192 bits are
+            --    all in the register. Take a snapshot.
+            -- 32 BCLKs per slot, 24-bit data: 24 data bits then 8 pad BCLKs, so
+            -- take the top 24 of every 32. The 8 spare bits per slot are what
+            -- give C_BIT_ADJ its -8..+8 range; 24-BCLK slots have none.
+            if lrclk_d = '1' and lrclk_d2 = '0' and C_RAW_CAPTURE then
                 -- verbatim: frame bits 1..192, MSB = first bit after the sync
                 ch_data_out <= shift_reg(255 + C_BIT_ADJ downto 64 + C_BIT_ADJ);
-            elsif lrclk_in = '1' and lrclk_d = '0' then
+            elsif lrclk_d = '1' and lrclk_d2 = '0' then
                 for k in 0 to 7 loop
                     ch_data_out(191 - 24*k downto 168 - 24*k)
                         <= shift_reg(255 + C_BIT_ADJ - 32*k

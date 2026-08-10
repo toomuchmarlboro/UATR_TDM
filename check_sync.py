@@ -222,6 +222,17 @@ for idx, (reg, want) in enumerate(poll):
     chk("POLL_LIST 0x%02X" % reg, want, written.get(reg),
         "adau_sequencer POLL_LIST vs BOOT_ROM (runtime check)")
 
+# cfg_ok_i decides whether the boot verify PASSES. If it is gated on a literal
+# rather than on VFY_LIST, changing a register value makes the verify fail
+# forever: the sequencer retries the whole boot MAX_BOOT_TRIES times, each pass
+# rewriting 0x01 PLL_CONTROL to all four parts and knocking their PLLs off
+# framing for ~167 ms. That is exactly what happened when 0x05 went 0x5A -> 0x5B
+# for 96 kHz, and it presented as a hardware dropout for hours.
+_lit = re.search(r'if i2c_data_rd = x"([0-9A-Fa-f]{2})" then\s*\n\s*cfg_ok_i', seq)
+chk("cfg_ok_i not gated on a literal", _lit is None, True,
+    "adau_sequencer must compare against VFY_LIST, found x\"%s\""
+    % (_lit.group(1) if _lit else "-"))
+
 # The edge tdm8_master launches LRCLK on must be the OPPOSITE of the ADAU1978's
 # active edge, or LRCLK changes at the instant the part samples it and setup time
 # is zero. 0x04 bit 6 BCLKEDGE: 0 = the part acts on the falling edge, so the

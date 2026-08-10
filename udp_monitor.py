@@ -172,6 +172,23 @@ def chan_stats(x):
     if run >= 64:
         holds += 1
     zero_frac = 100.0 * sum(1 for v in x if v == 0) / n
+    # Lengths of every zero run >= 64 samples. A marginal contact should miss a
+    # sync edge and recover on the next frame - 10.4 us at 96 kHz - so gaps ought
+    # to be short and exponentially distributed. Measured gaps are ~167 ms, which
+    # is 16000 frames, and 167 ms keeps recurring across different builds and
+    # clock rates. Random bounce does not repeat a duration, so the spread of
+    # these lengths is what tells systematic apart from mechanical.
+    gaps = []
+    run0 = 0
+    for v in x:
+        if v == 0:
+            run0 += 1
+        else:
+            if run0 >= 64:
+                gaps.append(run0)
+            run0 = 0
+    if run0 >= 64:
+        gaps.append(run0)
     # Single-sample outliers. Real audio is band limited, so consecutive samples
     # are correlated and the second difference stays small. One flipped bit in a
     # 24-bit word shows up as a lone spike, which barely moves the RMS but lifts
@@ -193,7 +210,7 @@ def chan_stats(x):
             "diff": d, "distinct": distinct, "n": n,
             "hold_len": hold_len, "hold_val": hold_val, "hold_at": hold_at,
             "holds": holds, "zero_frac": zero_frac,
-            "glitch": glitch, "glitch_rate": glitch_rate}
+            "glitch": glitch, "glitch_rate": glitch_rate, "gaps": gaps}
 
 
 def classify(st):
@@ -414,14 +431,41 @@ def main():
     print("=" * 62)
     print("  ch    min        max        DC offset     RMS    peak dBFS  state")
     print("  " + "-" * 68)
+    sts = []
     for c in range(CHANNELS):
         st = chan_stats(samples[c])
+        sts.append(st)
         if st is None:
             print("  %2d    (no data)" % (c + 1))
             continue
         print("  %2d  %9d  %9d  %11.1f  %8.1f    %s   %s"
               % (c + 1, st["min"], st["max"], st["mean"], st["rms"],
                  fmt_db(st["peak"]), classify(st)))
+
+    # Distribution of dropout lengths, for channels that have any. A part that
+    # misses one sync edge should recover on the next frame - 10.4 us at 96 kHz.
+    # Gaps of ~167 ms are 16000 frames, and that duration has recurred across
+    # different builds and clock rates. Tightly clustered lengths point at
+    # something systematic with its own time constant; a broad spread points at
+    # a mechanical contact. This is the measurement that separates them.
+    gappy = [c for c in range(CHANNELS) if sts[c] and sts[c]["gaps"]]
+    if gappy:
+        print("\n" + "=" * 62)
+        print("DROPOUT LENGTHS   (runs of exact zero, >= 64 samples)")
+        print("=" * 62)
+        print("  one frame = %.1f us, so anything in ms means the part stayed off"
+              % (1e6 / SAMPLE_RATE))
+        print()
+        print("  ch   gaps   min ms   med ms   max ms   total ms   spread")
+        print("  " + "-" * 60)
+        for c in gappy:
+            g = sorted(sts[c]["gaps"])
+            ms = lambda k: 1000.0 * k / SAMPLE_RATE
+            spread = "tight - systematic?" if ms(g[-1]) - ms(g[0]) < 0.25 * ms(
+                g[len(g) // 2]) else "broad - mechanical?"
+            print("  %2d   %4d   %6.1f   %6.1f   %6.1f   %8.1f   %s"
+                  % (c + 1, len(g), ms(g[0]), ms(g[len(g) // 2]), ms(g[-1]),
+                     ms(sum(g)), spread))
 
     src = "ADC A (U19/U20 via TDM1)", "ADC B (U37/U38 via TDM2)"
     print("\n  channels 1-8  = %s" % src[0])

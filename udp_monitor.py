@@ -34,7 +34,7 @@ WIRE_LEN     = 452                                    # incl. eth+ip+udp headers
 CHANNELS     = 16
 SAMPLE_BYTES = 3
 FULL_SCALE   = 1 << 23                                # 24-bit signed
-SAMPLE_RATE   = 48000
+SAMPLE_RATE   = 96000
 EXPECTED_PPS = SAMPLE_RATE / FRAMES_PKT               # 6000 at 48 kHz
 
 
@@ -172,10 +172,28 @@ def chan_stats(x):
     if run >= 64:
         holds += 1
     zero_frac = 100.0 * sum(1 for v in x if v == 0) / n
+    # Single-sample outliers. Real audio is band limited, so consecutive samples
+    # are correlated and the second difference stays small. One flipped bit in a
+    # 24-bit word shows up as a lone spike, which barely moves the RMS but lifts
+    # the window PEAK by tens of dB - exactly what makes a channel read "steady"
+    # in timeline.py while a level meter flickers. Counted here so bit errors can
+    # be told apart from a genuinely varying signal.
+    glitch = 0
+    if n > 2 and rms > 0:
+        thr = 8.0 * rms
+        i = 1
+        while i < n - 1:
+            if abs(2 * x[i] - x[i - 1] - x[i + 1]) > thr:
+                glitch += 1
+                i += 3      # one spike trips three adjacent tests; count it once
+            else:
+                i += 1
+    glitch_rate = glitch / (n / float(SAMPLE_RATE)) if n else 0.0
     return {"min": mn, "max": mx, "mean": mean, "rms": rms, "peak": peak,
             "diff": d, "distinct": distinct, "n": n,
             "hold_len": hold_len, "hold_val": hold_val, "hold_at": hold_at,
-            "holds": holds, "zero_frac": zero_frac}
+            "holds": holds, "zero_frac": zero_frac,
+            "glitch": glitch, "glitch_rate": glitch_rate}
 
 
 def classify(st):
@@ -200,6 +218,9 @@ def classify(st):
     # A converter that dithers never repeats a sample many times over. A long
     # run means the part held its output: framing survived but conversion
     # stopped. Distinct from tri-stating, which reads as exact zeros.
+    if st["glitch_rate"] > 1.0:
+        return "%d bit glitches (%.0f/s) - marginal capture" % (
+            st["glitch"], st["glitch_rate"])
     if st["hold_len"] >= 64:
         where = "at start" if st["hold_at"] < 64 else \
                 "from %.2f s" % (st["hold_at"] / float(SAMPLE_RATE))

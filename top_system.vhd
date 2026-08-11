@@ -419,6 +419,13 @@ architecture rtl of top_system is
     -- clk_18m, so it goes through the 2-FF chain below like every other
     -- cross-domain byte.
     signal pll_ever_lost : std_logic := '0';
+    -- Sticky "adc_rst_n was re-asserted after its initial release". rst_drop
+    -- counted exactly this and was read by nothing, so a spurious hardware reset
+    -- of all four ADCs was invisible. It matters because the reset is 100 ms and
+    -- reconfiguration follows, which lands in the same 110-170 ms band every
+    -- observed dropout falls into. Published in status bit 6.
+    signal rst_ever      : std_logic := '0';
+    signal rst_meta, rst_sync : std_logic := '0';
     signal pll_lost_meta, pll_lost_sync : std_logic := '0';
     -- dbg_health/dbg_ot come from the sequencer in the rmii_ref_clk domain and
     -- were wired STRAIGHT into packet_formatter, which runs on clk_18m, while
@@ -761,6 +768,7 @@ begin
                 rst_seen <= '1';                  -- initial release happened
             elsif rst_seen = '1' and rst_n_d = '1' and rst_drop /= 255 then
                 rst_drop <= rst_drop + 1;         -- a later re-assertion
+                rst_ever <= '1';
             end if;
         end if;
     end process;
@@ -1111,7 +1119,9 @@ begin
             -- status bit 5 was unused by i2c_scan (it decodes 0x80, 0x10, 0x08,
             -- 0x04, 0x02, 0x01), so the audio PLL flag goes there.
             pll_lost_meta <= pll_ever_lost; pll_lost_sync <= pll_lost_meta;
-            dbgs_meta <= dbg_status_int(7 downto 6) & pll_lost_sync
+            rst_meta      <= rst_ever;       rst_sync      <= rst_meta;
+            -- bit 7 kept, bit 6 = adc_rst_n re-asserted, bit 5 = audio PLL lost
+            dbgs_meta <= dbg_status_int(7) & rst_sync & pll_lost_sync
                        & dbg_status_int(4 downto 0);
             dbgs_sync <= dbgs_meta;
             dbgy_meta <= dbg_health_int; dbgy_sync <= dbgy_meta;

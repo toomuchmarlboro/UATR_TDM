@@ -280,13 +280,35 @@ architecture rtl of adau1978_sequencer is
         -- 384 x fS) and then moves the goalposts to 64-96 kHz underneath it.
         -- The datasheet: "the PLL be disabled, reprogrammed with the new
         -- setting, and then reenabled".
+        -- PLL_MUTE (bit 6) is deliberately 0 here, against the reset default of
+        -- 1. Table 18: set to 1 it "mutes the ADC output if PLL becomes
+        -- unlocked". Leaving it off is a DEBUG choice: with automute disabled a
+        -- PLL unlock produces garbage, not silence, so the fact that every
+        -- observed dropout is EXACTLY zero proves those are tri-state from lost
+        -- frame sync and not PLL unlock. Set bit 6 for production - 0x43 - once
+        -- the dropouts are resolved, so a real unlock mutes instead of screaming.
         0  => x"0103", -- 0x01 PLL_CONTROL:  CLK_S=0 MCLKIN, MCS=011 = 256 x fS,
-                       -- i.e. 24.576 MHz at 96 kHz (Table 9). 256 is also what
-                       -- the part assumes from its own reset defaults (MCS=001,
-                       -- FS=010 -> 256 x fS), so the PLL locks on the ratio it
-                       -- boots with and never has to re-acquire. 192 x fS would
-                       -- change the ratio mid-configuration, which the datasheet
-                       -- warns against and which left 3 of 4 PLLs unlocked.
+                       -- i.e. 24.576 MHz at 96 kHz (Table 9).
+                       --
+                       -- CORRECTION 2026-08-11. This previously claimed 192 x fS
+                       -- cannot work because changing MCS mid-configuration needs
+                       -- a PLL re-acquire that the part cannot do. That reasoning
+                       -- was WRONG: Table 17 says M_POWER enables "the boost
+                       -- regulator, microphone bias, PLL, band gap reference, ADC,
+                       -- and LDO regulator", and PWUP=0 is a Full Power-Down - so
+                       -- the PLL is OFF while PWUP=0. Writing MCS first and PWUP
+                       -- last, which this ROM already does, gives a clean acquire
+                       -- at whatever ratio is programmed. Reset defaults are
+                       -- irrelevant.
+                       --
+                       -- 192 x fS nevertheless failed on hardware: at 18.4332 MHz
+                       -- with MCS=010 three of four PLLs read PLL_LOCK=0, while
+                       -- 24.576 MHz with MCS=011 locks every time. Both are legal
+                       -- per Table 9 and the real reason is still unknown - a
+                       -- fixed MCLK-mode loop filter (390 pF + 5600 pF) at a
+                       -- different VCO operating point is the open suspicion.
+                       -- 256 x fS is kept because it works, not because 192 is
+                       -- impossible.
         1  => x"055B", -- 0x05 SAI_CTRL0:    left-just, TDM8, FS=011 64-96 kHz
                        -- SDATA_FMT changed 00 (I2S) -> 01 (left justified).
                        -- I2S delays data one BCLK from the LRCLK edge, but with

@@ -12,17 +12,26 @@ entity tdm8_rx is
 end entity tdm8_rx;
 
 architecture rtl of tdm8_rx is
-    -- 96 kHz via 192 x fS: 8 slots x 24 BCLKs, 24-bit data filling each slot
-    -- exactly. That geometry has ZERO slack - 8 x 24 = 192 bits in a 192-BCLK
-    -- frame - so unlike the 32-BCLK case there are no pad bits to slide into and
-    -- C_BIT_ADJ has exactly one legal, working value. sim_chain.py sweeps it:
-    -- only (ADC launch offset 0, adj +1) decodes, and no offset >= 1 has any
-    -- solution at all, because the part cannot fit 192 data bits into 192 BCLKs
-    -- if it starts even one BCLK late.
+    -- 96 kHz via 256 x fS: 8 slots x 32 BCLKs carrying 24-bit data, so 8 pad
+    -- BCLKs per slot and C_BIT_ADJ has -8..+8 of room.
     --
-    -- There is therefore nothing to tune here. Confirm on hardware by injecting a
-    -- known tone: it must appear at full amplitude on exactly one channel.
-    constant C_BIT_ADJ : integer := -1;
+    -- 0, not -1. SDATA_FMT=01 (left justified) starts the data ON the frame
+    -- boundary with no delay, which is ADC launch offset 0, and sim_chain maps
+    -- that to adj 0 given the falling-edge input register and the one-clock
+    -- capture delay. -1 corresponds to launch 1, i.e. I2S, which is not what is
+    -- configured. The 256 x fS builds before 2026-08-11 used -1 and U20's
+    -- channels persistently reported "NOISE / misaligned?" in udp_monitor even
+    -- though that part never dropped a sample - consistent with being one bit off.
+    --
+    -- 192 x fS was tried and abandoned: only U19 locked its PLL, the other three
+    -- read PLL_LOCK=0 at 18.4332 MHz while all four lock at 24.576 MHz. The one
+    -- known per-part difference is the PLL loop filter return (U20 reworked to
+    -- AVDD2, the rest to GND), so locking at that VCO point looks marginal and
+    -- filter dependent. Unproven.
+    --
+    -- Confirm on hardware by injecting a known tone: it must appear at full
+    -- amplitude on exactly one channel.
+    constant C_BIT_ADJ : integer := 0;
 
     -- RAW CAPTURE MODE. Instead of extracting 24 bits from each 32-BCLK slot,
     -- publish the first 192 BCLKs of the frame verbatim - slots 1 to 6, which
@@ -96,9 +105,8 @@ begin
             
             -- 2. One clock after the sync edge the previous frame's 192 bits are
             --    all in the register. Take a snapshot.
-            -- 32 BCLKs per slot, 24-bit data: 24 data bits then 8 pad BCLKs, so
-            -- take the top 24 of every 32. The 8 spare bits per slot are what
-            -- give C_BIT_ADJ its -8..+8 range; 24-BCLK slots have none.
+            -- 32 BCLKs per slot, 24-bit data: take the top 24 of every 32. The 8
+            -- pad BCLKs are what give C_BIT_ADJ its range.
             if lrclk_d = '1' and lrclk_d2 = '0' and C_RAW_CAPTURE then
                 -- verbatim: frame bits 1..192, MSB = first bit after the sync
                 ch_data_out <= shift_reg(255 + C_BIT_ADJ downto 64 + C_BIT_ADJ);

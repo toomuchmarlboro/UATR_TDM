@@ -156,6 +156,12 @@ def main():
         # frame - is derived from that one PLL, so a drop here invalidates any
         # conclusion drawn about the ADCs. The design counted these internally
         # and published them nowhere until 2026-08-10.
+        # bit 6: sticky, set if adc_rst_n was re-asserted after its initial
+        # release. That resets ALL FOUR ADCs for 100 ms and wipes their
+        # registers, so it would show as a simultaneous dropout on every part.
+        print("    ADC hardware reset    %s"
+              % ("*** RE-ASSERTED since boot ***" if status & 0x40
+                 else "released once, never again"))
         print("    audio PLL lock        %s"
               % ("*** HAS LOST LOCK since power-up ***" if status & 0x20
                  else "never lost since power-up"))

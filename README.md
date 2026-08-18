@@ -2,15 +2,27 @@
 
 **16-channel 24-bit audio capture — 4× ADAU1978 → Cyclone IV FPGA → LAN8720A → Fiber → 7km Subsea → PC**
 
-> **Status (2026-08-08):**
+> **Status (2026-08-18):**
 > - ✅ **Ethernet stack complete and verified on hardware** — ~11,950 packets/s, 0 FPGA-side
 >   sequence gaps, FCS and IP checksum confirmed in Wireshark.
 > - ✅ **ADAU1978 I2C bring-up complete** — all four parts answer, every register read back
 >   byte-exact and cross-checked field-by-field against the datasheet.
 > - ✅ **Analog supplies and VREF good** — 1.5 V on all four parts, ±15 V stable.
-> - 🔴 **BLOCKING: no TDM audio data.** Both LMK1C1104 clock fanout buffers (U1, U2) are
->   damaged, so MCLK/BCLK/LRCLK never reach the ADCs at a valid logic level. See
->   [Hardware Bring-Up Log](#hardware-bring-up-log).
+> - ✅ **Clock buffers fixed — all four ADCs frame and produce data.** Both LMK1C1104
+>   fan-out buffers (U1, U2), previously damaged and blocking MCLK/BCLK/LRCLK, are no
+>   longer the blocker. See [Hardware Bring-Up Log](#hardware-bring-up-log) (marked
+>   RESOLVED — superseded by the LRCLK hold-spec finding below).
+> - 🟡 **Active configuration is 2× TDM8 (16 ch, 24-bit) — not TDM16.** TDM16 was built and
+>   tested (`output_files/96K_TDM16.jic`) but reverted: timing analysis showed the capture
+>   path was never the fault, so merging all four parts onto one net would only have traded
+>   24-bit samples for 16-bit. Procedure kept in
+>   [docs/TDM16_BRINGUP.md](docs/TDM16_BRINGUP.md) in case it's revisited.
+> - 🔴 **OPEN: channel dropouts on 3 of 4 ADCs.** Root-caused to the FPGA violating the
+>   ADAU1978's LRCLK hold spec (tALH = 5 ns min) by ~4 ns, compounding with per-part output
+>   delay through the U1 buffer — U20 alone reads 0% dropouts. See
+>   [docs/LRCLK_HOLD_VIOLATION.md](docs/LRCLK_HOLD_VIOLATION.md) and
+>   [docs/TDM2_NETLIST_FINDINGS.md](docs/TDM2_NETLIST_FINDINGS.md). Known-good fallback
+>   image: `output_files/96K_LRCLK_FIX.jic`.
 
 ---
 
@@ -165,8 +177,8 @@ Stream B wire:  Chip 2  ch  9–12  → TDM slots 1–4
 ```
 FPGA output         Signal                Destination
 ───────────         ──────                ───────────
-mclk_out            18.432 MHz            all 4× MCLKIN
-bclk_out            18.432 MHz            all 4× BCLK
+mclk_out            24.576 MHz            all 4× MCLKIN
+bclk_out            24.576 MHz            all 4× BCLK
 lrclk_out           96 kHz pulse          all 4× LRCLK
 
 FPGA input          Source
@@ -181,7 +193,7 @@ sdata_in_B          Chip 2 SDATAOUT1 + Chip 3 SDATAOUT1  (47kΩ pull-down to GND
 LRCLK:   |‾|__________________________________|‾|__
           1 BCLK wide pulse — marks start of slot 1
 
-BCLK:    192 cycles per frame  (8 slots × 24 bits)
+BCLK:    256 cycles per frame  (8 slots × 32 BCLK, 24-bit data + 8 pad bits)
 
 sdata_in_A:
 [Chip0 ch1:24b][Chip0 ch2:24b][Chip0 ch3:24b][Chip0 ch4:24b]  slots 1–4
@@ -432,7 +444,7 @@ disk     16 x 96000 x 3 B                   = 4.6 MB/s = 16.6 GB/hour
 
 ```vhdl
 FPGA_MAC  : x"DEADBEEF0001"
-FPGA_IP   : 192.168.1.100
+FPGA_IP   : 192.168.1.101
 PC_IP     : 192.168.1.10
 UDP_PORT  : 5005
 ```
@@ -495,10 +507,10 @@ staged power-up timer, and this runtime flag, which defaults to 0. Phantom
 power therefore never comes up on its own after a reset.
 
 ```
-python ctrl.py --test --channel 3     prove the receive path
-python ctrl.py --set 3 -6             one channel to -6 dB
-python ctrl.py --all 0                every channel to 0 dB
-python mixer_gui.py                   live meters + faders + phantom
+python python/ctrl.py --test --channel 3     prove the receive path
+python python/ctrl.py --set 3 -6             one channel to -6 dB
+python python/ctrl.py --all 0                every channel to 0 dB
+python python/mixer_gui.py                   live meters + faders + phantom
 ```
 
 ✅ **Verified on hardware 2026-08-09.** `ctrl.py --test --channel 1`:
@@ -509,63 +521,108 @@ directions.
 
 ## File Index
 
-Everything below is in the synthesis hierarchy (`TDM_UATR.qsf`, plus the two `.qip`
-IP wrappers) except the two testbenches. Superseded step-1/2 files (`top_tdm.vhd`,
-`top_loopback.vhd`, `seven_seg*.vhd`) were removed on 2026-08-08 — recover from git
-history if ever needed.
+### Repository layout
+
+```
+rtl/        Synthesizable VHDL — everything in TDM_UATR.qsf's VHDL_FILE list
+ip/         ALTPLL / FIFO IP cores, one directory per .qip (self-contained —
+            Quartus resolves each .qip's files relative to itself)
+sim/        Testbenches, modelsim.ini, wave.do — not in the synthesis hierarchy
+python/     Host-side tools (Python 3)
+hardware/   Schematic PDF and KiCad netlist export
+docs/       Bring-up logs and findings, referenced from this README
+db/, incremental_db/, output_files/   Quartus build output — gitignored, regenerable
+```
+
+`TDM_UATR.qpf` / `.qsf` / `.sdc` stay at the repository root so the project still
+opens in Quartus by double-clicking the `.qpf`. Everything the source files reference
+is a path relative to the project root — no fixed drive letters. **After pulling this
+layout change, run Project → Clean Project (or delete `db/`) once** so Quartus drops
+any cached references to the old flat paths.
+
+The step-1/2 files superseded by `top_system.vhd` (`top_tdm.vhd`, `top_loopback.vhd`,
+`seven_seg*.vhd`) were removed on 2026-08-08 — recover from git history if ever needed.
 
 ### RTL — top level
 
 | File | Status | Description |
 |------|--------|-------------|
-| `top_system.vhd` | ✅ Verified | Top level. Clock/reset, staged power-up, I2C open-drain buffers, TX arbiter, build-option constants |
+| `rtl/top_system.vhd` | ✅ Verified | Top level. Clock/reset, staged power-up, I2C open-drain buffers, TX arbiter, build-option constants |
 
 ### RTL — audio path
 
 | File | Status | Description |
 |------|--------|-------------|
-| `tdm8_master.vhd` | ✅ Verified | Generates LRCLK (1 BCLK pulse @ 96 kHz) from 18.432 MHz |
-| `tdm8_rx.vhd` | ✅ Verified | TDM8 receiver — 192-bit shift reg, latch on LRCLK |
-| `tdm16_merge.vhd` | ✅ Verified | Merges the two TDM8 streams into 16 channels |
-| `pll_audio.vhd` | ✅ Verified | ALTPLL: 50 MHz → 18.432 MHz (×80 / ÷217) |
-| `async_fifo.vhd` | ✅ Verified | Clock-domain crossing, 18.432 MHz → 50 MHz |
+| `rtl/tdm8_master.vhd` | ✅ Verified | Generates LRCLK (1 BCLK pulse @ 96 kHz) from 24.576 MHz |
+| `rtl/tdm8_rx.vhd` | ✅ Verified | TDM8 receiver — 264-bit shift reg (256-BCLK frame + `C_BIT_ADJ` slack), latch on LRCLK |
+| `rtl/tdm16_rx.vhd` | 🟡 Built, not active | Single-net 16-slot receiver for the TDM16 experiment — see [docs/TDM16_BRINGUP.md](docs/TDM16_BRINGUP.md) |
+| `rtl/tdm16_merge.vhd` | ✅ Verified | Merges the two TDM8 streams into 16 channels |
+| `ip/pll_audio/pll_audio.vhd` | ✅ Verified | ALTPLL: 50 MHz → 24.576 MHz (c2, ×1536 / ÷3125) — see [PLL Configuration](#pll-configuration) |
+| `ip/async_fifo/async_fifo.vhd` | ✅ Verified | Clock-domain crossing, 24.576 MHz → 50 MHz |
 
 ### RTL — ADC control
 
 | File | Status | Description |
 |------|--------|-------------|
-| `i2c_master.vhd` | ✅ Verified | I2C master. Bus recovery, probe mode, repeated-START reads |
-| `adau_sequencer.vhd` | ✅ Verified | 128-address scan, soft reset, register boot, two-pass PWUP, live PLL poll |
+| `rtl/i2c_master.vhd` | ✅ Verified | I2C master. Bus recovery, probe mode, repeated-START reads |
+| `rtl/adau_sequencer.vhd` | ✅ Verified | 128-address scan, soft reset, register boot, two-pass PWUP, live PLL poll |
 
 ### RTL — Ethernet
 
 | File | Status | Description |
 |------|--------|-------------|
-| `crc32.vhd` | ✅ Verified | Ethernet FCS (0x04C11DB7). **Root cause of the original "Ethernet dead" fault** |
-| `rmii_tx.vhd` | ✅ Verified | RMII MAC TX — preamble, data, FCS, IFG |
-| `rmii_rx.vhd` | ✅ Verified | RMII MAC RX. Proven by the control-path test |
-| `udp_tx_core.vhd` | ✅ Verified | Ethernet + IP + UDP headers, 452-byte frame |
-| `udp_rx_core.vhd` | ✅ Verified | UDP receive path, gain + flags control |
-| `arp_responder.vhd` | ✅ Verified | ARP replies so the PC resolves the FPGA IP |
-| `packet_formatter.vhd` | ✅ Verified | 10-byte header + 8 × 50-byte frames = 410-byte payload |
+| `rtl/crc32.vhd` | ✅ Verified | Ethernet FCS (0x04C11DB7). **Root cause of the original "Ethernet dead" fault** |
+| `rtl/rmii_tx.vhd` | ✅ Verified | RMII MAC TX — preamble, data, FCS, IFG |
+| `rtl/rmii_rx.vhd` | ✅ Verified | RMII MAC RX. Proven by the control-path test |
+| `rtl/udp_tx_core.vhd` | ✅ Verified | Ethernet + IP + UDP headers, 452-byte frame |
+| `rtl/udp_rx_core.vhd` | ✅ Verified | UDP receive path, gain + flags control |
+| `rtl/arp_responder.vhd` | ✅ Verified | ARP replies so the PC resolves the FPGA IP |
+| `rtl/packet_formatter.vhd` | ✅ Verified | 10-byte header + 8 × 50-byte frames = 410-byte payload |
 
-### Host tools (Python 3)
+### Host tools (Python 3, in `python/`)
 
 | File | Description |
 |------|-------------|
 | `udp_monitor.py` | One-shot capture: link rate, loss, per-channel statistics, `--wav`, `--align`. The single definition of the packet geometry — the others import it |
 | `i2c_scan.py` | Decodes the boot-time I2C diagnostics: bus health, 128-address sweep, per-part table, register verify |
-| `check_sync.py` | Cross-checks the Python decoders against the RTL **and** the datasheet tables. 32 assertions, run on every build |
+| `check_sync.py` | Cross-checks the Python decoders against the RTL (in `../rtl/`) **and** the datasheet tables. 52 assertions, run on every build |
+| `sim_chain.py` | Cycle-accurate model of the TDM chain used to settle `C_BIT_ADJ` without a licensed simulator |
+| `rawview.py` | Decodes `tdm8_rx`'s raw-capture debug mode, bit for bit |
 | `mixer_gui.py` | **Live tkinter mixer** — 16 meters, gain faders, mute, 48 V toggle |
 | `mixer.py` | Same meters in the terminal, no GUI |
 | `ctrl.py` | Control protocol and `--test`, which proves the UDP receive path |
+| `timeline.py` | Reports channel dropout windows over a capture |
+| `gdat2.py` | Serial telemetry GUI tab — see [docs/GDAT2_TELEMETRY.md](docs/GDAT2_TELEMETRY.md) |
 
-### Testbenches (not in the synthesis hierarchy)
+### Testbenches (`sim/`, not in the synthesis hierarchy)
 
 | File | Description |
 |------|-------------|
-| `tb_tdm8_rx.vhd` | ModelSim — known pattern, frame assertions |
-| `tb_tdm16.vhd` | ModelSim — 16-channel merge |
+| `sim/tb_tdm8_rx.vhd` | ModelSim — known pattern, frame assertions |
+| `sim/tb_tdm16.vhd` | ModelSim — 16-channel merge |
+| `sim/tb_chain.vhd` | ModelSim — full chain |
+
+Run from the repository root:
+
+```
+vlib work
+vcom -modelsimini sim/modelsim.ini -work work -2002 rtl/tdm8_master.vhd rtl/tdm8_rx.vhd rtl/tdm16_merge.vhd sim/tb_tdm16.vhd
+vsim -modelsimini sim/modelsim.ini -do sim/wave.do work.tb_tdm16
+```
+
+(`-modelsimini sim/modelsim.ini` points at the tracked library mapping — ModelSim
+otherwise resolves `modelsim.ini` from the current directory and would silently fall
+back to the install default. ModelSim's own `*.mpf` project cache is machine-specific
+— it's gitignored and regenerates from the `vcom`/`vsim` lines above.)
+
+### Bring-up logs (`docs/`)
+
+| File | Description |
+|------|-------------|
+| `TDM16_BRINGUP.md` | TDM16 procedure and why it was reverted |
+| `LRCLK_HOLD_VIOLATION.md` | The ~4 ns LRCLK hold-spec violation behind the current dropouts |
+| `TDM2_NETLIST_FINDINGS.md` | Netlist trace of the LMK1C1104 buffer fan-out, superseded as the headline by the hold-violation finding but still composing with it |
+| `GDAT2_TELEMETRY.md` | Notes on the `gdat2.py` serial telemetry GUI tab |
 
 ---
 
@@ -597,9 +654,9 @@ Condensed. The detail that matters now lives in
 [Clock and Framing Calculation](#clock-and-framing-calculation) and the
 [Hardware Bring-Up Log](#hardware-bring-up-log).
 
-**Simulation** — TDM8 master and receiver verified in ModelSim. `tb_tdm8_rx.vhd`
+**Simulation** — TDM8 master and receiver verified in ModelSim. `sim/tb_tdm8_rx.vhd`
 drives a known 8-channel pattern and asserts `ch_data_out` after three complete
-frames; `tb_tdm16.vhd` covers the 16-channel merge. Both are still in the tree
+frames; `sim/tb_tdm16.vhd` covers the 16-channel merge. Both are still in the tree
 and still the fastest way to check a framing change before it reaches hardware.
 
 ![ModelSim TDM16 waveform](docs/modelsim_tdm16.png)
@@ -622,9 +679,10 @@ against a 6 V maximum, both clock buffers were fitted rotated 180°, and the
 ADAU1978 turned out to reject the 24-BCLK slot width the board was designed
 around.
 
-**Current state** — 16 of 16 channels driving at 96 kHz / 24-bit. Channels 5–8
-convert correctly but their analog front end delivers no signal; that is the
-open item.
+**Current state (2026-08-18)** — clock buffers fixed, all four ADAU1978s frame at
+96 kHz / 24-bit on 2× TDM8. Three of the four (all but U20) show channel dropouts,
+root-caused to the FPGA violating the ADAU1978's LRCLK hold spec by ~4 ns — see
+[docs/LRCLK_HOLD_VIOLATION.md](docs/LRCLK_HOLD_VIOLATION.md); that is the open item.
 
 ---
 
@@ -671,14 +729,20 @@ is derivable from the RTL.
 
 ### Outstanding
 
-🔴 **Both LMK1C1104 clock buffers (U1, U2) are damaged.** Confirmed with a 10× probe:
-their inputs load the FPGA's 3.3 V outputs down to 2.0 V, and their outputs produce
-0.9 V (U1) and millivolts (U2). The ADAU1978 needs **VIH = 0.7 × IOVDD = 2.31 V**, so the
-ADCs never see a valid clock, never frame, and leave SDATAOUT high-Z. Everything upstream
-and downstream is verified good — the FPGA drives a clean 3.3 V when jumpered directly.
+✅ **RESOLVED, kept for the record — both LMK1C1104 clock buffers (U1, U2) were
+damaged.** Confirmed with a 10× probe: their inputs loaded the FPGA's 3.3 V outputs
+down to 2.0 V, and their outputs produced 0.9 V (U1) and millivolts (U2). The ADAU1978
+needs **VIH = 0.7 × IOVDD = 2.31 V**, so the ADCs never saw a valid clock, never framed,
+and left SDATAOUT high-Z. Everything upstream and downstream was verified good — the
+FPGA drove a clean 3.3 V when jumpered directly.
 
-Fix: replace both, or bypass in place by bridging pin 1 to pins 3/5/7/8 on each footprint
+Fix applied: replace both, or bypass in place by bridging pin 1 to pins 3/5/7/8 on each footprint
 (the FPGA can drive these loads directly; the 49.9 Ω series resistors stay).
+
+🔴 **Current open item: channel dropouts on 3 of 4 ADCs.** See
+[docs/LRCLK_HOLD_VIOLATION.md](docs/LRCLK_HOLD_VIOLATION.md) and
+[docs/TDM2_NETLIST_FINDINGS.md](docs/TDM2_NETLIST_FINDINGS.md) for the current
+investigation — this is a different fault from the resolved buffer damage above.
 
 ---
 
@@ -719,9 +783,8 @@ while True:
 - VHDL only — no Verilog or SystemVerilog
 - Cyclone IV E only — no Cyclone V or later features
 - Quartus Prime 18.1+
-- `tdm8_rx.vhd` is complete — instantiate twice in `top_tdm.vhd`, do not rewrite
-- `top_loopback.vhd` is a test scaffold — not the final top-level
-- `top_system.vhd` is the final top-level, replacing `top_loopback.vhd`
+- `rtl/tdm8_rx.vhd` is complete — instantiated twice in `rtl/top_system.vhd`, do not rewrite
+- `rtl/top_system.vhd` is the only top-level; `top_tdm.vhd` / `top_loopback.vhd` were removed 2026-08-08
 - All FPGA IO pins are 3.3V — LAN8720A IOVCC must also be 3.3V
 - ESP32 only acts as a surrogate 2x ADAU1978 chip outputting TDM8
 - UDP checksum may be set to 0x0000 (valid per RFC 768) to simplify implementation

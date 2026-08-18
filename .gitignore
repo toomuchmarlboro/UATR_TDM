@@ -16,11 +16,14 @@ simulation/
 *.done
 *.qarlog
 
-# ModelSim
+# ModelSim - project caches carry absolute paths baked in by the GUI, so they
+# can't survive a move or a different machine. Regenerate with vsim.
 work/
 transcript
 vsim.wlf
 *.vstf
+*.mpf
+*.cr.mti
 
 # Programming images - build artifacts, regenerate with quartus_cpf
 *.jic

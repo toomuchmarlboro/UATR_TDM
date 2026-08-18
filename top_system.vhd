@@ -426,8 +426,13 @@ architecture rtl of top_system is
     -- audio is. See the note on sdata_f in tdm8_rx.vhd.
     signal sd_a_f, sd_b_f   : std_logic := '0';
     signal sd_a_d, sd_b_d   : std_logic := '0';
-    signal act_a, act_b     : unsigned(7 downto 0) := (others => '0');
-    signal act_a_l, act_b_l : unsigned(7 downto 0) := (others => '0');
+    -- PER-SLOT activity bitmaps, not edge counts. Bit k is set if slot k saw at
+    -- least one SDATA transition during the window. See the process below.
+    signal act_a, act_b     : std_logic_vector(7 downto 0) := (others => '0');
+    signal act_a_l, act_b_l : std_logic_vector(7 downto 0) := (others => '0');
+    -- Local BCLK-within-frame counter, used only to attribute an edge to a slot.
+    signal slot_cnt         : unsigned(7 downto 0) := (others => '0');
+    signal lr_d             : std_logic := '0';
 
     -- Fault counters, in the 50 MHz board-clock domain so they survive anything
     -- that happens to the audio PLL. Both saturate at 255.
@@ -677,20 +682,51 @@ begin
     -- So 255 means "driven", and anything near 0 means "nobody is driving".
     -- There is no useful information in between.
     --
-    -- LIMITATION, and it matters: both parts on a line share it. act_b counts
-    -- U37 and U38 together, so it cannot say WHICH of the two went quiet - only
-    -- that at least one is still driving. That is still the measurement that
-    -- splits the fault in half:
-    --   ch 9-12 read exact zero while act_b = 255
-    --      -> the line is alive, so the clocks, PD/RST and the +3V3 that
-    --         BOTH parts share are all fine, and the fault is U37 alone or
-    --         our decode of its slots. Nothing shared, nothing in the cable.
-    --   ch 9-12 read exact zero while act_b falls to 0
-    --      -> both parts stopped together, so it IS something shared:
-    --         clock delivery, PD/RST, or supply. Then the cable is back in
-    --         scope and scoping J20/J21 is worth the time.
-    -- Sample the counter in the same capture as the audio, not separately - and
-    -- on the same EDGE as the audio too. See sd_a_f/sd_b_f above.
+    -- 2026-08-18: this used to be a saturating EDGE COUNT per line, and its
+    -- recorded limitation was that both parts on a line shared one number, so it
+    -- could not say WHICH of the two went quiet. It is now a PER-SLOT ACTIVITY
+    -- BITMAP, which answers exactly that at no cost in packet bytes:
+    --
+    --   bit k = 1  slot k saw at least one SDATA transition during the window
+    --
+    --   0xFF  all eight slots driven          - healthy, same as the old 255
+    --   0x0F  only slots 0-3                  - the upper part went quiet
+    --                                           (U20 on line A, U38 on line B)
+    --   0xF0  only slots 4-7                  - the lower part went quiet
+    --                                           (U19 on line A, U37 on line B)
+    --   0x00  nothing at all                  - whole line dead, same as old 0
+    --
+    -- This is the measurement that localizes a dropout to ONE PART without
+    -- depending on our decode being correct, which no other diagnostic here can
+    -- do. The channel table cannot: if the slot alignment is wrong, every
+    -- channel reads wrong and the table looks the same as a dead part.
+    --
+    -- THREE LIMITATIONS, all real:
+    --
+    -- 1. NOT BIT-EXACT AT THE PART BOUNDARY. slot_cnt is reset by the LRCLK
+    --    rising edge we generate, but the ADC's data for slot 0 arrives about one
+    --    BCLK later - that offset is what C_BIT_ADJ = -1 encodes. So the two
+    --    nibbles bleed into each other by 1 BCLK out of 128. Irrelevant for "did
+    --    this part drive at all", wrong if read as bit-exact slot framing.
+    --
+    -- 2. DIGITAL SILENCE READS AS ABSENCE. A part driving exact 0x000000 makes no
+    --    transitions and its bits read 0. This is a genuine regression against
+    --    the old count, where one live part masked a silent one. Cross-check
+    --    against the channel levels: 0x0F with ch 5-8 at exact zero means U20 is
+    --    not driving; 0x0F with ch 5-8 carrying real audio is impossible and
+    --    means the slot phase is off, not that U20 died.
+    --
+    -- 3. IT DETECTS SUSTAINED LOSS, NOT FLICKER. The bits are OR'd over 65536
+    --    BCLKs (~256 frames), so a slot driven even once in that 2.7 ms reads 1.
+    --    A part dropping 200 of 256 frames still shows healthy. OR is kept
+    --    deliberately because it preserves the 0xFF = healthy convention; if
+    --    frame-granularity flicker needs catching, AND these instead.
+    --
+    -- The slot index is 32 BCLKs wide here because TDM8 slots are 32 BCLKs. For
+    -- TDM16 (16-BCLK slots) it becomes slot_cnt(7 downto 4).
+    --
+    -- Sample the line in the same capture as the audio, not separately - and on
+    -- the same EDGE as the audio too. See sd_a_f/sd_b_f above.
     process(clk_18m)
     begin
         if falling_edge(clk_18m) then
@@ -704,6 +740,23 @@ begin
         if rising_edge(clk_18m) then
             sd_a_d <= sd_a_f;
             sd_b_d <= sd_b_f;
+            lr_d   <= lrclk_int;
+
+            -- BCLKs since the frame start. Derived locally from lrclk_int rather
+            -- than exported out of tdm8_master, so this diagnostic cannot perturb
+            -- the audio path. The counter wraps at 256 on its own, which is the
+            -- frame length, so a missed LRCLK edge self-corrects on the next one.
+            -- Reset to 1, not 0. lr_d is registered in this same process, so the
+            -- edge is detected on the cycle AFTER the LRCLK rise; writing 0 here
+            -- would make slot_cnt read 0 on the cycle whose true frame index is
+            -- already 1, leaving the counter permanently one BCLK behind on top
+            -- of the data-arrival offset noted above. Loading 1 cancels it.
+            if lrclk_int = '1' and lr_d = '0' then
+                slot_cnt <= to_unsigned(1, slot_cnt'length);
+            else
+                slot_cnt <= slot_cnt + 1;
+            end if;
+
             if act_win = 65535 then
                 act_win <= (others => '0');
                 act_a_l <= act_a;      -- publish
@@ -712,11 +765,12 @@ begin
                 act_b   <= (others => '0');
             else
                 act_win <= act_win + 1;
-                if sd_a_f /= sd_a_d and act_a /= 255 then
-                    act_a <= act_a + 1;
+                -- Top three bits of the BCLK counter = the 32-BCLK slot index.
+                if sd_a_f /= sd_a_d then
+                    act_a(to_integer(slot_cnt(7 downto 5))) <= '1';
                 end if;
-                if sd_b_f /= sd_b_d and act_b /= 255 then
-                    act_b <= act_b + 1;
+                if sd_b_f /= sd_b_d then
+                    act_b(to_integer(slot_cnt(7 downto 5))) <= '1';
                 end if;
             end if;
         end if;
@@ -1001,29 +1055,34 @@ begin
     -- script are untouched.
     sdata_b_sel <= sdata_in_A when C_TDM2_FROM_TDM1 else sdata_in_B;
 
-    u_rx : tdm16_rx port map (
+    u_rx_A : tdm8_rx port map (
         rst         => sys_rst,
         bclk_in     => clk_18m,
         lrclk_in    => lrclk_int,
         sdata_in    => sdata_in_A,
-        ch_data_A   => ch_data_A_int,
-        ch_data_B   => ch_data_B_int
+        ch_data_out => ch_data_A_int
     );
 
-    -- ================= REVERTING THIS FILE TO TDM8 =================
-    -- Delete the u_rx instance above, uncomment the two below, and remove the
-    -- board jumper. tdm8_rx.vhd and its component declaration are still in the
-    -- project untouched, so nothing else needs restoring here. adau_sequencer.vhd
-    -- has its own revert note covering the four register values that go with it.
+    u_rx_B : tdm8_rx port map (
+        rst         => sys_rst,
+        bclk_in     => clk_18m,
+        lrclk_in    => lrclk_int,
+        sdata_in    => sdata_b_sel,
+        ch_data_out => ch_data_B_int
+    );
+
+    -- ================= SWITCHING THIS FILE TO TDM16 =================
+    -- Delete the two instances above, uncomment the one below, and fit the board
+    -- jumper (R21 pin 1 to R122 pin 1, or devboard header pins 32 and 119).
+    -- tdm16_rx.vhd stays in the project either way, so nothing else moves here.
+    -- adau_sequencer.vhd has its own note covering the four register values.
+    -- Board procedure and failure signatures: docs/TDM16_BRINGUP.md
     --
-    -- u_rx_A : tdm8_rx port map (
+    -- u_rx : tdm16_rx port map (
     --     rst => sys_rst, bclk_in => clk_18m, lrclk_in => lrclk_int,
-    --     sdata_in => sdata_in_A, ch_data_out => ch_data_A_int);
-    --
-    -- u_rx_B : tdm8_rx port map (
-    --     rst => sys_rst, bclk_in => clk_18m, lrclk_in => lrclk_int,
-    --     sdata_in => sdata_b_sel, ch_data_out => ch_data_B_int);
-    -- ===============================================================
+    --     sdata_in => sdata_in_A,
+    --     ch_data_A => ch_data_A_int, ch_data_B => ch_data_B_int);
+    -- ================================================================
 
     u_merge : tdm16_merge port map (
         clk         => clk_18m,
@@ -1058,8 +1117,8 @@ begin
         --
         -- Already in the clk_18m domain, same as packet_formatter, so unlike
         -- dbg0_sync/dbg1_sync these need no synchroniser.
-        dbg_byte0    => std_logic_vector(act_a_l),
-        dbg_byte1    => std_logic_vector(act_b_l),
+        dbg_byte0    => act_a_l,
+        dbg_byte1    => act_b_l,
         dbg_status   => dbgs_sync,
         dbg_status2  => dbgt_sync,
         dbg_status3  => dbgu_sync,

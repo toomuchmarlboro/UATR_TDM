@@ -97,8 +97,8 @@ architecture rtl of adau1978_sequencer is
         0 => x"0001",  -- M_POWER        PWUP
         1 => x"0103",  -- PLL_CONTROL    bit7 is PLL_LOCK status, masked below
         2 => x"043F",  -- BLOCK_POWER_SAI
-        3 => x"0563",  -- SAI_CTRL0      SAI=100 TDM16
-        4 => x"0658",  -- SAI_CTRL1      SLOT_WIDTH=10 16 BCLK, 16-bit, LR_MODE=1
+        3 => x"055B",  -- SAI_CTRL0      SAI=011 TDM8
+        4 => x"0608",  -- SAI_CTRL1      SLOT_WIDTH=00 32 BCLK, 24-bit, LR_MODE=1
         5 => x"09F8"   -- SAI_OVERTEMP   bit0 is OT status, masked below
     );
     signal vfy_mask : std_logic_vector(5 downto 0) := (others => '0');
@@ -229,8 +229,8 @@ architecture rtl of adau1978_sequencer is
         1 => x"0900",   -- SAI_OVERTEMP, bit 0 captured
         2 => x"1900",   -- ASDC_CLIP, bits 3:0 captured
         3 => x"0001",   -- M_POWER      expect 0x01
-        4 => x"0563",   -- SAI_CTRL0    expect as written
-        5 => x"0658");  -- SAI_CTRL1    expect as written
+        4 => x"055B",   -- SAI_CTRL0    expect as written
+        5 => x"0608");  -- SAI_CTRL1    expect as written
     -- Entries 3..5 are compared against BOOT_ROM; 0..2 are read-only status and
     -- their expected byte is ignored. check_sync.py enforces that pairing, added
     -- after this list was left at 0x06 = 0x00 when BOOT_ROM moved to 0x08 - which
@@ -309,16 +309,19 @@ architecture rtl of adau1978_sequencer is
                        -- different VCO operating point is the open suspicion.
                        -- 256 x fS is kept because it works, not because 192 is
                        -- impossible.
-        1  => x"0563", -- 0x05 SAI_CTRL0:    left-just, TDM16, FS=011 64-96 kHz
-                       -- TDM16 2026-08-16. Table 20: SAI[5:3] 011 = TDM8,
-                       -- 100 = TDM16. All four parts now share ONE SDATA net
-                       -- (R21 pin 1 jumpered to R122 pin 1) and take four slots
-                       -- each out of sixteen. Table 10: TDM16 at 16 BCLKs per
-                       -- slot is 256 x fS, the SAME 24.576 MHz this board
-                       -- already runs - so the frame stays 256 BCLKs and
-                       -- tdm8_master is untouched. The cost is 16-bit data;
-                       -- 24-bit would need 384 x fS = 36.864 MHz, which the
-                       -- audio domain has no timing margin for.
+        1  => x"055B", -- 0x05 SAI_CTRL0:    left-just, TDM8, FS=011 64-96 kHz
+                       -- REVERTED TO TDM8 2026-08-18. Table 20: SAI[5:3] 011 =
+                       -- TDM8, 100 = TDM16. TDM16 was built and is retained in
+                       -- tdm16_rx.vhd, but the two SDATA lines are kept separate:
+                       -- the timing analysis showed the capture path was never
+                       -- the fault (sdata_in setup +10.651 ns, hold +8.494 ns
+                       -- worst corner against a 40.695 ns period), so merging all
+                       -- four parts onto one net only added drivers and stub
+                       -- length to a net whose signal integrity is the open
+                       -- question. Eight slots of 32 BCLKs is 256 BCLKs per
+                       -- frame, the same frame TDM16 used, so tdm8_master and the
+                       -- 24.576 MHz clock are unchanged either way - and TDM8
+                       -- keeps the full 24-bit sample width.
                        -- SDATA_FMT changed 00 (I2S) -> 01 (left justified).
                        -- I2S delays data one BCLK from the LRCLK edge, but with
                        -- SLOT_WIDTH=24 BCLK and DATA_WIDTH=24-bit the slot is
@@ -329,15 +332,15 @@ architecture rtl of adau1978_sequencer is
                        -- 32-BCLK slots and the delay does fit.
                        --                    -> MCS=010 now means 192 x fS,
                        --                       i.e. 18.432 MHz at 96 kHz
-        2  => x"0658", -- 0x06 SAI_CTRL1:    SDATAOUT1, 16 BCLK slots, 16-bit,
+        2  => x"0608", -- 0x06 SAI_CTRL1:    SDATAOUT1, 32 BCLK slots, 24-bit,
                        --                    LRCLK pulse, MSB first, slave
                        -- Table 21, verbatim: SLOT_WIDTH[6:5] 00 = 32 BCLKs per
                        -- TDM slot, 01 = 24, 10 = 16. DATA_WIDTH bit 4: 0 =
-                       -- 24-bit data, 1 = 16-bit. 16 slots x 16 BCLKs = 256.
-                       -- 16-bit data exactly fills a 16-BCLK slot, so there are
-                       -- NO pad bits left - which is why tdm16_rx has to delay
-                       -- its capture to keep C_BIT_ADJ legal. See the comment
-                       -- there before changing either number.
+                       -- 24-bit data, 1 = 16-bit. 8 slots x 32 BCLKs = 256.
+                       -- 24-bit data in a 32-BCLK slot leaves 8 pad bits per
+                       -- slot, which is the slack C_BIT_ADJ slides the capture
+                       -- window within. TDM16 had none, which is why tdm16_rx
+                       -- needed C_CAP_EXTRA; that constraint is gone here.
                        -- LR_MODE (bit 3) SET = "single BCLK cycle wide pulse"
                        -- (Table 21). 50% duty was tried instead, because an
                        -- 81 ns pulse averages 13 mV and no meter can see it
@@ -388,24 +391,32 @@ architecture rtl of adau1978_sequencer is
     --
     -- Read each byte as (C2,C1) and (C4,C3), high nibble first - so U37's
     -- 0x07 is 0x98 because C2 = slot 10 (1001) and C1 = slot 9 (1000).
+    -- TDM8: the two SDATA lines are independent, so the slot numbering RESTARTS
+    -- on each line. U19 and U37 both take slots 1-4 of their own line, U20 and
+    -- U38 both take slots 5-8 of theirs. That repetition is correct and is the
+    -- difference from TDM16, where all sixteen slots were unique on one net.
     type cmap_by_idx_t is array (0 to 3) of std_logic_vector(7 downto 0);
-    constant CMAP12_BY_IDX : cmap_by_idx_t := (x"10", x"54", x"98", x"DC");
-    constant CMAP34_BY_IDX : cmap_by_idx_t := (x"32", x"76", x"BA", x"FE");
+    constant CMAP12_BY_IDX : cmap_by_idx_t := (x"10", x"54", x"10", x"54");
+    constant CMAP34_BY_IDX : cmap_by_idx_t := (x"32", x"76", x"32", x"76");
 
-    -- ================= REVERTING THIS FILE TO TDM8 =================
-    -- Four values change, nothing else. Under TDM8 the two lines are independent,
-    -- so slots repeat: U19/U37 both take slots 1-4 and U20/U38 both take 5-8.
+    -- ================= SWITCHING THIS FILE TO TDM16 =================
+    -- Four values change, nothing else. Under TDM16 all four parts share one net
+    -- (jumper R21 pin 1 to R122 pin 1, or devboard header pins 32 and 119) and
+    -- the sixteen slots are unique:
     --
-    --   CMAP12_BY_IDX := (x"10", x"54", x"10", x"54")
-    --   CMAP34_BY_IDX := (x"32", x"76", x"32", x"76")
-    --   0x05 SAI_CTRL0 := x"5B"   SAI=011 TDM8      (currently x"63", SAI=100)
-    --   0x06 SAI_CTRL1 := x"08"   32-BCLK, 24-bit   (currently x"58", 16/16)
+    --   CMAP12_BY_IDX := (x"10", x"54", x"98", x"DC")
+    --   CMAP34_BY_IDX := (x"32", x"76", x"BA", x"FE")
+    --   0x05 SAI_CTRL0 := x"63"   SAI=100 TDM16     (currently x"5B", SAI=011)
+    --   0x06 SAI_CTRL1 := x"58"   16-BCLK, 16-bit   (currently x"08", 32/24)
+    --
+    -- and top_system swaps its two tdm8_rx instances for the one tdm16_rx.
+    -- See docs/TDM16_BRINGUP.md for the board side.
     --
     -- 0x05 and 0x06 appear three times each - BOOT_ROM, VFY_LIST and POLL_LIST -
     -- and all three must agree or cfg_ok_i will reject a correct part. check_sync.py
     -- cross-checks all three plus i2c_scan.py's VERIFY table, so run it after the
     -- edit and it will name any copy that was missed.
-    -- ===============================================================
+    -- ================================================================
 
     -- DIAGNOSTIC: exchange which part of each pair owns the upper slots.
     --

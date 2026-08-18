@@ -77,24 +77,76 @@ set bclk_net  [get_clocks $bclk_node]
 create_generated_clock -name bclk_pin -source [get_pins $bclk_node] -divide_by 1 \
     [get_ports {bclk_out}]
 
-# LRCLK is DATA with respect to BCLK, and the ADAU1978 acts on the FALLING edge
-# of BCLK because BCLKEDGE (0x04 bit 6) = 0 - see Table 19. tdm8_master launches
-# LRCLK on the rising edge, so this is deliberately a half-cycle path and must
-# be analysed against the falling edge; -clock_fall is what says so.
+# LRCLK is DATA with respect to BCLK. The numbers and the reference edge now come
+# from the datasheet rather than being guessed - Table 5, ADC SERIAL PORT:
 #
-# The numbers are placeholders: the ADAU1978 serial-port setup/hold table is in
-# a figure that does not extract cleanly from the PDF, so 10 ns setup / 0 ns hold
-# is a conservative stand-in. Replace with the datasheet values when read - but
-# constrained with approximate numbers beats unconstrained, because the fitter
-# now has to control the skew instead of leaving it to chance.
-set_output_delay -clock bclk_pin -clock_fall -max 10.0 [get_ports {lrclk_out}]
-set_output_delay -clock bclk_pin -clock_fall -min  0.0 [get_ports {lrclk_out}]
+#   tALS   10 ns min   LRCLK setup to BCLK RISING, slave mode
+#   tALH    5 ns min   LRCLK hold from BCLK RISING, slave mode
+#   tABDD  18 ns max   SDATAOUTx delay from BCLK falling
+#
+# So the part LATCHES LRCLK ON THE RISING EDGE of BCLK, and drives SDATAOUT from
+# the falling edge. Those are different edges and both are correct: BCLKEDGE
+# (0x04 bit 6) = 0 makes the falling edge the OUTPUT launch edge, which is what
+# Table 19 describes and what tABDD confirms. It does not move the LRCLK input
+# sampling edge, and this file previously assumed it did.
+#
+# -clock_fall was therefore wrong: it analysed LRCLK against the falling edge,
+# half a BCLK away from where the part actually samples it. That made the budget
+# a half period (20.3 ns) when the real relationship is launch on rising edge N
+# to sample on rising edge N+1, a full period. The constraint was PESSIMISTIC,
+# not loose, so it never caused a failure - but the slack it reported understated
+# the real margin by about 2x, and the fitter was optimising the wrong skew.
+#
+# SIGN. tALH is a HOLD requirement at the ADC and must be entered as a NEGATIVE
+# min output delay: -min -5.0, not +5.0. set_output_delay states delay EXTERNAL
+# to the port, and TimeQuest SUBTRACTS it from the required time in both checks:
+#     required(setup) = latch_edge + T - output_delay_max
+#     required(hold)  = latch_edge     - output_delay_min
+# so a positive -min makes hold EASIER by exactly that amount, not harder. The
+# previous +5.0 therefore relaxed the check by 10 ns relative to the truth and
+# turned a real violation into a comfortable pass.
+#
+# Confirmed against the tool's own arithmetic on the 2026-08-16 report, where
+# both rows reconcile to within the same 0.110 ns of clock uncertainty:
+#     setup  40.695 - 10.0 + 2.670 - 4.488 = 28.877  reported 28.767
+#     hold            4.161 - 2.904 + 5.0  =  6.257  reported  6.147
+# The hold row only balances if the +5.0 is ADDED, which is the bug.
+#
+# The physical number underneath, which needs no sign convention at all: LRCLK
+# leaves its pad only 4.161 - 2.904 = 1.26 ns (min) to 4.488 - 2.670 = 1.82 ns
+# (max) after BCLK leaves its pad, and Table 5 requires 5 ns. See tdm8_master.
+set_output_delay -clock bclk_pin -max  10.0 [get_ports {lrclk_out}]
+set_output_delay -clock bclk_pin -min  -5.0 [get_ports {lrclk_out}]
 
-# SDATA is launched by the ADC on the falling edge of BCLK, for the same
-# BCLKEDGE = 0 reason, and tdm8_rx captures it on the rising edge. This was
-# referenced to the rising edge, which analysed the path half a BCLK out.
-set_input_delay  -clock $bclk_net -clock_fall -max 18.0 [get_ports {sdata_in_A sdata_in_B}]
-set_input_delay  -clock $bclk_net -clock_fall -min  0.0 [get_ports {sdata_in_A sdata_in_B}]
+# SDATA is launched by the ADC on the falling edge of BCLK (tABDD, 18 ns max)
+# and tdm8_rx now captures it on the falling edge of the internal clock.
+#
+# REFERENCE CLOCK. This was "-clock $bclk_net", the INTERNAL PLL output. That is
+# not the clock the ADC launches from: the part is clocked by the copy that left
+# the FPGA on bclk_out and went through U2. Referencing the internal node omits
+# the entire clock-forwarding delay, and the report shows exactly how much that
+# is - bclk_pin arrives 1.559 to 2.904 ns after the PLL clock reaches the core
+# (the "Clock Skew" column on the lrclk_out rows). Add U2 at 1.5-2.5 ns and the
+# cable, and the analysis was crediting the design with 5-7 ns it does not have.
+# "-clock bclk_pin" makes TimeQuest walk the real path to the pad.
+#
+# Board delays are declared rather than buried. Adjust if the harness changes.
+#   BCLK_TO_ADC   bclk_out pad -> U2 -> ADC BCLK pin
+#   SDATA_TO_FPGA ADC SDATAOUTx pin -> sdata_in_x pad (no buffer in this path)
+set bclk_to_adc_max   2.5
+set bclk_to_adc_min   1.5
+set sdata_to_fpga_max 1.0
+set sdata_to_fpga_min 0.3
+#
+# max: worst case the data can be late  = clock out + tABDD max + data back
+# min: best case it can be early. The datasheet gives no minimum for tABDD, so 0
+# is the only defensible floor - pessimistic for hold, which is the safe side.
+set_input_delay -clock bclk_pin -clock_fall \
+    -max [expr $bclk_to_adc_max + 18.0 + $sdata_to_fpga_max] \
+    [get_ports {sdata_in_A sdata_in_B}]
+set_input_delay -clock bclk_pin -clock_fall \
+    -min [expr $bclk_to_adc_min +  0.0 + $sdata_to_fpga_min] \
+    [get_ports {sdata_in_A sdata_in_B}]
 
 # 5. RMII PHY Interface (LAN8720A)
 # The FPGA and the PHY are both clocked by rmii_ref_clk, so these are real

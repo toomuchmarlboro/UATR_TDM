@@ -113,25 +113,56 @@ chk("SAMPLE_RATE", abs(_want - fs) / fs < 1e-3, True,
 
 # slot width and data width are no longer the same: 32 BCLK slots carry 24-bit
 # samples, so the shift register (frame in BCLKs) is wider than the data output.
+# TDM mode comes from the ADC configuration, not from an assumption here.
+# 0x05 SAI_CTRL0 bits [5:3] SAI: 011 = TDM8, 100 = TDM16   (Table 20)
+# 0x06 SAI_CTRL1 bits [6:5] SLOT_WIDTH: 00 = 32, 01 = 24, 10 = 16 BCLKs
+# 0x06 SAI_CTRL1 bit  4    DATA_WIDTH: 0 = 24-bit, 1 = 16-bit   (Table 21)
+_rom_pairs = dict((int(v[:2], 16), int(v[2:], 16)) for v in
+                  re.findall(r'=>\s*x"([0-9A-Fa-f]{4})"', seq))
+v05, v06 = _rom_pairs.get(0x05, 0), _rom_pairs.get(0x06, 0)
+nslots = {3: 8, 4: 16}.get((v05 >> 3) & 7)
+slotw  = {0: 32, 1: 24, 2: 16}.get((v06 >> 5) & 3)
+dataw  = 16 if (v06 >> 4) & 1 else 24
+# The receiver that is actually instantiated in top_system, not whichever file
+# happens to exist - both are kept in the project so a revert is one swap.
+rx_name = "tdm16_rx" if re.search(r'^\s*u_rx\s*:\s*tdm16_rx', top, re.M) else "tdm8_rx"
+trx = rd(rx_name + ".vhd")
 shift_w = int(re.search(r'signal shift_reg\s*:\s*std_logic_vector\((\d+) downto 0\)', trx).group(1)) + 1
-data_w  = int(re.search(r'ch_data_out\s*:\s*out\s*std_logic_vector\((\d+) downto 0\)', trx).group(1)) + 1
+cap_extra = int(re.search(r'C_CAP_EXTRA\s*:\s*integer\s*:=\s*(\d+)', trx).group(1))             if "C_CAP_EXTRA" in trx else 0
+# The receivers do not agree on port shape: tdm8_rx exposes one ch_data_out and
+# is instantiated twice (one per SDATA line), tdm16_rx exposes ch_data_A and
+# ch_data_B from a single instance. Count what is actually there rather than
+# assuming either shape - total audio bits per frame is what has to match the
+# host, and both arrangements have to reach the same number.
+_ports = [int(w) + 1 for w in re.findall(
+    r'ch_data_\w+\s*:\s*out\s*std_logic_vector\((\d+) downto 0\)', trx)]
+n_inst  = len(re.findall(r':\s*' + rx_name + r'\s+port map', top))
+data_w  = sum(_ports)
 chk("channels x bits", pyconst(mon, "CHANNELS") * pyconst(mon, "SAMPLE_BYTES") * 8,
-    data_w * 2, "tdm8_rx ch_data_out %d bits x 2 lines" % data_w)
-# tdm8_rx carries slack either side of the frame so C_BIT_ADJ can slide the
+    data_w * n_inst, "%s: %d output port(s) totalling %d bits x %d instance(s)"
+    % (rx_name, len(_ports), data_w, n_inst))
+# The receiver carries slack either side of the frame so C_BIT_ADJ can slide the
 # capture window, so the register is intentionally wider than one frame.
-adj = int(re.search(r'C_BIT_ADJ\s*:\s*integer\s*:=\s*(-?\d+)', trx).group(1))
+# tdm16_rx constrains the type ("integer range -8 to 8 := -1") to catch a typo at
+# elaboration, so the range clause has to be optional here or this stops matching.
+adj = int(re.search(r'C_BIT_ADJ\s*:\s*integer\s*(?:range\s+[^:]*?)?:=\s*(-?\d+)',
+                    trx).group(1))
 chk("shift reg holds a frame", shift_w >= div + abs(adj), True,
-    "tdm8_rx %d bits >= %d BCLK frame + %d adj" % (shift_w, div, abs(adj)))
-# 8 TDM slots, so the slot width follows the frame length: 256 BCLK -> 32, and
-# 192 BCLK -> 24. At 24 the 24-bit sample fills the slot exactly, leaving no pad
-# bits and so no slack at all for C_BIT_ADJ - the lowest slice index reduces to
-# adj itself, and a negative value would be an illegal VHDL range.
-slotw = div // 8
-lo = (div - 24) + adj - slotw * 7
-hi = (div - 1) + adj
+    "%s %d bits >= %d BCLK frame + %d adj" % (rx_name, shift_w, div, abs(adj)))
+# The slice must land inside the register for EVERY slot, at the configured
+# slot width and data width. When the data exactly fills the slot there are no
+# pad bits and no slack at all, so the lowest index reduces to the capture
+# offset itself and a negative C_BIT_ADJ becomes an illegal VHDL range. That is
+# what C_CAP_EXTRA buys back: it delays the capture so the frame sits higher in
+# the register, creating room underneath.
+base = (div - 1) + cap_extra
+hi   = base + adj
+lo   = base + adj - slotw * (nslots - 1) - dataw + 1
 chk("capture window in range", 0 <= lo and hi <= shift_w - 1, True,
-    "C_BIT_ADJ = %+d -> slice %d..%d inside 0..%d, %d-BCLK slots leave %d spare "
-    "bits per slot" % (adj, lo, hi, shift_w - 1, slotw, slotw - 24))
+    "%s C_BIT_ADJ = %+d, C_CAP_EXTRA = %d -> slice %d..%d inside 0..%d; "
+    "%d slots x %d BCLK carrying %d-bit data leaves %d pad bits per slot"
+    % (rx_name, adj, cap_extra, lo, hi, shift_w - 1,
+       nslots, slotw, dataw, slotw - dataw))
 
 # --------------------------------------------------------------- 3. magic ----
 mg = re.findall(r'when [0-3] => fifo_wr_data <= x"([0-9A-Fa-f]{2})"', pf)[:4]
@@ -176,8 +207,13 @@ DS = {0x00: (0x01, "PWUP=1"),
       # drives LRCLK/BCLK, not datasheet-mandated values, so mask them here.
       # Bits [5:0] (LDO_EN, VREF_EN, ADC_EN4..1) are the ones that must be set.
       0x04: (0x3F, "LDO+VREF+ADC1-4 enabled", 0x3F),
-      0x05: (0x5B, "left-justified, SAI=011 TDM8, FS=011 64-96kHz"),
-      0x06: (0x08, "SDATAOUT1, 32 BCLK/slot, 24-bit, LRCLK pulse, MSB, slave"),
+      # SAI (0x05 [5:3]) and SLOT_WIDTH/DATA_WIDTH (0x06 [6:5], [4]) are the
+      # TDM mode itself and are checked below against Table 10 rather than
+      # pinned here - otherwise switching TDM8 <-> TDM16 means editing the
+      # "datasheet" table, which is exactly how a check turns into a rubber
+      # stamp. What is pinned is everything the mode must NOT change.
+      0x05: (0x43, "left-justified (fmt=01), FS=011 64-96kHz", 0xC7),
+      0x06: (0x08, "SDATAOUT1, LRCLK pulse, MSB first, slave", 0x8F),
       0x09: (0xF8, "drive C1-C4, DRV_HIZ=1")}
 for reg, spec in sorted(DS.items()):
     val, why = spec[0], spec[1]
@@ -186,9 +222,18 @@ for reg, spec in sorted(DS.items()):
     chk("datasheet 0x%02X" % reg, None if got is None else got & mask, val & mask,
         why + ("" if mask == 0xFF else "  (mask %02X)" % mask))
 
-# TDM8 with 24-bit slots must give BCLK = 192 x fS  (datasheet Table 10)
-chk("Table 10 BCLK ratio", div, 8 * slotw,
-    "TDM8 x %d BCLK slots = %d x fS" % (slotw, div))
+# Table 10: slots x BCLKs-per-slot IS the frame, and the frame is what
+# tdm8_master counts out. Previously this read slotw = div // 8, which made it
+# div == 8 * (div // 8) - true for any div, and blind to the slot COUNT. It now
+# derives both numbers from the ADC registers, so a TDM16 config against a
+# TDM8-length frame fails here instead of on the bench.
+chk("Table 10 BCLK ratio", nslots * slotw, div,
+    "TDM%d x %d BCLK slots = %d BCLK frame = %d x fS" % (nslots, slotw, div, div))
+chk("data fits its slot", dataw <= slotw, True,
+    "%d-bit data in a %d-BCLK slot" % (dataw, slotw))
+chk("host channel count", pyconst(mon, "CHANNELS"), nslots,
+    "TDM%d fills %d slots, udp_monitor decodes %d channels"
+    % (nslots, nslots, pyconst(mon, "CHANNELS")))
 
 # The FPGA's LRCLK shape and the ADC's LR_MODE must agree. Nothing checked this
 # before, and they drifted apart: tdm8_master sent 50% duty while tdm16_merge
@@ -233,16 +278,38 @@ chk("cfg_ok_i not gated on a literal", _lit is None, True,
     "adau_sequencer must compare against VFY_LIST, found x\"%s\""
     % (_lit.group(1) if _lit else "-"))
 
-# The edge tdm8_master launches LRCLK on must be the OPPOSITE of the ADAU1978's
-# active edge, or LRCLK changes at the instant the part samples it and setup time
-# is zero. 0x04 bit 6 BCLKEDGE: 0 = the part acts on the falling edge, so the
-# FPGA must launch on rising; 1 = acts on rising, so launch on falling.
+# tdm8_master must launch LRCLK on the FALLING edge of BCLK. Fixed, not derived
+# from BCLKEDGE.
+#
+# This check used to key off 0x04 bit 6 BCLKEDGE, on the reading that BCLKEDGE
+# selects "the edge the serial port acts on" for everything. It does not, and
+# Table 5 on page 5 of the ADAU1978 datasheet settles it - the ADC SERIAL PORT
+# block gives three separate parameters with two different reference edges:
+#
+#   tALS   10 ns min   "LRCLK setup to BCLK rising, slave mode"
+#   tALH    5 ns min   "LRCLK hold from BCLK rising, slave mode"
+#   tABDD  18 ns max   "SDATAOUTx delay from BCLK falling"
+#
+# LRCLK is sampled on the RISING edge whatever BCLKEDGE is; BCLKEDGE moves the
+# OUTPUT launch edge, which is the one tABDD measures. So the FPGA must launch
+# LRCLK on the falling edge, unconditionally, to sit half a period away from the
+# sampling edge.
+#
+# Launching on the rising edge is what this check used to demand, and it put the
+# LRCLK transition on the very edge that samples it. Quartus scored the residual
+# at -3.853 ns of hold against tALH on 2026-08-16, i.e. LRCLK left its pad only
+# 1.257 ns after BCLK left its. Which parts then framed correctly was decided by
+# U1-versus-U2 buffer delay and trace length - per part, drifting with
+# temperature. Moving to the falling edge took that to +16.5 ns.
+#
+# If BCLKEDGE is ever set to 1, this stays FALLING. Re-read Table 5 before
+# changing it, and do not re-derive it from BCLKEDGE.
 bclkedge = (written.get(0x04, 0) >> 6) & 1
 launch_rising = bool(re.search(r'elsif\s+rising_edge\(clk_in\)', tm))
-chk("LRCLK launch edge opposes BCLKEDGE", launch_rising, bclkedge == 0,
-    "0x04 bit 6 BCLKEDGE=%d (part acts on %s), tdm8_master launches on %s"
-    % (bclkedge, "falling" if bclkedge == 0 else "rising",
-       "rising" if launch_rising else "falling"))
+chk("LRCLK launches on BCLK falling edge", launch_rising, False,
+    "Table 5: LRCLK is sampled on BCLK RISING (tALS/tALH) regardless of "
+    "BCLKEDGE=%d, so tdm8_master must launch on falling; it launches on %s"
+    % (bclkedge, "rising" if launch_rising else "falling"))
 
 # Whatever the shape, both consumers must edge-detect it rather than test the
 # level - a level test is only correct for the one-BCLK pulse.
@@ -250,6 +317,57 @@ for name, src in (("tdm8_rx", trx), ("tdm16_merge", rd("tdm16_merge.vhd"))):
     chk("%s edge-detects sync" % name,
         bool(re.search(r"=\s*'1'\s+and\s+\w+\s*=\s*'0'", src)), True,
         "must not level-test LRCLK")
+
+# ------------------------------------------------- 8. IP/UDP header fields ---
+# udp_tx_core hardcodes the IPv4 header checksum as a constant, but the header it
+# covers contains fpga_ip and pc_ip, which are declared in top_system. Change an
+# IP address and the checksum silently becomes wrong - the FPGA keeps sending and
+# the PC's stack drops every frame, which looks exactly like a dead link. Same
+# class of cross-file coupling as cfg_ok_i vs VFY_LIST, so guard it the same way.
+fpga_ip = int(re.search(r'C_FPGA_IP\s*:\s*std_logic_vector\(31 downto 0\)\s*:=\s*x"([0-9A-Fa-f]{8})"', top).group(1), 16)
+pc_ip   = int(re.search(r'C_PC_IP\s*:\s*std_logic_vector\(31 downto 0\)\s*:=\s*x"([0-9A-Fa-f]{8})"', top).group(1), 16)
+ck_rtl  = int(re.search(r'IP_CHECKSUM\s*:\s*std_logic_vector\(15 downto 0\)\s*:=\s*x"([0-9A-Fa-f]{4})"', utx).group(1), 16)
+
+
+def _byte(src, n):
+    """the literal udp_tx_core emits for byte_cnt = n, as an int"""
+    m = re.search(r'when %d\s*=>\s*next_byte <= x"([0-9A-Fa-f]{2})"' % n, src)
+    return int(m.group(1), 16) if m else None
+
+
+ip_total  = (_byte(utx, 16) << 8) | _byte(utx, 17)
+udp_total = (_byte(utx, 38) << 8) | _byte(utx, 39)
+_words = [(_byte(utx, 14) << 8) | _byte(utx, 15), ip_total,
+          (_byte(utx, 18) << 8) | _byte(utx, 19),
+          (_byte(utx, 20) << 8) | _byte(utx, 21),
+          (_byte(utx, 22) << 8) | _byte(utx, 23), 0x0000,
+          fpga_ip >> 16, fpga_ip & 0xFFFF, pc_ip >> 16, pc_ip & 0xFFFF]
+_s = sum(_words)
+while _s >> 16:
+    _s = (_s & 0xFFFF) + (_s >> 16)
+chk("IPv4 header checksum", ck_rtl, (~_s) & 0xFFFF,
+    "udp_tx_core IP_CHECKSUM vs %d.%d.%d.%d -> %d.%d.%d.%d in top_system"
+    % (fpga_ip >> 24, (fpga_ip >> 16) & 0xFF, (fpga_ip >> 8) & 0xFF, fpga_ip & 0xFF,
+       pc_ip >> 24, (pc_ip >> 16) & 0xFF, (pc_ip >> 8) & 0xFF, pc_ip & 0xFF))
+chk("IPv4 total length", ip_total, 20 + 8 + pyconst(mon, "PAYLOAD_LEN"),
+    "20 IP + 8 UDP + payload")
+chk("UDP length", udp_total, 8 + pyconst(mon, "PAYLOAD_LEN"), "8 UDP + payload")
+
+# ------------------------------------------------- 9. frame counter range ----
+# bit_cnt must be able to REACH C_FRAME_BCLKS - 1, or the frame boundary never
+# fires and LRCLK stops toggling with no other symptom. A hardcoded "range 0 to
+# 255" survives 192 and 256 and dies silently at anything longer.
+_bc = re.search(r'signal bit_cnt\s*:\s*integer range 0 to ([^:=]+?)\s*:=', tm)
+_bc_txt = _bc.group(1).strip() if _bc else "?"
+if _bc_txt == "C_FRAME_BCLKS - 1":
+    _top = div - 1
+else:
+    try:
+        _top = int(_bc_txt)
+    except ValueError:
+        _top = -1
+chk("bit_cnt reaches frame end", _top >= div - 1, True,
+    "tdm8_master bit_cnt range 0 to %s, needs to reach %d" % (_bc_txt, div - 1))
 
 # --------------------------------------------------------------- report ------
 w = max(len(n) for n, *_ in OK + [(f[0],) for f in FAIL])

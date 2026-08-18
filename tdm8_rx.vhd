@@ -31,7 +31,31 @@ architecture rtl of tdm8_rx is
     --
     -- Confirm on hardware by injecting a known tone: it must appear at full
     -- amplitude on exactly one channel.
-    constant C_BIT_ADJ : integer := 0;
+    --
+    -- 2026-08-16: 0 -> -1, as the companion to tdm8_master moving the LRCLK
+    -- launch to the falling edge of BCLK. This is a PREDICTION, so it is stated
+    -- as one.
+    --
+    -- The reasoning: C_BIT_ADJ = 0 corresponds to sim_chain launch offset 0,
+    -- which is the ADC framing on the same BCLK rising edge N that the FPGA
+    -- launched LRCLK on. That is only reachable by latching a signal which
+    -- arrived 0.6-1.3 ns AFTER that edge, i.e. by winning the tALH violation
+    -- described in tdm8_master - which is exactly why only some parts managed it.
+    -- With LRCLK now arriving 21 ns after edge N, every part deterministically
+    -- frames on edge N+1 instead: launch offset +1, and sim_chain's matrix maps
+    -- launch +1 -> C_BIT_ADJ = -1.
+    --
+    -- IF THE CHANNELS READ AS NOISE OR "misaligned?" AFTER THIS BUILD, THIS
+    -- CONSTANT IS THE ONE KNOB - put it back to 0 and rebuild. That outcome
+    -- would mean the working parts had been framing on edge N+1 all along, and
+    -- it does not invalidate the tdm8_master change.
+    --
+    -- Do not read a misalignment as the LRCLK fix having failed. The two are
+    -- independent measurements: dropouts (exact-zero percentage per channel, in
+    -- udp_monitor and timeline) test the LRCLK timing; bit alignment tests this
+    -- constant. The success criterion for the LRCLK change is all four parts at
+    -- or near 0 % zeros, whatever the audio sounds like.
+    constant C_BIT_ADJ : integer := -1;
 
     -- RAW CAPTURE MODE. Instead of extracting 24 bits from each 32-BCLK slot,
     -- publish the first 192 BCLKs of the frame verbatim - slots 1 to 6, which

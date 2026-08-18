@@ -85,6 +85,20 @@ architecture rtl of top_system is
         );
     end component;
 
+    -- Single-line TDM16 receiver. Instantiated in place of the two tdm8_rx
+    -- instances; tdm8_rx stays declared and in the project so reverting to the
+    -- two-line TDM8 build is one instantiation swap away.
+    component tdm16_rx is
+        port (
+            rst         : in  std_logic;
+            bclk_in     : in  std_logic;
+            lrclk_in    : in  std_logic;
+            sdata_in    : in  std_logic;
+            ch_data_A   : out std_logic_vector(191 downto 0);
+            ch_data_B   : out std_logic_vector(191 downto 0)
+        );
+    end component;
+
     component tdm16_merge is
         port (
             clk         : in  std_logic;
@@ -401,6 +415,16 @@ architecture rtl of top_system is
     -- all", independent of whether our framing happens to line up. Exact zeros
     -- in the channel table could be a silent bus OR a mis-snapshot; this tells
     -- the two apart.
+    -- SDATA registered on the FALLING edge of clk_18m, for the activity
+    -- counters below. They used to compare the raw pin on the rising edge, which
+    -- is a half-period path against tABDD = 18 ns plus the clock-forwarding and
+    -- buffer delay - it cannot be met, and once the SDC referenced the input
+    -- delay to bclk_pin rather than to the internal PLL node the analyser said so
+    -- (-7.275 ns, and -122 ns of TNS swamping the whole clk[2] domain summary).
+    -- tdm8_rx already registers SDATA on the falling edge for exactly this
+    -- reason; these two do the same so the diagnostic is sampled the same way the
+    -- audio is. See the note on sdata_f in tdm8_rx.vhd.
+    signal sd_a_f, sd_b_f   : std_logic := '0';
     signal sd_a_d, sd_b_d   : std_logic := '0';
     signal act_a, act_b     : unsigned(7 downto 0) := (others => '0');
     signal act_a_l, act_b_l : unsigned(7 downto 0) := (others => '0');
@@ -412,6 +436,15 @@ architecture rtl of top_system is
     --              i.e. how often all four ADCs were reset at runtime
     -- The timeline showed U19 and U20 going dead in exactly the same windows,
     -- which is a shared cause, and both of these are gated on pll_locked.
+    -- Two-stage synchroniser for pll_locked before the edge detector below.
+    -- The ALTPLL lock output is asynchronous to clk_50m_board, so the detector
+    -- used to compare a registered copy against the RAW pin: one metastable
+    -- sample, or a glitch on an unsynchronised input, could latch pll_ever_lost
+    -- and declare the audio PLL unstable when it was not. That flag is exactly
+    -- what a day of framing debug rested on, so it must not be able to lie.
+    -- Edge detection now happens entirely between two synchronised stages.
+    signal pll_lock_s1 : std_logic := '0';
+    signal pll_lock_s2 : std_logic := '0';
     signal pll_lock_d : std_logic := '0';
     signal pll_drop   : unsigned(7 downto 0) := (others => '0');
     -- Sticky "the audio PLL has lost lock at least once since power-up",
@@ -635,14 +668,42 @@ begin
     m_sda_i <= i2c_scl when C_I2C_SWAP else i2c_sda;
 
     -- Count SDATA transitions over a 65536-cycle window in the audio clock
-    -- domain: 3.5 ms at 18.432 MHz, 5.3 ms at 12.288 MHz. The absolute
-    -- duration does not matter - the counter saturates at 255 either way
-    -- and it is only used as a live/static indicator.
+    -- domain: 2.7 ms at 24.576 MHz, 3.5 ms at 18.432 MHz, 5.3 ms at 12.288 MHz.
+    -- The absolute duration does not matter - the counter saturates at 255
+    -- either way and it is only used as a live/static indicator.
+    --
+    -- How to read it. A healthy line saturates almost immediately: one window
+    -- holds ~250 audio frames of 256 bits each, so tens of thousands of edges.
+    -- So 255 means "driven", and anything near 0 means "nobody is driving".
+    -- There is no useful information in between.
+    --
+    -- LIMITATION, and it matters: both parts on a line share it. act_b counts
+    -- U37 and U38 together, so it cannot say WHICH of the two went quiet - only
+    -- that at least one is still driving. That is still the measurement that
+    -- splits the fault in half:
+    --   ch 9-12 read exact zero while act_b = 255
+    --      -> the line is alive, so the clocks, PD/RST and the +3V3 that
+    --         BOTH parts share are all fine, and the fault is U37 alone or
+    --         our decode of its slots. Nothing shared, nothing in the cable.
+    --   ch 9-12 read exact zero while act_b falls to 0
+    --      -> both parts stopped together, so it IS something shared:
+    --         clock delivery, PD/RST, or supply. Then the cable is back in
+    --         scope and scoping J20/J21 is worth the time.
+    -- Sample the counter in the same capture as the audio, not separately - and
+    -- on the same EDGE as the audio too. See sd_a_f/sd_b_f above.
+    process(clk_18m)
+    begin
+        if falling_edge(clk_18m) then
+            sd_a_f <= sdata_in_A;
+            sd_b_f <= sdata_in_B;
+        end if;
+    end process;
+
     process(clk_18m)
     begin
         if rising_edge(clk_18m) then
-            sd_a_d <= sdata_in_A;
-            sd_b_d <= sdata_in_B;
+            sd_a_d <= sd_a_f;
+            sd_b_d <= sd_b_f;
             if act_win = 65535 then
                 act_win <= (others => '0');
                 act_a_l <= act_a;      -- publish
@@ -651,10 +712,10 @@ begin
                 act_b   <= (others => '0');
             else
                 act_win <= act_win + 1;
-                if sdata_in_A /= sd_a_d and act_a /= 255 then
+                if sd_a_f /= sd_a_d and act_a /= 255 then
                     act_a <= act_a + 1;
                 end if;
-                if sdata_in_B /= sd_b_d and act_b /= 255 then
+                if sd_b_f /= sd_b_d and act_b /= 255 then
                     act_b <= act_b + 1;
                 end if;
             end if;
@@ -669,9 +730,17 @@ begin
 
     -- Everything we know about the I2C bus and the ADC, packed into one byte
     -- and shipped in every packet so it can be read without touching an LED.
+    --
+    -- WARNING: bits 6 and 5 below are DEAD. The synchroniser that publishes this
+    -- byte (see dbgs_meta, further down) forwards only bit 7 and bits 4:0, and
+    -- substitutes rst_ever into bit 6 and pll_ever_lost into bit 5. Quartus
+    -- reports both source terms as unread. What i2c_scan.py decodes for those two
+    -- positions is "ADC hardware reset" and "audio PLL lock", NOT the two signals
+    -- named here. Kept assigned rather than deleted so the intent stays visible,
+    -- but do not add a reader of bit 6 or 5 of this signal expecting these.
     dbg_status_int <= '1'                 -- bit 7: marker, proves this is populated
-                    & adc_cfg_ok_int      -- bit 6: 0x05 read back as written
-                    & adc_pll_lock_int    -- bit 5: ADC PLL locked
+                    & adc_cfg_ok_int      -- bit 6: DEAD, replaced by rst_ever
+                    & adc_pll_lock_int    -- bit 5: DEAD, replaced by pll_ever_lost
                     & boot_done_int       -- bit 4: boot + verify sequence finished
                     & i2c_sda_stuck       -- bit 3
                     & i2c_scl_stuck       -- bit 2
@@ -751,8 +820,11 @@ begin
     process(clk_50m_board)
     begin
         if rising_edge(clk_50m_board) then
-            pll_lock_d <= pll_locked;
-            if pll_lock_d = '1' and pll_locked = '0' and pll_drop /= 255 then
+            -- 2-FF synchronise, THEN edge detect between synchronised stages.
+            pll_lock_s1 <= pll_locked;
+            pll_lock_s2 <= pll_lock_s1;
+            pll_lock_d  <= pll_lock_s2;
+            if pll_lock_d = '1' and pll_lock_s2 = '0' and pll_drop /= 255 then
                 pll_drop <= pll_drop + 1;
                 -- Sticky, and unlike pll_drop this one is actually published.
                 -- pll_drop counted lock losses and was read by nothing, so the
@@ -913,25 +985,45 @@ begin
         lrclk_out  => lrclk_int
     );
 
-    u_rx_A : tdm8_rx port map (
+    -- TDM16: ONE receiver on ONE line, replacing the two tdm8_rx instances.
+    --
+    -- All four parts are jumpered onto a single SDATA net (R21 pin 1 to R122
+    -- pin 1) and hold four slots each out of sixteen. Sixteen 16-BCLK slots is
+    -- still 256 BCLKs per frame, so BCLK, LRCLK and tdm8_master are unchanged.
+    --
+    -- Both FPGA SDATA pins now see the same wire, so which one is read is
+    -- arbitrary; sdata_in_A is used and sdata_in_B is left connected but
+    -- unread. Keeping the port avoids a QSF pin change, and if the jumper is
+    -- ever removed the pin is already there.
+    --
+    -- tdm16_rx splits its output into the same two 192-bit halves the old pair
+    -- produced, so tdm16_merge, packet_formatter, the UDP layout and every host
+    -- script are untouched.
+    sdata_b_sel <= sdata_in_A when C_TDM2_FROM_TDM1 else sdata_in_B;
+
+    u_rx : tdm16_rx port map (
         rst         => sys_rst,
         bclk_in     => clk_18m,
         lrclk_in    => lrclk_int,
         sdata_in    => sdata_in_A,
-        ch_data_out => ch_data_A_int
+        ch_data_A   => ch_data_A_int,
+        ch_data_B   => ch_data_B_int
     );
 
-    -- DIAGNOSTIC: while C_TDM2_FROM_TDM1 is true this feeds the TDM2 receiver
-    -- from the TDM1 pin. See the constant's declaration for what it proves.
-    sdata_b_sel <= sdata_in_A when C_TDM2_FROM_TDM1 else sdata_in_B;
-
-    u_rx_B : tdm8_rx port map (
-        rst         => sys_rst,
-        bclk_in     => clk_18m,
-        lrclk_in    => lrclk_int,
-        sdata_in    => sdata_b_sel,
-        ch_data_out => ch_data_B_int
-    );
+    -- ================= REVERTING THIS FILE TO TDM8 =================
+    -- Delete the u_rx instance above, uncomment the two below, and remove the
+    -- board jumper. tdm8_rx.vhd and its component declaration are still in the
+    -- project untouched, so nothing else needs restoring here. adau_sequencer.vhd
+    -- has its own revert note covering the four register values that go with it.
+    --
+    -- u_rx_A : tdm8_rx port map (
+    --     rst => sys_rst, bclk_in => clk_18m, lrclk_in => lrclk_int,
+    --     sdata_in => sdata_in_A, ch_data_out => ch_data_A_int);
+    --
+    -- u_rx_B : tdm8_rx port map (
+    --     rst => sys_rst, bclk_in => clk_18m, lrclk_in => lrclk_int,
+    --     sdata_in => sdata_b_sel, ch_data_out => ch_data_B_int);
+    -- ===============================================================
 
     u_merge : tdm16_merge port map (
         clk         => clk_18m,
@@ -948,8 +1040,26 @@ begin
         rst          => sys_rst,
         tdm16_valid  => tdm16_val_int,
         tdm16_data   => tdm16_out_int,
-        dbg_byte0    => dbg0_sync,
-        dbg_byte1    => dbg1_sync,
+        -- Raw SDATA edge counters, NOT the ADC register readbacks any more.
+        --
+        -- act_a_l/act_b_l were computed every 2.7 ms and then read by nothing:
+        -- when the debug bytes were reshuffled to carry cfg_bad/clip and
+        -- ot_ever/pll_lost, these lost their slot and became dead code that
+        -- Quartus stripped. That removed the only measurement in the design
+        -- that can tell "the ADC stopped driving the line" apart from "the ADC
+        -- is driving and our decode is wrong" - which is precisely the question
+        -- every dropout investigation has had to guess at since.
+        --
+        -- The readbacks they displace (ADAU 0x01 and 0x05 from C_VERIFY_IDX)
+        -- are static after boot, cover ONE part, and their live per-part
+        -- equivalents are already in dbg_status6/7 as cfg_bad and pll_lost.
+        -- i2c_scan.py can read the raw registers from any part at any time.
+        -- A live liveness bit on both SDATA lines is worth more than that.
+        --
+        -- Already in the clk_18m domain, same as packet_formatter, so unlike
+        -- dbg0_sync/dbg1_sync these need no synchroniser.
+        dbg_byte0    => std_logic_vector(act_a_l),
+        dbg_byte1    => std_logic_vector(act_b_l),
         dbg_status   => dbgs_sync,
         dbg_status2  => dbgt_sync,
         dbg_status3  => dbgu_sync,

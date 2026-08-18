@@ -128,18 +128,73 @@ def loss_report(seqs):
 
 
 # ------------------------------------------------------------------ stats ----
+def _valid_mask(x, min_run=64):
+    """True for samples that are real data, False inside a dropout.
+
+    A dropout is a run of >= min_run EXACT zeros. The ADAU1978 tri-states
+    SDATAOUT outside its own slots and the 10k pull-down makes that read as
+    0x000000, so a long exact-zero run means "this part was not driving" - it is
+    absence, not a measurement of silence. A real converter dithers, so a run
+    that long cannot be signal.
+
+    Single and short zero runs stay VALID: a legitimate waveform crosses zero,
+    and excluding those would bias the level upward.
+    """
+    n = len(x)
+    m = [True] * n
+    run0 = 0
+    for i, v in enumerate(x):
+        if v == 0:
+            run0 += 1
+        else:
+            if run0 >= min_run:
+                for k in range(i - run0, i):
+                    m[k] = False
+            run0 = 0
+    if run0 >= min_run:
+        for k in range(n - run0, n):
+            m[k] = False
+    return m
+
+
 def chan_stats(x):
     n = len(x)
     if n == 0:
         return None
-    mn, mx = min(x), max(x)
-    mean = sum(x) / n
-    var = sum((v - mean) ** 2 for v in x) / n
-    rms = math.sqrt(var)                       # AC-coupled RMS
+    # Amplitude statistics are computed over VALID samples only - see _valid_mask.
+    #
+    # Every level on this page used to be computed across the dropout zeros as if
+    # they were signal, which corrupted three things at once on any flickering
+    # channel:
+    #   RMS  a channel 75% absent had 75% of its variance terms as (0 - mean)^2,
+    #        so the reported level was about 6 dB LOW. U19's channels were the
+    #        ones being judged, and they are exactly the ones affected.
+    #   DC   the mean was pulled toward zero in proportion to the gap fraction.
+    #   min/max/asym  on a channel whose real signal sits below zero, the
+    #        dropout zeros BECAME the maximum. That is where "max = 0, asym =
+    #        0.00, skewed - check analog" came from on ch7/11/12/15/16 - an
+    #        artefact of the dropouts being read as analog non-linearity.
+    #
+    # zero_frac below still reports how much of the capture was absent, so the
+    # honest reading is now "level X while present, present Y% of the time"
+    # instead of one number conflating the two.
+    valid = _valid_mask(x)
+    xv = [v for v, ok in zip(x, valid) if ok]
+    nv = len(xv)
+    if nv == 0:                                # nothing but dropout
+        xv, nv = x, n
+    mn, mx = min(xv), max(xv)
+    mean = sum(xv) / nv
+    var = sum((v - mean) ** 2 for v in xv) / nv
+    rms = math.sqrt(var)                       # AC-coupled RMS, valid samples
     peak = max(abs(mn), abs(mx))
-    # first-difference energy: low ratio => sample-to-sample correlation (real audio)
-    if n > 1:
-        d = sum(abs(x[i] - x[i - 1]) for i in range(1, n)) / (n - 1)
+    # first-difference energy: low ratio => sample-to-sample correlation (real
+    # audio). Over valid samples only - a step from signal down to an exact zero
+    # and back is a full-scale first difference that has nothing to do with the
+    # waveform, so gap edges used to inflate this on exactly the channels whose
+    # correlation was in question.
+    if nv > 1:
+        d = sum(abs(xv[i] - xv[i - 1]) for i in range(1, nv)) / (nv - 1)
     else:
         d = 0.0
     # distinct over the WHOLE capture, not x[:4000]. With 4000 samples that is
@@ -147,7 +202,7 @@ def chan_stats(x):
     # first 83 ms was labelled "STUCK at <value>" while its own min/max/RMS
     # showed it varying. It made healthy channels flip between "active" and
     # "STUCK" from run to run depending only on where the capture started.
-    distinct = len(set(x))
+    distinct = len(set(xv))
     # Longest run of identical consecutive samples, and what it held. A real
     # converter dithers, so any long run means the part stopped producing new
     # samples - which is a different fault from tri-stating, where the pull-down
@@ -172,6 +227,14 @@ def chan_stats(x):
     if run >= 64:
         holds += 1
     zero_frac = 100.0 * sum(1 for v in x if v == 0) / n
+    # Peak pile-up: how many samples sit within 1% of the extreme reached. An
+    # impulse touches its peak once or twice; a signal being CLIPPED piles up
+    # hundreds of samples against the same ceiling. This is what distinguishes
+    # "sharp transient" from "distorting", which RMS and peak alone cannot.
+    lim = max(abs(mn), abs(mx))
+    pile = sum(1 for v in xv if abs(v) >= 0.99 * lim) if lim > 0 else 0
+    # and how symmetric the excursion is: an analog non-linearity skews it
+    asym = (abs(mx) / abs(mn)) if mn != 0 else 0.0
     # Lengths of every zero run >= 64 samples. A marginal contact should miss a
     # sync edge and recover on the next frame - 10.4 us at 96 kHz - so gaps ought
     # to be short and exponentially distributed. Measured gaps are ~167 ms, which
@@ -195,22 +258,33 @@ def chan_stats(x):
     # the window PEAK by tens of dB - exactly what makes a channel read "steady"
     # in timeline.py while a level meter flickers. Counted here so bit errors can
     # be told apart from a genuinely varying signal.
+    # Tested only where the sample and BOTH neighbours are valid. A dropout edge
+    # is a full-scale step, so it trips this test twice per gap and used to be
+    # counted as a bit error - inflating the glitch rate on precisely the
+    # channels that were dropping out, which is what made glitch counts look
+    # like they "tracked the dropout rate". They partly WERE the dropout rate.
     glitch = 0
     if n > 2 and rms > 0:
         thr = 8.0 * rms
         i = 1
         while i < n - 1:
+            if not (valid[i - 1] and valid[i] and valid[i + 1]):
+                i += 1
+                continue
             if abs(2 * x[i] - x[i - 1] - x[i + 1]) > thr:
                 glitch += 1
                 i += 3      # one spike trips three adjacent tests; count it once
             else:
                 i += 1
-    glitch_rate = glitch / (n / float(SAMPLE_RATE)) if n else 0.0
+    # per second of VALID audio, not of wall clock - a channel absent 75% of the
+    # time only had a quarter of the capture in which to produce a glitch.
+    glitch_rate = glitch / (nv / float(SAMPLE_RATE)) if nv else 0.0
     return {"min": mn, "max": mx, "mean": mean, "rms": rms, "peak": peak,
             "diff": d, "distinct": distinct, "n": n,
             "hold_len": hold_len, "hold_val": hold_val, "hold_at": hold_at,
             "holds": holds, "zero_frac": zero_frac,
-            "glitch": glitch, "glitch_rate": glitch_rate, "gaps": gaps}
+            "glitch": glitch, "glitch_rate": glitch_rate, "gaps": gaps,
+            "pile": pile, "asym": asym}
 
 
 def classify(st):
@@ -426,6 +500,41 @@ def main():
             print("    GROUND PLANE\" - so a degraded pad joint after repeated reflow")
             print("    gives exactly this: intermittent dropouts that worsen with time.")
 
+    # ---------------- SDATA line liveness ----------------
+    # Header bytes 8 and 9 are the raw SDATA edge counts for line A and line B
+    # over the FPGA's 2.7 ms window, saturating at 255. This is the measurement
+    # that splits the fault in half without a scope, so read it over the WHOLE
+    # capture rather than one packet - a line that dies for 167 ms shows up as a
+    # handful of low samples among thousands of 255s, and pkts[0] alone would
+    # miss it completely.
+    good = [p for p in pkts if len(p) == PAYLOAD_LEN]
+    if good:
+        SILENT = 16          # anything this low means nobody drove the line
+        print("\n" + "=" * 62)
+        print("SDATA LINE LIVENESS   (raw edge count per 2.7 ms, saturates at 255)")
+        print("=" * 62)
+        for byte_i, line, owners in ((8, "A (ch 1-8) ", "U19+U20"),
+                                     (9, "B (ch 9-16)", "U37+U38")):
+            e = [p[byte_i] for p in good]
+            dead = sum(1 for v in e if v < SILENT)
+            print("  line %s %s   min %3d  max %3d  silent in %d of %d pkts (%.2f%%)"
+                  % (line, owners, min(e), max(e),
+                     dead, len(e), 100.0 * dead / len(e)))
+        print()
+        print("  Both parts on a line share it, so this cannot say WHICH part went")
+        print("  quiet - only whether ANYONE was still driving. That is still the")
+        print("  measurement that halves the search:")
+        print()
+        print("    channels exactly zero WHILE the line stays at 255")
+        print("      -> the line is alive, so the clocks, PD/RST and +3V3 that BOTH")
+        print("         parts share are all fine. The fault is the one part, or our")
+        print("         decode of its slots. Nothing shared. Nothing in the cable.")
+        print()
+        print("    channels exactly zero AND the line falls to ~0")
+        print("      -> both parts stopped together, so it IS something shared:")
+        print("         clock delivery, PD/RST or supply. Only then is scoping the")
+        print("         cable at J20/J21 worth the time.")
+
     print("\n" + "=" * 62)
     print("CHANNELS   (24-bit signed, full scale = %d)" % FULL_SCALE)
     print("=" * 62)
@@ -448,6 +557,27 @@ def main():
     # different builds and clock rates. Tightly clustered lengths point at
     # something systematic with its own time constant; a broad spread points at
     # a mechanical contact. This is the measurement that separates them.
+    live = [c for c in range(CHANNELS)
+            if sts[c] and sts[c]["rms"] > 8 * 30 and sts[c]["peak"] > 20000]
+    if live:
+        print()
+        print("=" * 62)
+        print("SIGNAL SHAPE   (channels carrying real level)")
+        print("=" * 62)
+        print("  pile-up = samples within 1% of the peak. a handful means a clean")
+        print("  transient; hundreds means the signal is being clipped.")
+        print("  asym = |max|/|min|; far from 1.0 suggests analog non-linearity.")
+        print()
+        print("  ch   peak dBFS   pile-up   asym    verdict")
+        print("  " + "-" * 52)
+        for c in live:
+            st = sts[c]
+            v = ("CLIPPING" if st["pile"] > 50 else
+                 "skewed - check analog" if st["asym"] > 2.0 or st["asym"] < 0.5
+                 else "clean transient")
+            print("  %2d   %s      %5d   %5.2f   %s"
+                  % (c + 1, fmt_db(st["peak"]), st["pile"], st["asym"], v))
+
     gappy = [c for c in range(CHANNELS) if sts[c] and sts[c]["gaps"]]
     if gappy:
         print("\n" + "=" * 62)

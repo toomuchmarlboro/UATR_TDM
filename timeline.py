@@ -103,7 +103,21 @@ def rms_db(blocks):
     x = np.concatenate(blocks, axis=0).astype(np.float64)
     zero = np.all(x == 0, axis=0)
     zfrac = np.mean(x == 0, axis=0)
-    r = np.sqrt(np.mean(x * x, axis=0))
+    # RMS over samples the part was actually DRIVING. Averaging x*x across the
+    # dropout zeros mixes "absent" into "quiet": a channel present only 25% of
+    # the window read about 6 dB below its true level, so the dB figure fell as
+    # the dropouts got worse and looked like a level change. Level and
+    # availability are separate measurements and the zfrac column already carries
+    # availability - so exclude the zeros here rather than blending the two.
+    #
+    # Exact zeros only, which is what tri-stating produces. A dithering converter
+    # does not sit at exactly 0, so this cannot swallow real quiet signal; the
+    # handful of genuine zero crossings it does drop are immaterial over a
+    # window of tens of thousands of samples.
+    live = (x != 0)
+    cnt = np.sum(live, axis=0)
+    ssq = np.sum(np.where(live, x * x, 0.0), axis=0)
+    r = np.sqrt(np.divide(ssq, cnt, out=np.zeros_like(ssq), where=cnt > 0))
     db = np.where(r > 0, 20.0 * np.log10(np.maximum(r, 1e-12) / um.FULL_SCALE), -999.0)
     return db, zero, zfrac
 

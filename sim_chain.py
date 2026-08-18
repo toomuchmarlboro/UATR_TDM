@@ -47,17 +47,20 @@ class Master:
     The wrap value is FRAME-1, taken from the RTL. It was hardcoded 255 here,
     which silently kept modelling a 256-BCLK frame after the design moved to 192.
     """
-    def __init__(self, pulse_bclks):
+    def __init__(self, pulse_bclks, lr_pulse=True):
         self.bit_cnt = 0
         self.lrclk = 0
-        self.pulse = pulse_bclks
+        # high time: C_LR_PULSE_BCLKS in pulse mode, FRAME/2 at 50% duty. Reading
+        # C_LR_PULSE matters - the model used to assume pulse mode unconditionally
+        # and so described the wrong LRCLK shape the moment 50% duty was selected.
+        self.high = pulse_bclks if lr_pulse else FRAME // 2
 
     def rising(self):
         bc, lr = self.bit_cnt, self.lrclk       # read pre-edge
         self.bit_cnt = 0 if bc == FRAME - 1 else bc + 1
         if bc == FRAME - 1:
             self.lrclk = 1
-        elif bc == self.pulse - 1:
+        elif bc == self.high - 1:
             self.lrclk = 0
         else:
             self.lrclk = lr
@@ -139,9 +142,9 @@ class Rx:
         self.sreg = ((self.sreg << 1) | self.sdata_f) & ((1 << SREG) - 1)
 
 
-def run(launch, adj, pulse_bclks, frames=10):
+def run(launch, adj, pulse_bclks, frames=10, lr_pulse=True):
     pay_a = [0xA10000 + s * 0x1111 for s in range(8)]
-    m   = Master(pulse_bclks)
+    m   = Master(pulse_bclks, lr_pulse)
     adc = Adc(pay_a, launch)
     rx  = Rx(adj)
     caps = []
@@ -160,14 +163,19 @@ def run(launch, adj, pulse_bclks, frames=10):
 
 def main():
     pulse = rtl_const("tdm8_master.vhd", "C_LR_PULSE_BCLKS") or 1
+    _lp = re.search(r'C_LR_PULSE\s*:\s*boolean\s*:=\s*(true|false)',
+                    open("tdm8_master.vhd", encoding="utf-8").read())
+    lr_pulse = (_lp.group(1) == "true") if _lp else True
     adj_rtl = rtl_const("tdm8_rx.vhd", "C_BIT_ADJ")
-    print("from the RTL: frame = %d BCLKs, %d BCLKs/slot, "
-          "C_LR_PULSE_BCLKS = %d, C_BIT_ADJ = %+d"
-          % (FRAME, SLOTW, pulse, adj_rtl))
+    print("from the RTL: frame = %d BCLKs, %d BCLKs/slot, LRCLK %s, "
+          "C_BIT_ADJ = %+d"
+          % (FRAME, SLOTW,
+             ("%d-BCLK pulse" % pulse) if lr_pulse else "50%% duty",
+             adj_rtl))
     print()
 
     # 1. LRCLK shape
-    m = Master(pulse)
+    m = Master(pulse, lr_pulse)
     edges, hi = [], 0
     prev = 0
     for i in range(3 * FRAME):
@@ -181,7 +189,9 @@ def main():
     hi_per_frame = hi / max(1, len(edges))
     print("LRCLK: period %d BCLKs, high %.0f BCLKs per frame  -> %s"
           % (period, hi_per_frame,
-             "OK" if period == FRAME and hi_per_frame == pulse else "WRONG"))
+             "OK" if period == FRAME and
+                hi_per_frame == (pulse if lr_pulse else FRAME // 2)
+                else "WRONG"))
     if SLOTW == DATAW:
         print("      %d-BCLK slots hold %d-bit data exactly, so there are no pad"
               % (SLOTW, DATAW))
@@ -200,7 +210,7 @@ def main():
             if not Rx.adj_legal(adj):
                 row.append(" xx ")          # illegal slice range in the VHDL
                 continue
-            pay, caps = run(launch, adj, pulse)
+            pay, caps = run(launch, adj, pulse, lr_pulse=lr_pulse)
             ok = len(caps) >= 3 and caps[-1] == pay
             row.append(" OK " if ok else "  . ")
             if ok:
@@ -219,7 +229,7 @@ def main():
     # 3. what the RTL's own C_BIT_ADJ actually produces
     print("with C_BIT_ADJ = %+d as currently set in tdm8_rx.vhd:" % adj_rtl)
     for launch in range(0, 3):
-        pay, caps = run(launch, adj_rtl, pulse)
+        pay, caps = run(launch, adj_rtl, pulse, lr_pulse=lr_pulse)
         got = caps[-1] if caps else [0] * 8
         print("  launch %+d: ch1 got 0x%06X want 0x%06X   %s"
               % (launch, got[0], pay[0],

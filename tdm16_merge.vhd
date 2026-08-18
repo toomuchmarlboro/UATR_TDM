@@ -22,9 +22,22 @@ architecture rtl of tdm16_merge is
     -- rate into the FIFO. Symptoms were a packet rate several times higher
     -- than fS/8 and channels that appeared and vanished between runs.
     --
-    -- Two stages, so the latch lands one clock AFTER the sync edge: tdm8_rx
-    -- registers its ch_data_out on that same edge, so sampling on the edge
-    -- itself would capture the previous frame. Correct for either LRCLK shape.
+    -- Two stages, matching the lrclk_d/lrclk_d2 chain in tdm8_rx. Correct for
+    -- either LRCLK shape.
+    --
+    -- Note what this does NOT do. tdm8_rx uses an identical two-stage chain off
+    -- the same lrclk and the same clk, so its capture condition and the one
+    -- below are true on exactly the SAME clock edge. tdm8_rx assigns
+    -- ch_data_out on that edge, so the value visible here is still the previous
+    -- frame's - this block is permanently one audio frame behind tdm8_rx.
+    --
+    -- That is harmless and deliberate: A and B are delayed identically, so all
+    -- 16 channels stay mutually aligned and the only cost is 10.4 us of latency
+    -- at 96 kHz. It is recorded because an earlier version of this comment
+    -- claimed the two stages PREVENTED capturing the previous frame, which is
+    -- not true and would mislead anyone retuning the delay. If tdm8_rx's chain
+    -- is ever shortened, this one must shorten with it or the two will land on
+    -- different frames and the A/B halves will skew by one sample.
     signal lrclk_d1 : std_logic := '0';
     signal lrclk_d2 : std_logic := '0';
 begin

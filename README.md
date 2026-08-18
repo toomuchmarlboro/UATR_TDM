@@ -83,6 +83,18 @@ SUBSEA ARRAY                   TOPSIDE FPGA BOARD              TOPSIDE NETWORK
 
 ---
 
+## Multi-AFE Deployment and Host DSP
+
+The system above describes **one** AFE. The deployed array uses **4 AFEs = 64 channels**,
+beamformed on a single host — 182.9 Mbps aggregate, 48,000 pkt/s, 70.8 GB/hr.
+
+Host-side handling of that aggregate (decimate /4 to 24 kHz, then FLAC; ~9 GB/hr and 4×
+less beamforming CPU) is specified in **[HOST_DSP_PIPELINE.md](HOST_DSP_PIPELINE.md)**,
+including why in-FPGA GZIP compression was evaluated and rejected, and the inter-AFE
+sample-alignment problem that is still open.
+
+---
+
 ## Architecture Decisions Log
 
 ### Why 2× TDM8 and not TDM16 or 4× TDM4

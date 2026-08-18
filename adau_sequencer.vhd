@@ -97,8 +97,8 @@ architecture rtl of adau1978_sequencer is
         0 => x"0001",  -- M_POWER        PWUP
         1 => x"0103",  -- PLL_CONTROL    bit7 is PLL_LOCK status, masked below
         2 => x"043F",  -- BLOCK_POWER_SAI
-        3 => x"055B",  -- SAI_CTRL0
-        4 => x"0608",  -- SAI_CTRL1      SLOT_WIDTH=00 32 BCLK, LR_MODE=1
+        3 => x"0563",  -- SAI_CTRL0      SAI=100 TDM16
+        4 => x"0658",  -- SAI_CTRL1      SLOT_WIDTH=10 16 BCLK, 16-bit, LR_MODE=1
         5 => x"09F8"   -- SAI_OVERTEMP   bit0 is OT status, masked below
     );
     signal vfy_mask : std_logic_vector(5 downto 0) := (others => '0');
@@ -229,8 +229,8 @@ architecture rtl of adau1978_sequencer is
         1 => x"0900",   -- SAI_OVERTEMP, bit 0 captured
         2 => x"1900",   -- ASDC_CLIP, bits 3:0 captured
         3 => x"0001",   -- M_POWER      expect 0x01
-        4 => x"055B",   -- SAI_CTRL0    expect as written
-        5 => x"0608");  -- SAI_CTRL1    expect as written
+        4 => x"0563",   -- SAI_CTRL0    expect as written
+        5 => x"0658");  -- SAI_CTRL1    expect as written
     -- Entries 3..5 are compared against BOOT_ROM; 0..2 are read-only status and
     -- their expected byte is ignored. check_sync.py enforces that pairing, added
     -- after this list was left at 0x06 = 0x00 when BOOT_ROM moved to 0x08 - which
@@ -309,7 +309,16 @@ architecture rtl of adau1978_sequencer is
                        -- different VCO operating point is the open suspicion.
                        -- 256 x fS is kept because it works, not because 192 is
                        -- impossible.
-        1  => x"055B", -- 0x05 SAI_CTRL0:    left-just, TDM8, FS=011 64-96 kHz
+        1  => x"0563", -- 0x05 SAI_CTRL0:    left-just, TDM16, FS=011 64-96 kHz
+                       -- TDM16 2026-08-16. Table 20: SAI[5:3] 011 = TDM8,
+                       -- 100 = TDM16. All four parts now share ONE SDATA net
+                       -- (R21 pin 1 jumpered to R122 pin 1) and take four slots
+                       -- each out of sixteen. Table 10: TDM16 at 16 BCLKs per
+                       -- slot is 256 x fS, the SAME 24.576 MHz this board
+                       -- already runs - so the frame stays 256 BCLKs and
+                       -- tdm8_master is untouched. The cost is 16-bit data;
+                       -- 24-bit would need 384 x fS = 36.864 MHz, which the
+                       -- audio domain has no timing margin for.
                        -- SDATA_FMT changed 00 (I2S) -> 01 (left justified).
                        -- I2S delays data one BCLK from the LRCLK edge, but with
                        -- SLOT_WIDTH=24 BCLK and DATA_WIDTH=24-bit the slot is
@@ -320,17 +329,33 @@ architecture rtl of adau1978_sequencer is
                        -- 32-BCLK slots and the delay does fit.
                        --                    -> MCS=010 now means 192 x fS,
                        --                       i.e. 18.432 MHz at 96 kHz
-        2  => x"0608", -- 0x06 SAI_CTRL1:    SDATAOUT1, 32 BCLK slots, 24-bit,
+        2  => x"0658", -- 0x06 SAI_CTRL1:    SDATAOUT1, 16 BCLK slots, 16-bit,
                        --                    LRCLK pulse, MSB first, slave
+                       -- Table 21, verbatim: SLOT_WIDTH[6:5] 00 = 32 BCLKs per
+                       -- TDM slot, 01 = 24, 10 = 16. DATA_WIDTH bit 4: 0 =
+                       -- 24-bit data, 1 = 16-bit. 16 slots x 16 BCLKs = 256.
+                       -- 16-bit data exactly fills a 16-BCLK slot, so there are
+                       -- NO pad bits left - which is why tdm16_rx has to delay
+                       -- its capture to keep C_BIT_ADJ legal. See the comment
+                       -- there before changing either number.
                        -- LR_MODE (bit 3) SET = "single BCLK cycle wide pulse"
                        -- (Table 21). 50% duty was tried instead, because an
                        -- 81 ns pulse averages 13 mV and no meter can see it
-                       -- while a square averages 1.65 V. It cost channels: a
-                       -- 256-BCLK frame puts the 50% falling edge at BCLK 128,
-                       -- the slot 4 / slot 5 boundary, exactly where the part
-                       -- owning slots 5-8 takes over the line. Both parts
-                       -- holding slots 5-8 dropped out; both holding slots 1-4
-                       -- did better. tdm8_master must match - C_LR_PULSE there.
+                       -- while a square averages 1.65 V. It cost channels, and
+                       -- the reason is the one recorded in tdm8_master: in
+                       -- nonpulse mode the part frames on the FALLING edge, so
+                       -- with a 256-BCLK frame every slot lands 4 positions late
+                       -- and the two halves of each line wrap into each other.
+                       --
+                       -- RETRACTED 2026-08-16. This used to say the 50% falling
+                       -- edge at BCLK 128 landed on the slot 4 / slot 5 boundary
+                       -- and that "both parts holding slots 5-8 dropped out;
+                       -- both holding slots 1-4 did better". That is the reading
+                       -- tdm8_master invalidates: because the halves swap, the
+                       -- two parts were reported UNDER EACH OTHER'S NAMES, so
+                       -- those runs are not evidence about either part or about
+                       -- either slot group. Do not use them to justify anything.
+                       -- tdm8_master must match - C_LR_PULSE there.
         3  => x"0710", -- 0x07 SAI_CMAP12:   slots 1,2   (0x54 on the B parts)
         4  => x"0832", -- 0x08 SAI_CMAP34:   slots 3,4   (0x76 on the B parts)
         5  => x"09F8", -- 0x09 SAI_OVERTEMP: drive C1-C4, DRV_HIZ=1
@@ -349,9 +374,38 @@ architecture rtl of adau1978_sequencer is
         11 => x"0001"  -- 0x00 M_POWER:      PWUP LAST, everything else settled
     );
 
-    -- Slot map for the second ADC on each shared SDATA line
-    constant CMAP12_SLOTS_5_6 : std_logic_vector(15 downto 0) := x"0754";
-    constant CMAP34_SLOTS_7_8 : std_logic_vector(15 downto 0) := x"0876";
+    -- Slot map, one entry per part, indexed by adc_idx.
+    --
+    -- TDM16: all four parts share one SDATA net, so all sixteen slots are in
+    -- use and every part needs its own map. Table 22 encodes the slot as a
+    -- 4-bit field per channel, 0000 = Slot 1 through 1111 = Slot 16, with
+    -- 0x07 = CMAP_C2 & CMAP_C1 and 0x08 = CMAP_C4 & CMAP_C3.
+    --
+    --   idx 0  U19 0x11  slots  1- 4   ch  1- 4   C1..C4 = 0,1,2,3
+    --   idx 1  U20 0x31  slots  5- 8   ch  5- 8   C1..C4 = 4,5,6,7
+    --   idx 2  U37 0x51  slots  9-12   ch  9-12   C1..C4 = 8,9,A,B
+    --   idx 3  U38 0x71  slots 13-16   ch 13-16   C1..C4 = C,D,E,F
+    --
+    -- Read each byte as (C2,C1) and (C4,C3), high nibble first - so U37's
+    -- 0x07 is 0x98 because C2 = slot 10 (1001) and C1 = slot 9 (1000).
+    type cmap_by_idx_t is array (0 to 3) of std_logic_vector(7 downto 0);
+    constant CMAP12_BY_IDX : cmap_by_idx_t := (x"10", x"54", x"98", x"DC");
+    constant CMAP34_BY_IDX : cmap_by_idx_t := (x"32", x"76", x"BA", x"FE");
+
+    -- ================= REVERTING THIS FILE TO TDM8 =================
+    -- Four values change, nothing else. Under TDM8 the two lines are independent,
+    -- so slots repeat: U19/U37 both take slots 1-4 and U20/U38 both take 5-8.
+    --
+    --   CMAP12_BY_IDX := (x"10", x"54", x"10", x"54")
+    --   CMAP34_BY_IDX := (x"32", x"76", x"32", x"76")
+    --   0x05 SAI_CTRL0 := x"5B"   SAI=011 TDM8      (currently x"63", SAI=100)
+    --   0x06 SAI_CTRL1 := x"08"   32-BCLK, 24-bit   (currently x"58", 16/16)
+    --
+    -- 0x05 and 0x06 appear three times each - BOOT_ROM, VFY_LIST and POLL_LIST -
+    -- and all three must agree or cfg_ok_i will reject a correct part. check_sync.py
+    -- cross-checks all three plus i2c_scan.py's VERIFY table, so run it after the
+    -- edit and it will name any copy that was missed.
+    -- ===============================================================
 
     -- DIAGNOSTIC: exchange which part of each pair owns the upper slots.
     --
@@ -411,6 +465,8 @@ begin
 
     process(clk, rst_n)
         variable current_boot_word : std_logic_vector(15 downto 0);
+        -- Which row of CMAP12_BY_IDX / CMAP34_BY_IDX this part uses.
+        variable cmap_idx          : integer range 0 to 3;
     begin
         if rst_n = '0' then
             state        <= ST_RESET;
@@ -561,6 +617,21 @@ begin
                         current_boot_word(0) := '1';
                     end if;
 
+                    -- Power the PARTNER on the same SDATA line down. Two parts
+                    -- share each line, and a master runs on its own frame timing
+                    -- while a slave runs on the FPGA's - the two are not phase
+                    -- related, so their slots overlap and both drive the same net
+                    -- at once. There is no series resistor on SDATA, only the 10k
+                    -- pulldown, so that is direct 3.3 V CMOS contention. PWUP=0 is
+                    -- a Full Power-Down (Table 17), which leaves SDATAOUT idle.
+                    -- Partner index is C_MASTER_IDX with bit 0 flipped: 0<->1 on
+                    -- TDM1, 2<->3 on TDM2.
+                    if C_MASTER_TEST
+                       and adc_idx = (to_unsigned(C_MASTER_IDX, 2) xor "01")
+                       and current_boot_word(15 downto 8) = x"00" then
+                        current_boot_word(7 downto 0) := x"00";   -- PWUP = 0
+                    end if;
+
                     -- gain probe: override 0x0A-0x0D on one part only
                     if C_GAIN_PROBE_IDX >= 0
                        and adc_idx = to_unsigned(C_GAIN_PROBE_IDX, 2)
@@ -572,14 +643,23 @@ begin
                                            & C_GAIN_PROBE_BYTE;
                     end if;
 
-                    -- C_SWAP_SLOTS inverts which of the pair takes slots 4-7.
-                    if (adc_idx(0) = '1') /= C_SWAP_SLOTS then
-                        -- keyed on the register address so ROM order can change
-                        if current_boot_word(15 downto 8) = x"07" then
-                            current_boot_word := CMAP12_SLOTS_5_6;
-                        elsif current_boot_word(15 downto 8) = x"08" then
-                            current_boot_word := CMAP34_SLOTS_7_8;
-                        end if;
+                    -- Slot map, now one entry per part rather than an A/B pair.
+                    -- Keyed on the register address so ROM order can change.
+                    -- The idx 0 entries equal the ROM defaults, so U19's writes
+                    -- are byte-identical to what they were before TDM16.
+                    --
+                    -- C_SWAP_SLOTS still exchanges the two parts sharing a line
+                    -- (0<->1 and 2<->3) by flipping bit 0 of the index, so the
+                    -- part-versus-slot diagnostic it exists for still works.
+                    if C_SWAP_SLOTS then
+                        cmap_idx := to_integer(adc_idx xor "01");
+                    else
+                        cmap_idx := to_integer(adc_idx);
+                    end if;
+                    if current_boot_word(15 downto 8) = x"07" then
+                        current_boot_word := x"07" & CMAP12_BY_IDX(cmap_idx);
+                    elsif current_boot_word(15 downto 8) = x"08" then
+                        current_boot_word := x"08" & CMAP34_BY_IDX(cmap_idx);
                     end if;
 
                     i2c_addr     <= get_i2c_addr(adc_idx);

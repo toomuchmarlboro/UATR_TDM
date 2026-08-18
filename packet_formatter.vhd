@@ -91,10 +91,14 @@ begin
                         when 5 => fifo_wr_data <= std_logic_vector(seq_num(23 downto 16));
                         when 6 => fifo_wr_data <= std_logic_vector(seq_num(15 downto 8));
                         when 7 => fifo_wr_data <= std_logic_vector(seq_num(7 downto 0));
-                        -- Frame count was a constant 0x0008 that nothing reads,
-                        -- so these two bytes now carry ADC register readbacks.
-                        when 8 => fifo_wr_data <= dbg_byte0; -- ADAU 0x01 PLL_CONTROL
-                        when 9 => fifo_wr_data <= dbg_byte1; -- ADAU 0x05 SAI_CTRL0
+                        -- Frame count was a constant 0x0008 that nothing reads.
+                        -- These two carried ADC register readbacks, which were
+                        -- static after boot and covered only one part; they now
+                        -- carry the raw SDATA edge counters, which are live and
+                        -- cover both TDM lines. See the note at the port map in
+                        -- top_system for why that trade is worth making.
+                        when 8 => fifo_wr_data <= dbg_byte0; -- SDATA_A edges/window
+                        when 9 => fifo_wr_data <= dbg_byte1; -- SDATA_B edges/window
                         when others => fifo_wr_data <= x"00";
                     end case;
 

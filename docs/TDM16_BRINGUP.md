@@ -1,5 +1,19 @@
 # TDM16 bring-up — what to do with the board
 
+> **STATUS 2026-08-18: NOT THE ACTIVE CONFIGURATION. The tree is back on TDM8.**
+>
+> TDM16 was built and the image `output_files/96K_TDM16.jic` is kept, but the
+> timing analysis that followed showed the capture path was never the fault —
+> `sdata_in` setup slack is **+10.651 ns** and hold **+8.494 ns** worst corner
+> against a 40.695 ns period, with the full 18 ns `tABDD` and the cable round
+> trip already budgeted in the SDC. Merging all four parts onto one net would
+> therefore have added drivers and stub length to a net whose signal integrity is
+> the actual open question, in exchange for dropping 24-bit samples to 16-bit.
+>
+> This document stays valid as the procedure **if** TDM16 is revisited. The
+> switch is four register values in `adau_sequencer.vhd` and one instantiation in
+> `top_system.vhd`; both files carry a comment block naming exactly what changes.
+
 Image: `output_files/96K_TDM16.jic`
 Fallback: `output_files/96K_LRCLK_FIX.jic` (TDM8, keep this — see "If it goes wrong")
 

@@ -231,9 +231,13 @@ chk("Table 10 BCLK ratio", nslots * slotw, div,
     "TDM%d x %d BCLK slots = %d BCLK frame = %d x fS" % (nslots, slotw, div, div))
 chk("data fits its slot", dataw <= slotw, True,
     "%d-bit data in a %d-BCLK slot" % (dataw, slotw))
-chk("host channel count", pyconst(mon, "CHANNELS"), nslots,
-    "TDM%d fills %d slots, udp_monitor decodes %d channels"
-    % (nslots, nslots, pyconst(mon, "CHANNELS")))
+# Channels are slots x LINES, not slots. TDM8 runs two independent SDATA lines
+# whose slot numbering restarts on each, so 8 slots x 2 receivers = 16 channels;
+# TDM16 runs one line of 16. n_inst is how many receivers top_system actually
+# instantiates, which is the only place that distinction is recorded.
+chk("host channel count", pyconst(mon, "CHANNELS"), nslots * n_inst,
+    "TDM%d x %d line(s) = %d channels, udp_monitor decodes %d"
+    % (nslots, n_inst, nslots * n_inst, pyconst(mon, "CHANNELS")))
 
 # The FPGA's LRCLK shape and the ADC's LR_MODE must agree. Nothing checked this
 # before, and they drifted apart: tdm8_master sent 50% duty while tdm16_merge

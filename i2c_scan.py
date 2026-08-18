@@ -18,8 +18,8 @@ comes out of reset. Running this tool again re-reads the same latched result. To
 genuinely re-scan the bus you must power-cycle or reprogram the FPGA.
 
 Diagnostic byte layout, from packet_formatter.vhd:
-    header byte  8      SDATA line A edge count per 2.7 ms (sat. 255)
-    header byte  9      SDATA line B edge count per 2.7 ms (sat. 255)
+    header byte  8      SDATA line A per-slot activity bitmap (0xFF = healthy)
+    header byte  9      SDATA line B per-slot activity bitmap (0xFF = healthy)
     frame 0 byte 0      bus status bits
     frame 1 byte 0      output self-test bits
     frame 2 byte 0      count of addresses that answered
@@ -40,28 +40,29 @@ PAYLOAD_LEN = HDR_LEN + FRAMES_PKT * FRAME_LEN      # 410
 
 # 7-bit address, refdes, TDM slot position, FPGA channels
 #
-# TDM16: all four parts share ONE SDATA net (R21.1 jumpered to R122.1), so the
-# slots run 1-16 straight through instead of 1-8 twice on two separate lines.
-# Each part claims four of them via SAI_CMAP12/34 - see CMAP12_BY_IDX in
-# adau_sequencer.vhd. Nothing else may drive a slot it does not own, which is
-# what DRV_HIZ = 1 in 0x09 enforces.
-DEVICES = [(0x11, "U19", "slot  1-4", "ch  1-4"),
-           (0x31, "U20", "slot  5-8", "ch  5-8"),
-           (0x51, "U37", "slot  9-12", "ch  9-12"),
-           (0x71, "U38", "slot 13-16", "ch 13-16")]
+# TDM8: two independent SDATA lines, so the slot numbering restarts on each one.
+# U19/U37 both hold slots 1-4 of their own line, U20/U38 both hold slots 5-8.
+# Each part claims its four via SAI_CMAP12/34 - see CMAP12_BY_IDX in
+# adau_sequencer.vhd. Within a line, nothing may drive a slot it does not own,
+# which is what DRV_HIZ = 1 in 0x09 enforces.
+DEVICES = [(0x11, "U19", "TDM1 slot 1-4", "ch  1-4"),
+           (0x31, "U20", "TDM1 slot 5-8", "ch  5-8"),
+           (0x51, "U37", "TDM2 slot 1-4", "ch  9-12"),
+           (0x71, "U38", "TDM2 slot 5-8", "ch 13-16")]
 
 # register, name, value written, datasheet reset value
 #
-# 0x05 = 0x63: SDATA_FMT=01 left-justified, SAI=100 TDM16, FS=011 64-96 kHz
-# 0x06 = 0x58: SDATAOUT1, SLOT_WIDTH=10 (16 BCLK), DATA_WIDTH=1 (16-bit),
+# 0x05 = 0x5B: SDATA_FMT=01 left-justified, SAI=011 TDM8, FS=011 64-96 kHz
+# 0x06 = 0x08: SDATAOUT1, SLOT_WIDTH=00 (32 BCLK), DATA_WIDTH=0 (24-bit),
 #              LR_MODE=1 pulse, MSB first, SAI_MS=0 slave
-# These two are the only registers TDM16 changes; check_sync.py cross-checks
-# them against adau_sequencer's BOOT_ROM, so the two files cannot drift apart.
+# These two are the only registers the TDM mode changes; check_sync.py
+# cross-checks them against adau_sequencer's BOOT_ROM, so the two files cannot
+# drift apart. For TDM16 they become 0x63 and 0x58.
 VERIFY = [(0x00, "M_POWER",         0x01, 0x00),
           (0x01, "PLL_CONTROL",     0x03, 0x41),
           (0x04, "BLOCK_POWER_SAI", 0x3F, 0x3F),
-          (0x05, "SAI_CTRL0",       0x63, 0x02),
-          (0x06, "SAI_CTRL1",       0x58, 0x00),
+          (0x05, "SAI_CTRL0",       0x5B, 0x02),
+          (0x06, "SAI_CTRL1",       0x08, 0x00),
           (0x09, "SAI_OVERTEMP",    0xF8, 0xF0)]
 
 
@@ -221,24 +222,31 @@ def main():
 
     # -------------------------------------------------------- SDATA liveness
     # Header bytes 8 and 9 USED to be raw ADAU 0x01 / 0x09 readbacks. They now
-    # carry the raw SDATA edge counters, one per TDM line, saturating at 255
-    # over a 2.7 ms window. Decoding them as registers printed convincing
-    # nonsense - 255 came out as "CLK_S=1 MCS=111" and 0 as "DRV_HIZ=0", both
-    # of which are alarming and neither of which was real.
+    # carry PER-SLOT ACTIVITY BITMAPS, one per TDM line, OR'd over a 2.7 ms
+    # window: bit k set means TDM slot k saw at least one SDATA transition.
+    # Decoding them as registers printed convincing nonsense - 255 came out as
+    # "CLK_S=1 MCS=111" and 0 as "DRV_HIZ=0", both alarming, neither real.
     #
-    # There is no information between the extremes: one window spans ~250 audio
-    # frames of 256 bits, so a driven line saturates immediately.
+    # Slots 0-3 belong to the lower part on each line, slots 4-7 to the upper, so
+    # a partial value names the part that stopped. udp_monitor.py reports the
+    # same bytes across a whole capture, which is the better view for anything
+    # intermittent; this is the single-shot version.
     print()
-    print("  SDATA LINE LIVENESS   (edges per 2.7 ms window, saturates at 255)")
-    for val, line, owners in ((rd_pll, "A (ch 1-8) ", "U19+U20"),
-                              (rd_ot,  "B (ch 9-16)", "U37+U38")):
-        if val >= 200:
-            v = "driven"
-        elif val == 0:
+    print("  SDATA PER-SLOT ACTIVITY   (bit k = slot k active, 0xFF = healthy)")
+    for val, line, lo_part, hi_part in ((rd_pll, "A (ch 1-8) ", "U19", "U20"),
+                                        (rd_ot,  "B (ch 9-16)", "U37", "U38")):
+        bits = "".join("1" if val & (1 << k) else "." for k in range(8))
+        if val == 0xFF:
+            v = "all 8 slots driven"
+        elif val == 0x00:
             v = "*** NO TRANSITIONS AT ALL - line static ***"
+        elif val & 0x0F and not val & 0xF0:
+            v = "*** %s driving, %s QUIET ***" % (lo_part, hi_part)
+        elif val & 0xF0 and not val & 0x0F:
+            v = "*** %s driving, %s QUIET ***" % (hi_part, lo_part)
         else:
-            v = "*** intermittent - %d, expected 255 ***" % val
-        print("    line %s %s   %3d   %s" % (line, owners, val, v))
+            v = "*** partial - expected 0xFF ***"
+        print("    line %s   0x%02X  slots[0..7] %s   %s" % (line, val, bits, v))
     if rd_ot == 0:
         print()
         print("    A line with zero transitions is NOT the same fault as one that")

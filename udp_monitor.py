@@ -500,40 +500,65 @@ def main():
             print("    GROUND PLANE\" - so a degraded pad joint after repeated reflow")
             print("    gives exactly this: intermittent dropouts that worsen with time.")
 
-    # ---------------- SDATA line liveness ----------------
-    # Header bytes 8 and 9 are the raw SDATA edge counts for line A and line B
-    # over the FPGA's 2.7 ms window, saturating at 255. This is the measurement
-    # that splits the fault in half without a scope, so read it over the WHOLE
-    # capture rather than one packet - a line that dies for 167 ms shows up as a
-    # handful of low samples among thousands of 255s, and pkts[0] alone would
-    # miss it completely.
+    # ---------------- SDATA per-slot activity ----------------
+    # Header bytes 8 and 9 are PER-SLOT ACTIVITY BITMAPS for line A and line B,
+    # accumulated over the FPGA's 2.7 ms window. Bit k is set if TDM slot k saw at
+    # least one SDATA transition. They used to be plain edge counts; the bitmap
+    # carries the same "is anyone driving" answer in bits 0-7 while also naming
+    # WHICH part stopped, which the count could never do.
+    #
+    # Read it over the WHOLE capture, not one packet - a line that dies for 167 ms
+    # is a handful of odd samples among thousands of 0xFF, and pkts[0] would miss
+    # it completely.
     good = [p for p in pkts if len(p) == PAYLOAD_LEN]
     if good:
-        SILENT = 16          # anything this low means nobody drove the line
-        print("\n" + "=" * 62)
-        print("SDATA LINE LIVENESS   (raw edge count per 2.7 ms, saturates at 255)")
-        print("=" * 62)
-        for byte_i, line, owners in ((8, "A (ch 1-8) ", "U19+U20"),
-                                     (9, "B (ch 9-16)", "U37+U38")):
-            e = [p[byte_i] for p in good]
-            dead = sum(1 for v in e if v < SILENT)
-            print("  line %s %s   min %3d  max %3d  silent in %d of %d pkts (%.2f%%)"
-                  % (line, owners, min(e), max(e),
-                     dead, len(e), 100.0 * dead / len(e)))
+        print("\n" + "=" * 68)
+        print("SDATA PER-SLOT ACTIVITY   (bit k = slot k had transitions, per 2.7 ms)")
+        print("=" * 68)
+        for byte_i, line, lo_part, hi_part, lo_ch, hi_ch in (
+                (8, "A", "U19", "U20", "ch 1-4",  "ch 5-8"),
+                (9, "B", "U37", "U38", "ch 9-12", "ch 13-16")):
+            v = [p[byte_i] for p in good]
+            n = len(v)
+            full = sum(1 for x in v if x == 0xFF)
+            dead = sum(1 for x in v if x == 0x00)
+            lo_only = sum(1 for x in v if x & 0x0F and not x & 0xF0)
+            hi_only = sum(1 for x in v if x & 0xF0 and not x & 0x0F)
+            print("  line %s   %s(slots 0-3, %s) + %s(slots 4-7, %s)"
+                  % (line, lo_part, lo_ch, hi_part, hi_ch))
+            print("           all 8 slots  %6d / %d (%.2f%%)   modes seen: %s"
+                  % (full, n, 100.0 * full / n,
+                     ", ".join("0x%02X" % m for m in sorted(set(v))[:8])))
+            if dead:
+                print("           DEAD (0x00)  %6d (%.2f%%)  - nothing driving the line"
+                      % (dead, 100.0 * dead / n))
+            if lo_only:
+                print("           only 0x0F    %6d (%.2f%%)  - %s quiet"
+                      % (lo_only, 100.0 * lo_only / n, hi_part))
+            if hi_only:
+                print("           only 0xF0    %6d (%.2f%%)  - %s quiet"
+                      % (hi_only, 100.0 * hi_only / n, lo_part))
         print()
-        print("  Both parts on a line share it, so this cannot say WHICH part went")
-        print("  quiet - only whether ANYONE was still driving. That is still the")
-        print("  measurement that halves the search:")
+        print("  0xFF = healthy. A partial value names the part that stopped, which")
+        print("  is what halves the search:")
         print()
-        print("    channels exactly zero WHILE the line stays at 255")
-        print("      -> the line is alive, so the clocks, PD/RST and +3V3 that BOTH")
-        print("         parts share are all fine. The fault is the one part, or our")
-        print("         decode of its slots. Nothing shared. Nothing in the cable.")
+        print("    0x0F or 0xF0, sustained")
+        print("      -> ONE part stopped while the other kept driving. Everything")
+        print("         they share - clocks, PD/RST, +3V3, the cable - is therefore")
+        print("         fine. The fault is that part or its own supply. Do not")
+        print("         scope the cable for this.")
         print()
-        print("    channels exactly zero AND the line falls to ~0")
+        print("    0x00")
         print("      -> both parts stopped together, so it IS something shared:")
-        print("         clock delivery, PD/RST or supply. Only then is scoping the")
+        print("         clock delivery, PD/RST or supply. Only now is scoping the")
         print("         cable at J20/J21 worth the time.")
+        print()
+        print("  TWO TRAPS. A part driving digital silence makes no transitions and")
+        print("  reads as absent, so cross-check the channel table: 0x0F with ch 5-8")
+        print("  at exact zero means U20 really is not driving, but 0x0F with ch 5-8")
+        print("  carrying audio means the slot phase is off, not that U20 died.")
+        print("  And the bits are OR'd over ~256 frames, so this catches SUSTAINED")
+        print("  loss - a part dropping 200 of 256 frames still reads 0xFF.")
 
     print("\n" + "=" * 62)
     print("CHANNELS   (24-bit signed, full scale = %d)" % FULL_SCALE)

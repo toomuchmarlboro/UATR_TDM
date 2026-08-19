@@ -79,7 +79,56 @@ spec, so the decimal in the comment is almost certainly the typo. Worth
 confirming, but it changes no code either way — the transform is hex → f32 bits
 regardless.
 
+## First real capture from buoy 3 (2026-08-19)
+
+399 sentences in 8 s from `192.168.3.130:8080`, **0 checksum errors, 0 parse
+errors, 0 counter gaps**. Framing, checksum and field layout are now confirmed
+against hardware rather than against the makers' example.
+
+```
+$GDAT2,3FBFF666,0,0,0,3F8CCCCD,40466666,4331B333,0,0,0,0,222*5C
+        1.4997V  0 0 0    1.1deg    3.1deg  177.7deg 0 0 0 seq cnt
+```
+
+Settled by this capture:
+
+- **The aux_vcu is the TCP server.** We dialled it and it streamed unprompted, so
+  `client` mode is correct and the "client or server" question below is closed.
+- **~50 Hz confirmed** — 399 sentences in 8 s.
+- **12-field form confirmed**, `cnt` increments and wraps through all 256 values.
+- **`seq` is stuck at 0.** Loss detection must rely on `cnt`, which works. Do not
+  build anything on `seq`.
+- **Fields are NOT always 8 hex digits.** The spec says they are, "even when
+  carrying integer data". The real device sends a bare `0`. The decoder
+  left-pads, so this costs nothing — but a strict 8-digit parser would have
+  rejected every sentence this device has ever sent.
+
+### The AHRS is not live — the values are firmware constants
+
+Over 399 frames the three attitude fields held **one bit pattern each**, while
+`ulRaw[0]` took **172 distinct values** dithering around 1.50 V. So the firmware
+is running, the sentence generator is alive, and at least one ADC channel is
+genuinely sampling. The IMU is not.
+
+The giveaway is the numbers themselves: `0x3F8CCCCD`, `0x40466666`, `0x4331B333`
+are the float32 encodings of exactly **1.1**, **3.1** and **177.7** — three
+one-decimal round numbers, held bit-identical. A real fused AHRS produces values
+like 1.0937 and dithers in the low bits every frame. These are placeholders
+somebody typed.
+
+Note they are also entirely *plausible* — a small roll, a small pitch, a heading
+just short of south. On a plain readout they look like a working IMU on a level
+bench, which is precisely why `imu_test.py` compares raw bits over a window
+instead of trusting one formatted frame.
+
+**They do confirm the field map is right**, though: placeholder attitudes landed
+in the attitude slots, and no field violated its plausible range. A shifted map
+would have put 177.7 somewhere that could not hold it.
+
 ## Still open: client or server
+
+> **Closed 2026-08-19** by the capture above — the aux_vcu listens, we dial it.
+> `server` mode is kept for the case where a future unit dials in.
 
 Unknown which end listens, so `Link` does either — `client` mode dials the
 aux_vcu, `server` mode listens. Switchable live from the tab. Does not block

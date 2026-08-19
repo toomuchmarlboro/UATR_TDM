@@ -373,6 +373,23 @@ def _selftest():
     assert (r["seq"], r["cnt"]) == (145, 149), "seq/cnt are decimal, not hex"
     assert not gdat2.implausible(r["vals"]), "captured sentence is plausible"
 
+    # The first real sentence off buoy 3 (2026-08-19). It exercises two things
+    # the makers' example does not, and that a stricter reading of the spec
+    # would have rejected outright:
+    #   - fields are NOT always 8 hex digits. The spec says they are "even when
+    #     carrying integer data"; the device sends a bare "0".
+    #   - seq is stuck at 0 on this firmware, so it must stay parseable as 0 and
+    #     not be mistaken for absent. Loss detection runs off cnt.
+    real = ("$GDAT2,3FBFF666,0,0,0,3F8CCCCD,40466666,4331B333,0,0,0,0,222*5C")
+    rr = gdat2.parse(real)
+    assert rr["csum_ok"] is True and rr["ok"], (rr["err"], rr["csum_ok"])
+    assert rr["seq"] == 0 and rr["cnt"] == 222, (rr["seq"], rr["cnt"])
+    assert abs(rr["vals"][gdat2.I_LEAK] - 1.4997) < 1e-3, rr["vals"][0]
+    # The attitude this firmware ships as placeholders: exactly 1.1/3.1/177.7.
+    for i, want in zip(gdat2.AHRS_IDX, (1.1, 3.1, 177.7)):
+        assert abs(rr["vals"][i] - want) < 1e-4, (i, rr["vals"][i], want)
+    assert not gdat2.implausible(rr["vals"]), gdat2.implausible(rr["vals"])
+
     # A shifted field map is caught by the bounds, and by pitch first: 13.27 m
     # of depth landing in the pitch slot is still a legal pitch, but the depth
     # slot then holds a temperature and so on down the line.

@@ -261,6 +261,39 @@ Re-snapshot it when the firmware changes; `gdat2.py` and `imu_test.py` remain
 authoritative. Its `--selftest` checks the embedded map against both real
 captured sentences.
 
+### Standalone GUI
+
+`mixer_gui_standalone.py` is the whole GUI — meters, faders and this telemetry
+tab — with **no imports from its own directory**. numpy and tkinter are still
+used; the constraint is only on local files.
+
+It is **generated, not written**:
+
+```sh
+python make_gui_standalone.py            # regenerate
+python make_gui_standalone.py --check    # fail if stale
+```
+
+The generator slices definitions out of `gdat2.py`, `imu_test.py`, `ctrl.py` and
+`udp_monitor.py` with `ast`, then appends the `mixer_gui.py` body verbatim with
+its local imports stripped and the module names supplied as small stand-in
+objects — so the body still reads `gdat2.Link`, `um.CHANNELS`, `ctrl.decode`,
+and is the real GUI source rather than a fork of it.
+
+This is the answer to the copied-map problem: a copy that is regenerated cannot
+drift, and `--check` turns drift into a build failure. Editing the generated
+file by hand puts the second diverging field map back into the world.
+
+Two things the generator refuses to let through, both learned the hard way:
+
+- **A definition read but never extracted.** The first build pulled
+  `decode_field` but not the `_HEX` set it reads; the file imported cleanly and
+  raised `NameError` on the first sentence. `symtable` now finds every global
+  the output reads and never defines, and fails the build.
+- **A substitution that stopped matching.** Each edit to the GUI body must match
+  exactly once or the build stops, rather than silently emitting a file that
+  still imports a module that will not be there.
+
 With no hardware, `python gdat2.py --sim` in one terminal and
 `python imu_test.py --connect 127.0.0.1` in another exercises the whole path,
 including the injected checksum failures — a bad-checksum sentence is counted

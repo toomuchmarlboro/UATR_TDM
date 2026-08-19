@@ -595,6 +595,8 @@ The step-1/2 files superseded by `top_system.vhd` (`top_tdm.vhd`, `top_loopback.
 | `gdat2.py` | Serial telemetry GUI tab — see [docs/GDAT2_TELEMETRY.md](docs/GDAT2_TELEMETRY.md) |
 | `imu_test.py` | IMU/AHRS connection test over the same link — checks the attitude is *live*, not just present (unproven-constant / all-zero / shifted field map) |
 | `imu_standalone.py` | The same check as a **single self-contained file** — stdlib only, no project imports. Copy it to any machine and run it. Snapshot; the two files above stay authoritative |
+| `mixer_gui_standalone.py` | The **whole GUI in one file** — no imports from this directory (numpy and tkinter still used). **Generated, do not edit** |
+| `make_gui_standalone.py` | Generates the above by extracting definitions from the real modules with `ast`. `--check` fails if the generated file is stale — a regenerated copy cannot drift, a hand-edited one silently does |
 
 ### Testbenches (`sim/`, not in the synthesis hierarchy)
 

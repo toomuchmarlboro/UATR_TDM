@@ -208,7 +208,10 @@ class ImuWatch(object):
         self.good = 0            # frames whose AHRS fields all decoded
         self.skipped = 0         # frames dropped before they reached the axes
         self.shifted = collections.Counter()   # field index -> times implausible
-        self.pending = collections.deque(maxlen=64)   # for the printer
+        # Drained once a second against a 50 Hz feed. Sized well past that: at
+        # 64 the first print cycle that slips past ~1.3 s starts dropping
+        # frames from --every, silently and only under load.
+        self.pending = collections.deque(maxlen=512)
 
     def feed(self, r):
         """gdat2.Link.on_frame callback. Never raises into the link."""

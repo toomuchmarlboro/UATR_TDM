@@ -137,6 +137,13 @@ PLAUSIBLE = (
     (0.0,      3.0),      # Digital I/O - only bits 0 and 1 are defined
 )
 
+# PLAUSIBLE is a second array indexed in step with FIELDS, which is the very
+# divergence the rest of this file argues against. It cannot be folded into
+# FIELDS without touching every unpack of it, so it is bound to FIELDS here
+# instead: add a field and forget the bound, and the module refuses to import
+# rather than reading someone else's bound for it.
+assert len(PLAUSIBLE) == len(FIELDS) == N_RAW, "PLAUSIBLE must track FIELDS"
+
 
 def implausible(vals):
     """-> [(index, value, lo, hi)] for every field outside PLAUSIBLE.

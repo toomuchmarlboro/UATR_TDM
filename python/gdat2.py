@@ -103,6 +103,56 @@ FIELDS = (
 DIO_OPEN  = 0x01
 DIO_CLOSE = 0x02
 
+# Index of each field, so callers name a field instead of hard-coding a number.
+# A second copy of the field order is how a decoder silently goes one position
+# out of step with the firmware and prints roll under the depth-temp heading.
+I_LEAK, I_VBUS, I_DEPTH, I_DTEMP, I_ROLL, I_PITCH, I_YAW, \
+    I_ALT_MM, I_ALT_PCT, I_DIO = range(N_RAW)
+
+AHRS_IDX = (I_ROLL, I_PITCH, I_YAW)
+
+# Physically plausible range per field, aligned with FIELDS. None = unbounded.
+#
+# These are sanity bounds, not calibration: a value outside them is far more
+# likely to mean the field map has shifted (the number is reasonable for some
+# OTHER quantity) than that the sensor read it. That is the failure this catches
+# and a checksum cannot - a shifted map produces perfectly framed, perfectly
+# checksummed, perfectly formatted nonsense.
+#
+# Yaw is the one bound that is a guess: the capture (26.28) and the simulator
+# both sit in 0..360, but a 0-referenced +/-180 convention would be equally
+# normal for an AHRS and is not ruled out by anything on hand, so the bound
+# admits both rather than flagging a working device.
+PLAUSIBLE = (
+    (0.0,    5.0),        # Leak sensor, V - an ADC pin reading, 3.3/5 V rail
+    (0.0,   60.0),        # Voltage monitor, V - 24 V nominal bus
+    (-2.0,  500.0),       # Depth, m - slightly negative at the surface is real
+    (-5.0,   50.0),       # Depth temp, degC - seawater plus self-heating
+    (-180.0, 180.0),      # Roll, deg
+    (-90.0,   90.0),      # Pitch, deg - a pitch outside this is a convention
+                          # error, not an attitude
+    (-180.0, 360.0),      # Yaw, deg - see note above, admits both conventions
+    (0.0, 100000.0),      # Altimeter dist, mm - 100 m
+    (0.0,    100.0),      # Altimeter conf, %
+    (0.0,      3.0),      # Digital I/O - only bits 0 and 1 are defined
+)
+
+
+def implausible(vals):
+    """-> [(index, value, lo, hi)] for every field outside PLAUSIBLE.
+
+    Undecoded fields (None) are not reported here; they are already an error of
+    their own and reporting them twice makes one fault read as two.
+    """
+    out = []
+    for i, v in enumerate(vals):
+        if v is None or PLAUSIBLE[i] is None:
+            continue
+        lo, hi = PLAUSIBLE[i]
+        if not (lo <= v <= hi):
+            out.append((i, v, lo, hi))
+    return out
+
 
 # ---------------------------------------------------------------- checksum ---
 def checksum(body):
@@ -267,9 +317,16 @@ class Link(threading.Thread):
     recv() as one message would corrupt roughly every other reading.
     """
 
-    def __init__(self, mode="client", host="127.0.0.1", port=DEFAULT_PORT):
+    def __init__(self, mode="client", host="127.0.0.1", port=DEFAULT_PORT,
+                 on_frame=None):
         super().__init__(daemon=True)
         self.mode, self.host, self.port = mode, host, port
+        # Called with every parsed sentence, good or bad, on the link thread.
+        # snapshot() only ever shows the LAST sentence, so a consumer that
+        # needs each one (imu_test.py, which measures how the attitude moves
+        # between frames) would otherwise have to re-parse the tail and drift
+        # away from this decoder.
+        self.on_frame = on_frame
         self.lock = threading.Lock()
         self.stop = False
         self.sock = None
@@ -418,6 +475,14 @@ class Link(threading.Thread):
                         self.lost += d - 1
                 self.cnt_prev = c
             self.tail = (self.tail + text + "\n")[-1200:]
+        # Outside the lock: a consumer that blocks must not stall the reader,
+        # and a consumer that raises must not take the link down - this thread
+        # is the whole transport.
+        if self.on_frame is not None:
+            try:
+                self.on_frame(r)
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------- simulator ---

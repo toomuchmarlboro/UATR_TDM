@@ -108,6 +108,56 @@ and 1×1, and gets no `<Configure>`. Resizing the window while the Mixer tab was
 in front therefore left this tab at its build-time font sizes. It rescales on
 `<Map>` as well, i.e. the first time it becomes visible.
 
+## IMU / AHRS — `imu_test.py`
+
+The only IMU in this system is the AHRS inside the aux_vcu. It is **not** on the
+FPGA's I2C bus and not on a serial port here — its attitude arrives already
+fused, as `ulRaw[4..6]` in the sentence above. Connecting to the IMU is exactly
+connecting to this link; there is no separate handshake or register map.
+
+`gdat2.py` already prints those three fields, which proves the *link*. It does
+not prove the *IMU*, because all three ways an attitude source fails produce
+sentences that frame, checksum and format perfectly:
+
+| Failure | What you see | How `imu_test.py` catches it |
+|---|---|---|
+| **Frozen** | plausible attitude, unchanging | identical raw u32 across the whole window. Compared on the **bits**, not the printed float — two decimal places hide the dither that separates a live AHRS from a dead one |
+| **Zero** | `0.00 / 0.00 / 0.00` | all-zero for the whole window. One frame of this is indistinguishable from level-and-pointing-north |
+| **Shifted map** | *plausible* attitude, from the wrong slot | plausible-range guard on **every** field. Roll read out of the depth-temp slot is still a legal roll — the giveaway is a leak sensor reading 18 V and a confidence of 4696 % |
+
+That last row is the one worth internalising. With the field map shifted one
+place, a test run reads roll 18.50°, pitch 5.30°, yaw 2.50° — three entirely
+believable numbers, correctly formatted, correct units. Nothing about the
+attitude fields themselves says anything is wrong. Ranges live in
+`gdat2.PLAUSIBLE` and the field map is **imported**, never copied — two copies
+of a field map drifting apart is the cause of this failure, not the cure.
+
+Yaw is unwrapped before any span or drift is computed. A plain max−min calls
+`359.5 → 0.5` a 359° swing, which inverts every motion verdict at the one
+heading a buoy is most likely to sit at.
+
+```sh
+python imu_test.py --selftest              # decoder + every verdict branch
+python imu_test.py --buoy 1                # report only
+python imu_test.py --buoy 1 --expect still   # bench: warn if something moves it
+python imu_test.py --buoy 1 --expect moving  # in water: warn if it is dither only
+python imu_test.py --connect 127.0.0.1 --raw # bytes only — any device, any framing
+```
+
+`--expect` is deliberately optional: frozen and all-zero are always faults, but
+whether the buoy *should* be moving is something only the operator knows.
+
+With no hardware, `python gdat2.py --sim` in one terminal and
+`python imu_test.py --connect 127.0.0.1` in another exercises the whole path,
+including the injected checksum failures — a bad-checksum sentence is counted
+but never fed to the motion window, since one corrupted float is a spike that
+reads as motion.
+
+**For a different IMU** — a part wired to a USB-serial adapter or onto the
+FPGA's I2C bus — nothing in this repo names one yet. Start with `--raw`, read
+the actual bytes, and write the decoder from those. A register map written from
+memory produces a decoder that looks like it works and is for the wrong device.
+
 ## Notes for the reader
 
 - **Hex is parsed as hex, with no sniffing.** An earlier decimal-first reading

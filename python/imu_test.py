@@ -258,6 +258,44 @@ _MARK = {"ok": "  ok  ", "warn": " WARN ", "wait": " ...  "}
 def print_report(watch, link, expect, t0):
     rows, good, skipped, shifted = watch.report(expect)
     s = link.snapshot()
+
+    # Nothing has decoded yet: say why, once, and say nothing else. The three
+    # axis rows carry no information before the first frame ("0 samples, need
+    # 10" x3), and repeating a four-line hint every second buries the one line
+    # that changes - the link state - in a screen of identical text. A waiting
+    # tool should be quiet enough that movement is visible.
+    if good == 0:
+        state = s["state"]
+        # Categorise, do not echo the state string. Link alternates "connecting
+        # to X" and "reconnecting" every retry, so keying the message on the
+        # state reprints the whole hint each cycle even though the situation
+        # never changed. What the operator must act on is the category.
+        if state.startswith("connected"):
+            cat = "silent"
+            hint = ("  !! connected, but no sentence has decoded. A GDAT2 "
+                    "source streams on connect\n     without being asked - "
+                    "check WHAT answered (--raw dumps the bytes).")
+        elif link.mode == "server":
+            cat = "nobody"
+            hint = "  !! listening - nothing has dialled in yet."
+        else:
+            cat = "unreachable"
+            hint = ("  !! not reachable. Check the unit is powered and on this "
+                    "subnet. If\n     'ping %s' fails at the ARP level it is "
+                    "not on this segment at\n     all, and no amount of "
+                    "retrying will find it." % link.host)
+        if cat != getattr(print_report, "_last_cat", None):
+            print_report._last_cat = cat
+            print("\n[%6.1fs] %s" % (time.time() - t0, state))
+            print(hint)
+        else:
+            # Same situation: one dot, so the tool visibly lives without
+            # repeating itself into a wall of identical text.
+            sys.stdout.write(".")
+            sys.stdout.flush()
+        return
+
+    print_report._last_cat = None            # next silence reports afresh
     print("\n[%6.1fs] %s %s   %.0f sentences/s   good %d  csum %d  bad %d  lost %d"
           % (time.time() - t0, s["state"], s["peer"], s["rate"], s["good"],
              s["csum_err"], s["parse_err"], s["lost"]))
@@ -284,22 +322,6 @@ def print_report(watch, link, expect, t0):
     if skipped:
         print("  (%d frames not fed to the window: checksum or field error)"
               % skipped)
-    if good == 0:
-        # Distinguish the two silences, because they need opposite actions and
-        # the link state alone does not say which. Not reaching the address is
-        # a power or network problem; reaching it and getting nothing means
-        # something answered that is not a GDAT2 source - and there is a device
-        # one digit from the buoy address doing exactly that.
-        if s["state"].startswith("connected"):
-            print("  !! connected, but no sentence has decoded. A GDAT2 source "
-                  "streams on connect\n     without being asked - check WHAT "
-                  "answered (--raw dumps the bytes).")
-        elif link.mode == "server":
-            print("  !! %s - nothing has dialled in yet." % s["state"])
-        else:
-            print("  !! not connected (%s). Check the unit is powered and on "
-                  "this subnet;\n     'ping %s' failing at the ARP level means "
-                  "it is not on this segment at all." % (s["state"], link.host))
 
 
 # --------------------------------------------------------------------- raw ---

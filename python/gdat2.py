@@ -84,7 +84,20 @@ BUOYS = (("buoy 1", "192.168.3.110"),
          ("buoy 2", "192.168.3.120"),
          ("buoy 3", "192.168.3.130"),
          ("buoy 4", "192.168.3.140"))
-DEFAULT_HOST = BUOYS[0][1]
+
+# The unit actually in service, so a bare run dials the one that exists rather
+# than the one that happens to be first in the table. 2026-08-19: buoy 3,
+# 192.168.3.130 - operator confirmed. Earlier notes name buoy 1 as the only
+# live unit; that is superseded.
+ACTIVE_BUOY  = 3
+DEFAULT_HOST = BUOYS[ACTIVE_BUOY - 1][1]
+
+# Not a buoy: 192.168.3.131 answers on 8080 with an Embedthis embedded web
+# server. It is one digit from the address above and open on the same port, and
+# it accepts the connection and then sends nothing - which reads exactly like a
+# silent aux_vcu. It is a different device. A GDAT2 source streams immediately
+# on connect and needs no request; if a socket opens and stays quiet, check
+# what answered before suspecting the telemetry.
 
 # name, unit, kind. kind drives how a bare integer token is reinterpreted.
 FIELDS = (

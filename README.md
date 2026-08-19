@@ -593,7 +593,7 @@ The step-1/2 files superseded by `top_system.vhd` (`top_tdm.vhd`, `top_loopback.
 | `ctrl.py` | Control protocol and `--test`, which proves the UDP receive path |
 | `timeline.py` | Reports channel dropout windows over a capture |
 | `gdat2.py` | Serial telemetry GUI tab — see [docs/GDAT2_TELEMETRY.md](docs/GDAT2_TELEMETRY.md) |
-| `imu_test.py` | IMU/AHRS connection test over the same link — checks the attitude is *live*, not just present (frozen / all-zero / shifted field map) |
+| `imu_test.py` | IMU/AHRS connection test over the same link — checks the attitude is *live*, not just present (unproven-constant / all-zero / shifted field map) |
 
 ### Testbenches (`sim/`, not in the synthesis hierarchy)
 

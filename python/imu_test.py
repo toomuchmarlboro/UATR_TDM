@@ -29,12 +29,24 @@ WHAT THIS CHECKS THAT gdat2.py DOES NOT
 proves the link. It does not prove the IMU, because the three ways an attitude
 source fails all survive framing, checksum and formatting untouched:
 
-  FROZEN   the same bits arrive frame after frame. A real AHRS dithers in the
-           low bits even bolted to a bench - fusion output that is bit-identical
-           across hundreds of frames is a firmware field that stopped being
-           updated, or a sensor that stopped being polled, not a steady boat.
-           Checked on the RAW u32, not the printed float: a value rounded to
-           two decimals hides exactly the dither that distinguishes the two.
+  CONSTANT the same bits arrive frame after frame. This is NOT by itself a
+           fault, and an earlier version of this script was wrong to call it
+           one. It reasoned that a live AHRS always dithers in its low bits, so
+           a repeated bit pattern had to be a field nobody updates. That
+           premise fails on a quantised output: buoy 3 reports attitude in
+           steps of 0.1 deg, so a stationary unit repeats one value forever and
+           is perfectly healthy. It was called FROZEN, and it was alive - the
+           values changed as soon as the unit was picked up and shaken.
+
+           A stationary quantised sensor and a dead field are bit-identical.
+           Nothing in the stream separates them, so the script no longer
+           pretends otherwise: a constant value is reported UNPROVEN until the
+           axis is seen to change at least once, and the operator is asked to
+           move the unit. After that first change the axis is known alive, and
+           later constant stretches just mean it is sitting still.
+
+           Checked on the RAW u32, not the printed float, and the apparent
+           quantisation step is derived from the data rather than assumed.
 
   ZERO     the field decodes fine and reads 0.0 forever. Means the firmware
            never filled it. Indistinguishable from "level and pointing north"
@@ -118,18 +130,70 @@ def wrapped_span(vals):
 
 
 class AxisWindow(object):
-    """Rolling window over one attitude axis, and the verdict it supports."""
+    """Rolling window over one attitude axis, and the verdict it supports.
+
+    Two timescales, and the difference between them is the whole point:
+
+      the WINDOW  answers "is it moving right now"
+      the SESSION answers "has it EVER moved", which is what proves it is alive
+
+    An earlier version had only the window, and concluded that a constant value
+    meant a dead field on the reasoning that a live AHRS always dithers in its
+    low bits. That is false for a quantised output. Buoy 3 reports attitude in
+    steps of 0.1 deg, so a stationary unit repeats one bit pattern indefinitely
+    and is perfectly healthy - it was called FROZEN and it was not. Only motion
+    distinguishes the two, so a constant value is now reported as UNPROVEN and
+    the operator is asked to move the unit, rather than being told a wrong
+    answer with confidence.
+    """
 
     def __init__(self, name, window_s=DEFAULT_WINDOW_S):
         self.name = name
         self.window_s = window_s
         self.samples = collections.deque()     # (t, raw_u32, value_deg)
+        # Session-wide, never evicted. Bounded because a 50 Hz feed left running
+        # all day must not grow without limit; the counts are what matter, not
+        # the full history.
+        self.session_raw = set()
+        self.session_vals = set()
+        self.changes = 0                       # times the raw value changed
+        self._prev_raw = None
 
     def feed(self, t, raw, val):
         self.samples.append((t, raw, val))
         cut = t - self.window_s
         while self.samples and self.samples[0][0] < cut:
             self.samples.popleft()
+
+        if self._prev_raw is not None and raw != self._prev_raw:
+            self.changes += 1
+        self._prev_raw = raw
+        if len(self.session_raw) < 4096:
+            self.session_raw.add(raw)
+            if val is not None:
+                self.session_vals.add(round(float(val), 6))
+
+    # -- session ----------------------------------------------------------
+    @property
+    def ever_moved(self):
+        """Has this axis ever taken a second value? Proof of life, once true."""
+        return self.changes > 0
+
+    def resolution(self):
+        """Apparent quantisation step, or None if it cannot be established.
+
+        Reported so a constant reading can be read correctly: at 0.1 deg steps,
+        a still unit SHOULD repeat one value. Derived from what arrived rather
+        than assumed - a firmware that sends full float precision will show
+        None here and its dither is then meaningful again.
+        """
+        vs = sorted(self.session_vals)
+        if len(vs) < 2:
+            return None
+        for q in (1.0, 0.5, 0.25, 0.1, 0.05, 0.01):
+            if all(abs(v / q - round(v / q)) < 1e-4 for v in vs):
+                return q
+        return None
 
     # -- derived ----------------------------------------------------------
     @property
@@ -169,20 +233,40 @@ class AxisWindow(object):
         return d / (t1 - t0) * 60.0
 
     def verdict(self, expect=None, min_samples=10):
-        """-> (tag, text). tag is 'ok' | 'warn' | 'wait'.
+        """-> (tag, text). tag is 'ok' | 'warn' | 'unproven' | 'wait'.
 
-        Order matters: ZERO is reported ahead of FROZEN because an all-zero
-        field is also frozen, and "the firmware never filled this" is the more
-        actionable of the two readings of the same evidence.
+        Order matters: ZERO is reported ahead of a constant reading because an
+        all-zero field is also constant, and "the firmware never filled this" is
+        the more actionable reading of the same evidence. All-zero stays a
+        warning - quantisation explains a repeated PLAUSIBLE value, not a field
+        that is exactly zero forever.
         """
         if self.n < min_samples:
             return "wait", "%d samples, need %d" % (self.n, min_samples)
-        if self.all_zero:
+        if self.all_zero and not self.ever_moved:
             return "warn", ("ZERO for %.1fs - firmware is not filling this "
                             "field" % self.window_s)
+
         if self.distinct_raw == 1:
-            return "warn", ("FROZEN - %d frames, one identical bit pattern; "
-                            "a live AHRS dithers" % self.n)
+            res = self.resolution()
+            step = (" at %g deg resolution" % res) if res else ""
+            if self.ever_moved:
+                # Already proved alive earlier in this session, so a constant
+                # now just means it is sitting still.
+                if expect == "moving":
+                    return "warn", ("steady%s while motion was expected "
+                                    "(moved %d times earlier)"
+                                    % (step, self.changes))
+                return "ok", ("steady%s - live, moved %d times this session"
+                              % (step, self.changes))
+            # Never yet seen to change. A quantised sensor sitting still and a
+            # field nobody updates are BIT-IDENTICAL. Refuse to guess.
+            if expect == "moving":
+                return "warn", ("constant%s through expected motion - suspect "
+                                "it is not being updated" % step)
+            return "unproven", ("constant%s - stationary and not-updated look "
+                                "identical here; MOVE the unit to tell them "
+                                "apart" % step)
 
         span = self.span
         if expect == "still" and span > STILL_MAX:
@@ -252,7 +336,8 @@ class ImuWatch(object):
 
 
 # ---------------------------------------------------------------- printing ---
-_MARK = {"ok": "  ok  ", "warn": " WARN ", "wait": " ...  "}
+_MARK = {"ok": "  ok  ", "warn": " WARN ", "wait": " ...  ",
+         "unproven": "  ??  "}
 
 
 def print_report(watch, link, expect, t0):
@@ -403,13 +488,40 @@ def _selftest():
     assert abs(wrapped_span([10.0, 12.0, 11.0]) - 2.0) < 1e-6
     assert wrapped_span([]) == 0.0 and wrapped_span([7.0]) == 0.0
 
-    # Verdicts. Raw bits drive FROZEN, so the frozen case must repeat the same
-    # u32 - which is exactly what a float comparison at 2 dp would miss.
+    # A constant reading is UNPROVEN, not a fault. This is the regression for
+    # the wrong call made on real hardware: buoy 3 quantises to 0.1 deg, sat
+    # still, repeated one bit pattern, and was declared FROZEN - then moved
+    # when shaken. A stationary quantised sensor and a dead field are
+    # bit-identical, so the only honest verdict before any motion is "unknown".
     w = AxisWindow("t", window_s=10.0)
     assert w.verdict()[0] == "wait"
     for k in range(20):
         w.feed(1000.0 + k * 0.02, gdat2.f32_bits(12.5), 12.5)
-    assert w.verdict()[0] == "warn" and "FROZEN" in w.verdict()[1], w.verdict()
+    assert w.verdict()[0] == "unproven", w.verdict()
+    assert "MOVE" in w.verdict()[1], w.verdict()
+    # Under an explicit expectation of motion it IS a warning: something should
+    # have changed and did not.
+    assert w.verdict("moving")[0] == "warn", w.verdict("moving")
+
+    # One change is proof of life. Afterwards a constant stretch is just
+    # stillness, and must read ok - this is the buoy-3 case once shaken.
+    for k in range(20, 40):
+        w.feed(1000.0 + k * 0.02, gdat2.f32_bits(12.6), 12.6)
+    for k in range(40, 60):
+        w.feed(1000.0 + k * 0.02, gdat2.f32_bits(12.6), 12.6)
+    assert w.ever_moved and w.changes == 1, (w.ever_moved, w.changes)
+    assert w.verdict()[0] == "ok", w.verdict()
+    assert "live" in w.verdict()[1], w.verdict()
+    # And the quantisation is derived, not assumed: 12.5 and 12.6 are 0.1 steps.
+    assert w.resolution() == 0.1, w.resolution()
+
+    # Full float precision must NOT be reported as quantised, or the message
+    # would excuse a genuinely stuck field on a device that sends real dither.
+    fw = AxisWindow("t", window_s=10.0)
+    for k in range(20):
+        v = 12.5 + 0.00137 * k
+        fw.feed(1000.0 + k * 0.02, gdat2.f32_bits(v), v)
+    assert fw.resolution() is None, fw.resolution()
 
     z = AxisWindow("t", window_s=10.0)
     for k in range(20):

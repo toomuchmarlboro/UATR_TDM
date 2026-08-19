@@ -103,27 +103,48 @@ Settled by this capture:
   left-pads, so this costs nothing — but a strict 8-digit parser would have
   rejected every sentence this device has ever sent.
 
-### The AHRS is not live — the values are firmware constants
+### The AHRS is live, and quantised to 0.1°
 
-Over 399 frames the three attitude fields held **one bit pattern each**, while
-`ulRaw[0]` took **172 distinct values** dithering around 1.50 V. So the firmware
-is running, the sentence generator is alive, and at least one ADC channel is
-genuinely sampling. The IMU is not.
+Over 399 frames the three attitude fields held **one bit pattern each**. The
+first reading of that was that they were hardcoded placeholders — the values are
+`0x3F8CCCCD`, `0x40466666`, `0x4331B333`, i.e. **exactly 1.1, 3.1 and 177.7**,
+and three one-decimal round numbers held bit-identical looked typed rather than
+measured.
 
-The giveaway is the numbers themselves: `0x3F8CCCCD`, `0x40466666`, `0x4331B333`
-are the float32 encodings of exactly **1.1**, **3.1** and **177.7** — three
-one-decimal round numbers, held bit-identical. A real fused AHRS produces values
-like 1.0937 and dithers in the low bits every frame. These are placeholders
-somebody typed.
+**That was wrong.** The operator shook the unit and the values moved. A second
+capture read **1.2 / 3.2 / 152.3** — same one-decimal pattern, different
+numbers.
 
-Note they are also entirely *plausible* — a small roll, a small pitch, a heading
-just short of south. On a plain readout they look like a working IMU on a level
-bench, which is precisely why `imu_test.py` compares raw bits over a window
-instead of trusting one formatted frame.
+The real explanation covers every observation: **the firmware quantises attitude
+to 0.1°**. Every value seen across both captures is an exact multiple of 0.1. A
+stationary unit therefore repeats one bit pattern indefinitely, and that is
+healthy, not frozen.
 
-**They do confirm the field map is right**, though: placeholder attitudes landed
-in the attitude slots, and no field violated its plausible range. A shifted map
-would have put 177.7 somewhere that could not hold it.
+The lesson is about the *inference*, not the arithmetic. "A live AHRS always
+dithers in its low bits" is true of a raw fusion output and false of a quantised
+one, and nothing in the stream distinguishes a still quantised sensor from a
+field nobody updates — they are bit-identical. Only motion separates them.
+`imu_test.py` now reports a constant axis as **UNPROVEN** and asks for the unit
+to be moved, rather than asserting a fault. Once an axis has been seen to change
+even once it is known alive, and later constant stretches read as stillness.
+
+The map is confirmed: attitudes landed in the attitude slots and no field
+violated its plausible range.
+
+### What is genuinely not populated
+
+Distinct values seen in 8 s, which is the measurement that matters:
+
+| field | distinct | reading |
+|---|---|---|
+| Leak sensor | **172** | ~1.50 V, dithering — live |
+| AHRS Roll / Pitch / Yaw | 1 per capture, **changes when moved** | live, 0.1° steps |
+| Voltage monitor | 3 | ~0.00 V |
+| Depth, Depth temp, Altimeter ×2, Digital I/O | 1 | exactly `0` |
+
+So the module and its ADC path are running. The all-zero fields are the open
+question — `Voltage monitor` reading 0.00 V on a powered unit is the one worth
+asking the firmware owner about.
 
 ## Still open: client or server
 
@@ -184,8 +205,8 @@ sentences that frame, checksum and format perfectly:
 
 | Failure | What you see | How `imu_test.py` catches it |
 |---|---|---|
-| **Frozen** | plausible attitude, unchanging | identical raw u32 across the whole window. Compared on the **bits**, not the printed float — two decimal places hide the dither that separates a live AHRS from a dead one |
-| **Zero** | `0.00 / 0.00 / 0.00` | all-zero for the whole window. One frame of this is indistinguishable from level-and-pointing-north |
+| **Constant** | plausible attitude, unchanging | identical raw u32 across the window → reported **UNPROVEN**, never as a fault. On buoy 3 this is normal: attitude is quantised to 0.1°, so a still unit repeats one value. Only motion separates "sitting still" from "nobody updates this field", so the tool asks for motion instead of guessing. One observed change proves the axis alive for the rest of the session |
+| **Zero** | `0.00 / 0.00 / 0.00` | all-zero for the whole window, and never yet seen to change. Quantisation explains a repeated *plausible* value, not an exact zero forever |
 | **Shifted map** | *plausible* attitude, from the wrong slot | plausible-range guard on **every** field. Roll read out of the depth-temp slot is still a legal roll — the giveaway is a leak sensor reading 18 V and a confidence of 4696 % |
 
 That last row is the one worth internalising. With the field map shifted one
@@ -207,8 +228,15 @@ python imu_test.py --buoy 1 --expect moving  # in water: warn if it is dither on
 python imu_test.py --connect 127.0.0.1 --raw # bytes only — any device, any framing
 ```
 
-`--expect` is deliberately optional: frozen and all-zero are always faults, but
-whether the buoy *should* be moving is something only the operator knows.
+`--expect` is deliberately optional, and it is what turns an UNPROVEN constant
+into a verdict: with `--expect moving`, an axis that does not change *is* a
+fault, because something should have moved it. Without it the tool will not
+guess, since whether the buoy should be moving is something only the operator
+knows.
+
+**The bench procedure that actually settles it:** run `python imu_test.py`, pick
+the unit up and shake it. The axes flip from `??` to `ok ... live, moved N times
+this session` the moment they change, and stay that way. That is the whole test.
 
 With no hardware, `python gdat2.py --sim` in one terminal and
 `python imu_test.py --connect 127.0.0.1` in another exercises the whole path,

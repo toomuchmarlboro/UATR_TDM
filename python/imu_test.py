@@ -284,6 +284,22 @@ def print_report(watch, link, expect, t0):
     if skipped:
         print("  (%d frames not fed to the window: checksum or field error)"
               % skipped)
+    if good == 0:
+        # Distinguish the two silences, because they need opposite actions and
+        # the link state alone does not say which. Not reaching the address is
+        # a power or network problem; reaching it and getting nothing means
+        # something answered that is not a GDAT2 source - and there is a device
+        # one digit from the buoy address doing exactly that.
+        if s["state"].startswith("connected"):
+            print("  !! connected, but no sentence has decoded. A GDAT2 source "
+                  "streams on connect\n     without being asked - check WHAT "
+                  "answered (--raw dumps the bytes).")
+        elif link.mode == "server":
+            print("  !! %s - nothing has dialled in yet." % s["state"])
+        else:
+            print("  !! not connected (%s). Check the unit is powered and on "
+                  "this subnet;\n     'ping %s' failing at the ARP level means "
+                  "it is not on this segment at all." % (s["state"], link.host))
 
 
 # --------------------------------------------------------------------- raw ---
@@ -440,8 +456,13 @@ def main():
         h, _, p = a.connect.partition(":")
         mode, host, port = "client", h, int(p) if p else a.port
     else:
-        ap.print_help()
-        return 1
+        # No selector: dial the unit in service rather than printing help. The
+        # overwhelmingly common run is "check the IMU on the buoy we are using",
+        # and making that the bare command keeps the active address in exactly
+        # one place (gdat2.ACTIVE_BUOY) instead of in everyone's shell history.
+        mode, host, port = "client", gdat2.DEFAULT_HOST, a.port
+        print("no target given - using the active unit, buoy %d (%s)"
+              % (gdat2.ACTIVE_BUOY, gdat2.DEFAULT_HOST))
 
     if a.raw:
         if mode != "client":

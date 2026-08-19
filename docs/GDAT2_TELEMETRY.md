@@ -6,12 +6,26 @@ device, different transport (TCP, not UDP), different framing. Implemented in
 
 One aux_vcu per buoy, all on **port 8080**:
 
-| | address |
-|---|---|
-| buoy 1 | `192.168.3.110` |
-| buoy 2 | `192.168.3.120` |
-| buoy 3 | `192.168.3.130` |
-| buoy 4 | `192.168.3.140` |
+| | address | |
+|---|---|---|
+| buoy 1 | `192.168.3.110` | |
+| buoy 2 | `192.168.3.120` | |
+| buoy 3 | `192.168.3.130` | **active unit** (2026-08-19) |
+| buoy 4 | `192.168.3.140` | |
+
+`gdat2.ACTIVE_BUOY` names the unit in service and `DEFAULT_HOST` follows it, so
+a bare `python imu_test.py` dials the buoy that exists rather than whichever is
+first in the table. Change it in that one place when the active unit changes.
+
+> ### ⚠ `192.168.3.131` is not a buoy
+>
+> One digit from buoy 3, open on the same port 8080, and it **accepts the
+> connection and then sends nothing** — which reads exactly like a silent
+> aux_vcu. It is a different device: an `Embedthis-http` embedded web server.
+>
+> The discriminator is simple. **A GDAT2 source streams on connect without being
+> asked.** A socket that opens and stays quiet is the wrong device, not a broken
+> sensor. `imu_test.py --raw` settles it in seconds.
 
 ## OUTGOING PACKETS (aux_vcu → Control Station)
 

@@ -66,6 +66,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import udp_monitor as um
 import ctrl
 import gdat2
+import imu_test          # AxisWindow: one implementation of "has this moved?"
 
 # Which ADC owns which channels: matches get_i2c_addr in adau_sequencer.vhd and
 # the B-part CMAP slot patch, cross-checked against the netlist address straps.
@@ -607,10 +608,16 @@ class Telemetry(tk.Frame):
                               font=("Consolas", 9), justify="left")
         self.stats.pack(fill="x", padx=12, pady=(8, 4))
 
+        # The "live" column is the one that stops a number being believed just
+        # because it is well formatted. A field can frame, checksum, decode and
+        # print a plausible value while never being updated at all - which is
+        # what 1.1/3.1/177.7 deg of attitude did on buoy 3 until someone picked
+        # the unit up. Tracking is imu_test's, imported rather than reimplemented.
         cols = (("field", 150, "w"), ("wire (hex)", 120, "e"),
-                ("u32", 110, "e"), ("value", 130, "e"), ("unit", 60, "w"))
+                ("u32", 110, "e"), ("value", 130, "e"), ("unit", 60, "w"),
+                ("live", 110, "w"))
         # weight per column, so the table uses the whole width when maximised
-        wts = (3, 2, 2, 2, 1)
+        wts = (3, 2, 2, 2, 1, 2)
         head = tk.Frame(self, bg=BG)
         head.pack(fill="x", padx=12)
         self.heads = []
@@ -626,6 +633,13 @@ class Telemetry(tk.Frame):
         self.cells = []
         for i in range(len(cols)):
             self.grid_f.grid_columnconfigure(i, weight=wts[i], uniform="tel")
+        # One tracker per field, session-wide. Reset on connect, not per frame:
+        # "has this ever changed" is only meaningful over a whole session, and
+        # is the only thing that separates a sensor sitting still from a field
+        # nobody writes. See imu_test.AxisWindow.
+        self.watch = [imu_test.AxisWindow(nm) for nm, _u, _k in gdat2.FIELDS]
+        self.last_t = None
+
         for r, (nm, unit, _k) in enumerate(gdat2.FIELDS):
             row = []
             bgc = PANEL if r % 2 == 0 else BG
@@ -659,6 +673,11 @@ class Telemetry(tk.Frame):
         except ValueError:
             self.state_lab.config(text="bad port", fg=RED)
             return
+        # A fresh link is a fresh session: carrying "it moved earlier" across a
+        # reconnect would let a dead field inherit a previous unit's proof.
+        for w in self.watch:
+            w.__init__(w.name)
+        self.last_t = None
         self.link = gdat2.Link(self.mode.get(), self.host.get().strip(), port)
         self.link.start()
         self.btn.config(text="disconnect", activebackground=RED)
@@ -682,6 +701,26 @@ class Telemetry(tk.Frame):
             # reading forever otherwise, which is the one failure a telemetry
             # view must never present as live data.
             stale = r is None or (time.time() - r["t"]) > 1.0
+
+            # Feed the liveness trackers, but only on a sentence we have not
+            # already seen - snapshot() returns the same "last" between ticks,
+            # and re-feeding it would pad the sample counts with duplicates.
+            # This samples at the GUI tick rate rather than every frame, which
+            # undercounts changes but cannot invent one: what matters is
+            # whether a field EVER changes, and that survives sampling.
+            if r is not None and r["t"] != self.last_t:
+                self.last_t = r["t"]
+                for i in range(len(gdat2.FIELDS)):
+                    if r["raw"][i] is not None:
+                        self.watch[i].feed(r["t"], r["raw"][i], r["vals"][i])
+
+            # Out-of-range says the SENTENCE is suspect, most likely a shifted
+            # field map, so it is flagged per field rather than as one banner.
+            bad_range = set()
+            if r is not None:
+                bad_range = set(i for i, _v, _lo, _hi
+                                in gdat2.implausible(r["vals"]))
+
             for i, (_nm, unit, kind) in enumerate(gdat2.FIELDS):
                 raw = r["raw"][i] if r else None
                 val = r["vals"][i] if r else None
@@ -701,8 +740,26 @@ class Telemetry(tk.Frame):
                                else "bad hex"), RED
                 else:
                     txt = "%.3f" % val if kind == "f32" else "%d" % val
-                    fg = TEXT
+                    fg = RED if i in bad_range else TEXT
                 c[3].config(text=txt, fg=DIM if stale else fg)
+
+                # Liveness. "constant" is deliberately not red: on this firmware
+                # attitude is quantised to 0.1 deg, so a still unit repeats one
+                # value and that is healthy. Amber means unproven - move the
+                # unit and watch it go green - not broken. Exact zero forever is
+                # a different claim and does read as a fault.
+                w = self.watch[i]
+                if not w.session_raw:
+                    lv, lfg = "-", DIM
+                elif w.ever_moved:
+                    lv, lfg = "live  %d" % w.changes, GREEN
+                elif w.session_raw == {0}:
+                    lv, lfg = "zero", RED
+                else:
+                    res = w.resolution()
+                    lv = "constant ?" + (" %gd" % res if res else "")
+                    lfg = AMBER
+                c[5].config(text=lv, fg=DIM if stale else lfg)
             if stale and r is not None:
                 self.state_lab.config(text="STALE - no sentence for >1 s",
                                       fg=RED)

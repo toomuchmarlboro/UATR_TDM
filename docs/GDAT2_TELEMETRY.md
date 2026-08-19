@@ -238,6 +238,29 @@ knows.
 the unit up and shake it. The axes flip from `??` to `ok ... live, moved N times
 this session` the moment they change, and stay that way. That is the whole test.
 
+### In the GUI
+
+The Telemetry tab of `mixer_gui.py` carries the same checks — it dials
+`gdat2.DEFAULT_HOST`, so it already targets the active unit, and each row now has
+a **live** column: `live N` (green, has changed N times), `constant ?` (amber,
+unproven — move the unit), `zero` (red, exactly zero forever). Out-of-range
+values turn red in place, flagging a shifted map per field rather than as one
+banner. The tracking is `imu_test.AxisWindow`, imported rather than
+reimplemented, so the GUI and the CLI cannot drift apart.
+
+### Standalone copy
+
+`imu_standalone.py` is the whole check in **one file, standard library only** —
+no project imports. Copy it to a deployment laptop or a colleague's machine and
+run it; `--sim` gives it a fake aux_vcu so it can be demonstrated with no
+hardware at all.
+
+It is a **snapshot** (2026-08-19), and being standalone it necessarily carries
+its own copy of the field map — the one defect this tool exists to catch.
+Re-snapshot it when the firmware changes; `gdat2.py` and `imu_test.py` remain
+authoritative. Its `--selftest` checks the embedded map against both real
+captured sentences.
+
 With no hardware, `python gdat2.py --sim` in one terminal and
 `python imu_test.py --connect 127.0.0.1` in another exercises the whole path,
 including the injected checksum failures — a bad-checksum sentence is counted

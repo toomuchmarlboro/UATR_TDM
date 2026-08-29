@@ -20,6 +20,8 @@ Usage
     python ctrl.py --set 1 -6          channel 1 to -6 dB
     python ctrl.py --set 5 mute
     python ctrl.py --all 0             every channel to 0 dB
+    python ctrl.py --phantom status    what is 48 V actually doing right now
+    python ctrl.py --phantom on
 
 --test is the important one. It measures a channel, mutes it, measures again,
 restores it, and tells you whether the FPGA acted. Nothing else in the control
@@ -36,9 +38,25 @@ import numpy as np
 sys.path.insert(0, __file__.rsplit("\\", 1)[0] if "\\" in __file__ else ".")
 import udp_monitor as um
 
-FPGA_IP   = "192.168.1.101"      # C_FPGA_IP in top_system.vhd
+FPGA_IP   = "192.168.1.101"      # C_FPGA_IP in top_system.vhd, node 1
 FPGA_PORT = 5005                 # any port: udp_rx_core does not filter on it
 STREAM_PORT = 5005
+
+
+def node_ip(n):
+    """Node number -> board IP. Mirrors C_NODE in top_system.vhd."""
+    return "192.168.1.%d" % (100 + int(n))
+
+
+def node_stream_port(n):
+    """Node number -> the port that board's audio arrives on.
+
+    Each board transmits on its own port so the host can open one socket per
+    board. udp_monitor.capture() uses recv(), not recvfrom(), so boards sharing
+    a port would interleave their sequence numbers into a single socket and the
+    loss report would be meaningless.
+    """
+    return 5004 + int(n)
 
 MUTE = 0xFF
 ZERO_DB = 0xA0
@@ -89,6 +107,92 @@ def send_flags(flags, ip=FPGA_IP, port=FPGA_PORT):
     return send_gain(1, ZERO_DB, flags=flags, ip=ip, port=port)
 
 
+# Frame 1's byte 0 is dbg_status2, which carries the 48 V phantom readback in
+# bits 6:3. See the comment on dbg_status2_int in top_system.vhd.
+#
+# Deliberately the frame NUMBER and not the byte offset. Anything at module
+# level here is extracted verbatim by make_gui_standalone.py and lands ABOVE
+# the `um` stand-in it builds, so a module-level `um.HDR_LEN` would import
+# cleanly in this file and raise NameError in the generated one. The offset is
+# formed inside phantom_state, where `um` resolves at call time.
+PHANTOM_FRAME = 1
+
+
+def phantom_state(pkt):
+    """Decode the 48 V readback out of one audio packet.
+
+    -> dict, or None if the packet is unusable or the bitstream predates this.
+
+    Phantom power is otherwise write-only, and the command path is not a record
+    of the state: the FPGA clears udp_flags on any reset, and a restarted GUI
+    starts with its checkbox off while the board may still be driving 48 V. So
+    the only trustworthy answer comes from the board itself, in every packet.
+
+    Keys:
+        on          the en_48v pin as actually driven
+        requested   the host asked for it (udp_flags bit 0)
+        staged      the staged power-up passed 1000 ms
+        permitted   C_ENABLE_48V is true in this build
+    'on' is the AND of the other three, so which one is false names the cause.
+
+    ASSERTED, NOT MEASURED. en_48v is an FPGA output with no sense line back, so
+    a dead supply or an open enable trace still reports on.
+    """
+    if len(pkt) < um.PAYLOAD_LEN or pkt[:4] != um.MAGIC:
+        return None
+    b = pkt[um.HDR_LEN + PHANTOM_FRAME * um.FRAME_LEN]
+    if not b & 0x80:            # marker bit: this byte is populated
+        return None
+    return {"on":        bool(b & 0x40),
+            "requested": bool(b & 0x20),
+            "staged":    bool(b & 0x10),
+            "permitted": bool(b & 0x08)}
+
+
+def phantom_reason(st):
+    """One line explaining a phantom_state dict, naming the gate that is off."""
+    if st is None:
+        return "unknown - no packet, or a bitstream older than the readback"
+    if st["on"]:
+        return "ON - the FPGA is asserting EN_48V"
+    if not st["permitted"]:
+        return "off - C_ENABLE_48V is false in this build, so it cannot come on"
+    if not st["staged"]:
+        return "off - the staged power-up has not reached 1000 ms yet"
+    if not st["requested"]:
+        return "off - not requested. An FPGA reset clears the request, so this " \
+               "is also what you see after the board has rebooted under a " \
+               "GUI that still shows phantom enabled"
+    # All three gates set and the pin still low is the watchdog signature. It
+    # needs no status bit of its own precisely because nothing else produces
+    # this combination: the host asked for 48 V, the build allows it, the
+    # power-up timer reached it, and the FPGA is overriding all three.
+    return ("off - the phantom WATCHDOG has tripped. The FPGA has not heard a "
+            "flags-carrying packet within C_PHANTOM_TIMEOUT_S and has dropped "
+            "48 V on its own. Send any command with a flags byte to restore it")
+
+
+def read_phantom(port=STREAM_PORT, bind="", timeout=3.0):
+    """Wait for one audio packet and return its phantom_state, or None."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((bind, port))
+    s.settimeout(timeout)
+    t0 = time.time()
+    try:
+        while time.time() - t0 < timeout:
+            try:
+                d, _ = s.recvfrom(2048)
+            except socket.timeout:
+                return None
+            st = phantom_state(d)
+            if st is not None:
+                return st
+    finally:
+        s.close()
+    return None
+
+
 def decode(payload):
     body = payload[um.HDR_LEN:]
     n = len(body) // um.FRAME_LEN
@@ -128,10 +232,11 @@ def measure(ch, secs=1.5, port=STREAM_PORT):
     return float(np.sqrt(np.mean(x[:, ch - 1] ** 2)))
 
 
-def self_test(ch):
-    print("UDP RECEIVE PATH TEST   channel %d -> %s" % (ch, FPGA_IP))
+def self_test(ch, ip=FPGA_IP, stream_port=STREAM_PORT):
+    print("UDP RECEIVE PATH TEST   channel %d -> %s  (stream port %d)"
+          % (ch, ip, stream_port))
     print("-" * 58)
-    base = measure(ch)
+    base = measure(ch, port=stream_port)
     if base is None:
         print("  no packets received.")
         print("  The board is not streaming - power it up and confirm")
@@ -146,14 +251,14 @@ def self_test(ch):
         print("  signal:  python ctrl.py --test --channel 3")
         return 2
 
-    send_gain(ch, MUTE)
+    send_gain(ch, MUTE, ip=ip)
     time.sleep(0.8)
-    muted = measure(ch)
+    muted = measure(ch, port=stream_port)
     print("  after mute  (0xFF)  %10.1f" % (muted if muted is not None else -1))
 
-    send_gain(ch, ZERO_DB)
+    send_gain(ch, ZERO_DB, ip=ip)
     time.sleep(0.8)
-    back = measure(ch)
+    back = measure(ch, port=stream_port)
     print("  after restore(0xA0) %10.1f" % (back if back is not None else -1))
     print()
 
@@ -167,8 +272,9 @@ def self_test(ch):
 
     print("  no change - the FPGA did not act on the packet.")
     print("  Things to check, in order:")
-    print("    - is the PC on 192.168.1.10 and the FPGA on 192.168.1.101?")
-    print("    - arp -a should map 192.168.1.101 to de-ad-be-ef-00-01")
+    print("    - is the PC on 192.168.1.10 and the FPGA on %s?" % ip)
+    print("    - arp -a should map %s to de-ad-be-ef-00-%02d"
+          % (ip, int(ip.rsplit(".", 1)[1]) - 100))
     print("    - rmii_rx / udp_rx_core have never been proven on hardware;")
     print("      this is the first thing that would exercise them.")
     return 1
@@ -185,15 +291,51 @@ def main():
     ap.add_argument("--set", nargs=2, metavar=("CH", "DB"),
                     help="set one channel, e.g. --set 3 -6  or  --set 5 mute")
     ap.add_argument("--all", metavar="DB", help="set every channel")
-    ap.add_argument("--ip", default=FPGA_IP)
+    ap.add_argument("--phantom", choices=("on", "off", "status"),
+                    help="48 V phantom power. 'status' reads it back from the "
+                         "board and does not change anything.")
+    ap.add_argument("--node", type=int, default=1, choices=(1, 2, 3, 4),
+                    help="which board (1-4). Sets both the control IP and the "
+                         "audio stream port. --ip overrides the address.")
+    ap.add_argument("--ip", default=None,
+                    help="override the board IP derived from --node")
     a = ap.parse_args()
 
+    ip     = a.ip or node_ip(a.node)
+    stream = node_stream_port(a.node)
+
+    if a.phantom:
+        if a.phantom != "status":
+            # There is no flags-only packet: the FPGA parses one command format,
+            # so carrying the flag means also writing a gain. send_flags picks
+            # channel 1 at 0 dB, which is why that is called out here.
+            send_flags(0x01 if a.phantom == "on" else 0x00, ip=ip)
+            print("sent 48 V %s  (channel 1 also set to 0 dB - the flags byte "
+                  "rides on a gain command)" % a.phantom)
+            time.sleep(0.5)
+        st = read_phantom(port=stream)
+        print("48 V readback: %s" % phantom_reason(st))
+        if st is None:
+            # Do not let "no packet" be read as "old bitstream". On Windows two
+            # sockets can both bind this port with SO_REUSEADDR while only ONE
+            # of them receives, so a mixer GUI open on this node silently takes
+            # the whole stream and this returns nothing at all.
+            print("  nothing arrived on port %d in 3 s. Close any mixer_gui or"
+                  % stream)
+            print("  udp_monitor already listening on that port and re-run -")
+            print("  two sockets can bind it but only one gets the packets.")
+        if st is not None:
+            print("  pin %s | requested %s | staged %s | build permits %s"
+                  % tuple("yes" if st[k] else "no"
+                          for k in ("on", "requested", "staged", "permitted")))
+        return
+
     if a.test:
-        sys.exit(self_test(a.channel))
+        sys.exit(self_test(a.channel, ip=ip, stream_port=stream))
     if a.set:
         ch, db = int(a.set[0]), parse_db(a.set[1])
         b = gain_byte(db)
-        adc, sub = send_gain(ch, b, ip=a.ip)
+        adc, sub = send_gain(ch, b, ip=ip)
         print("ch %d -> ADC %d ch %d, reg 0x%02X = 0x%02X (%s)"
               % (ch, adc, sub, 0x0A + sub, b,
                  "mute" if db is None else "%+.3f dB" % gain_db(b)))
@@ -202,7 +344,7 @@ def main():
         db = parse_db(a.all)
         b = gain_byte(db)
         for ch in range(1, 17):
-            send_gain(ch, b, ip=a.ip)
+            send_gain(ch, b, ip=ip)
             time.sleep(0.02)
         print("all 16 channels -> 0x%02X (%s)"
               % (b, "mute" if db is None else "%+.3f dB" % gain_db(b)))

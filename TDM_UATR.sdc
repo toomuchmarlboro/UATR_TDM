@@ -115,6 +115,29 @@ create_generated_clock -name bclk_pin -source [get_pins $bclk_node] -divide_by 1
 # The physical number underneath, which needs no sign convention at all: LRCLK
 # leaves its pad only 4.161 - 2.904 = 1.26 ns (min) to 4.488 - 2.670 = 1.82 ns
 # (max) after BCLK leaves its pad, and Table 5 requires 5 ns. See tdm8_master.
+#
+# LAUNCH CLOCK. As of the phase-shift change, lrclk_out is NOT launched by the
+# same clock as bclk_out. top_system registers it onto PLL output c3, a phase
+# shifted 24.576 MHz copy of c2, purely to move the transition off the half
+# period a falling-edge launch is stuck at. Nothing below needed to change:
+# derive_pll_clocks picks c3 up automatically, and the clk[*] wildcard in the
+# clock group above already declares c2 and c3 synchronous, which they are.
+#
+# These two constraints are therefore the readout for whether the phase landed
+# where it was meant to. Against the pre-shift baseline of setup +8.382 /
+# hold +16.520 (Slow 85C), expect roughly:
+#
+#   105 deg (11870 ps)   setup ~ +16.5    hold ~  +9.0
+#   225 deg (25431 ps)   setup ~  +3.0    hold ~ +22.5
+#
+# CHECK THE EDGE PAIR, DO NOT ASSUME IT. With a phase shifted launch clock
+# TimeQuest picks whichever launch/capture pair yields worst-case slack, and
+# that is not always the one intended. If setup and hold have not moved in
+# OPPOSITE directions by about 8.5 ns from the baseline, the tool chose a
+# different pair and this needs a set_multicycle_path - do not program the
+# device until those two numbers reconcile. This file has already shipped one
+# constraint that read plausibly and had its sign inverted; see
+# LRCLK_HOLD_VIOLATION.md.
 set_output_delay -clock bclk_pin -max  10.0 [get_ports {lrclk_out}]
 set_output_delay -clock bclk_pin -min  -5.0 [get_ports {lrclk_out}]
 

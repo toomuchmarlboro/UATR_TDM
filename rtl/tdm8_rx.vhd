@@ -55,6 +55,16 @@ architecture rtl of tdm8_rx is
     -- udp_monitor and timeline) test the LRCLK timing; bit alignment tests this
     -- constant. The success criterion for the LRCLK change is all four parts at
     -- or near 0 % zeros, whatever the audio sounds like.
+    -- TIED TO THE LRCLK OUTPUT PHASE. top_system re-times lrclk_out onto a
+    -- phase shifted PLL output (C_LRCLK_PHASE_PS). Where the capture edge falls
+    -- relative to lrclk_int's transition at 20.345 ns decides whether the pad
+    -- carries the same cycle's value or the previous one, which is a whole BCLK
+    -- of frame latency:
+    --     225 deg (25431 ps) - capture AFTER  the change - no extra latency, -1
+    --     105 deg (11870 ps) - capture BEFORE the change - one BCLK later,   -2
+    --     180 deg (20345 ps) - control build, also one BCLK later,           -2
+    -- Legal range is -8..+8, from the k=0 and k=7 slice bounds below.
+    -- See docs/LRCLK_PHASE_SHIFT.md.
     constant C_BIT_ADJ : integer := -1;
 
     -- RAW CAPTURE MODE. Instead of extracting 24 bits from each 32-BCLK slot,

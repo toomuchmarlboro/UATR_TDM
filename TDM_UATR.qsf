@@ -146,6 +146,7 @@ set_global_assignment -name SLD_NODE_PARAMETER_ASSIGNMENT "SLD_ENABLE_ADVANCED_T
 set_location_assignment PIN_135 -to test_led
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to test_led
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to altera_reserved_tms
+set_global_assignment -name VHDL_FILE rtl/net_pkg.vhd
 set_global_assignment -name VHDL_FILE rtl/rmii_rx.vhd
 set_global_assignment -name VHDL_FILE rtl/udp_rx_core.vhd
 set_global_assignment -name VHDL_FILE rtl/adau_sequencer.vhd

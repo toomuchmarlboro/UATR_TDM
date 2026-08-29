@@ -2,6 +2,8 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
+use work.net_pkg.all;
+
 entity top_system is
     port (
         -- Board Hardware
@@ -62,6 +64,11 @@ architecture rtl of top_system is
             c0     : out std_logic;
             c1     : out std_logic;
             c2     : out std_logic;
+            -- c3: 24.576 MHz like c2 but PHASE SHIFTED, used only to re-time
+            -- lrclk_out at the pad. See C_LRCLK_PHASE_PS below and
+            -- docs/LRCLK_PHASE_SHIFT.md. Must be added in the MegaWizard - the
+            -- generated pll_audio.vhd currently has clk0/clk1/clk2 generics only.
+            c3     : out std_logic;
             locked : out std_logic
         );
     end component;
@@ -170,6 +177,7 @@ architecture rtl of top_system is
             fpga_ip      : in  std_logic_vector(31 downto 0);
             pc_mac       : in  std_logic_vector(47 downto 0);
             pc_ip        : in  std_logic_vector(31 downto 0);
+            udp_port     : in  std_logic_vector(15 downto 0);
             packet_ready : in  std_logic;
             fifo_rd_en   : out std_logic;
             fifo_rd_data : in  std_logic_vector(7 downto 0);
@@ -185,6 +193,9 @@ architecture rtl of top_system is
             rst          : in  std_logic;
             fpga_mac     : in  std_logic_vector(47 downto 0);
             fpga_ip      : in  std_logic_vector(31 downto 0);
+            pc_ip        : in  std_logic_vector(31 downto 0);
+            learn_mac    : out std_logic_vector(47 downto 0);
+            learn_valid  : out std_logic;
             rx_data      : in  std_logic_vector(7 downto 0);
             rx_valid     : in  std_logic;
             rx_end       : in  std_logic;
@@ -291,7 +302,8 @@ architecture rtl of top_system is
             udp_adc_sel  : out std_logic_vector(1 downto 0);
             udp_ch_sel   : out std_logic_vector(1 downto 0);
             udp_gain     : out std_logic_vector(7 downto 0);
-            udp_flags    : out std_logic_vector(7 downto 0)
+            udp_flags    : out std_logic_vector(7 downto 0);
+            udp_flags_wr : out std_logic
         );
     end component;
 
@@ -346,12 +358,106 @@ architecture rtl of top_system is
     signal en_15v_int : std_logic := '0';
     signal en_48v_int : std_logic := '0';
     signal udp_flags_int : std_logic_vector(7 downto 0) := (others => '0');
+    -- What actually goes out on the en_48v pin. A separate signal because an
+    -- `out` port cannot be read back in VHDL-93, and the phantom readback in
+    -- dbg_status2_int has to publish the driven value, not re-derive it.
+    signal en_48v_drv  : std_logic := '0';
+    signal en48_permit : std_logic;         -- C_ENABLE_48V as a bit
+
+    -- Phantom watchdog. See C_PHANTOM_WATCHDOG.
+    signal udp_flags_wr_int : std_logic;
+    signal ph_wd_tick : unsigned(25 downto 0) := (others => '0'); -- 1 s prescaler
+    signal ph_wd_secs : unsigned(7 downto 0)  := (others => '0'); -- seconds idle
+    signal ph_wd_trip : std_logic := '0';
+    signal ph_wd_gate : std_logic;
 
     -- TX Arbiter State Lock
     signal active_tx   : std_logic_vector(1 downto 0) := "00"; -- "00"=Idle, "01"=ARP, "10"=UDP
 
+    -- ------------------------------------------------------------------
+    -- LRCLK output phase, and the ONE constant that sets it.
+    --
+    -- The ADAU1978 samples LRCLK on the BCLK RISING edge (Table 5, tALS/tALH,
+    -- slave mode). At 24.576 MHz the legal window for the LRCLK transition,
+    -- measured from that edge, is
+    --
+    --     [ tALH , T - tALS ] = [ 5.00 , 30.69 ] ns        T = 40.690 ns
+    --
+    -- tdm8_master launches LRCLK on the FALLING edge of clk_18m, which is
+    -- exactly T/2 = 20.345 ns - the only value a falling-edge launch can
+    -- produce. That leaves 15.35 ns of hold margin and 10.34 ns of setup
+    -- margin, and it is the value every image up to now has shipped.
+    --
+    -- Registering lrclk_int onto a PHASE SHIFTED copy of the same PLL clock
+    -- puts the transition anywhere in the period instead. c3 is that copy.
+    --
+    -- WHICH WAY TO MOVE IT IS NOT KNOWN YET. ADC3/ADC4 drop out intermittently
+    -- and the failure is at one end of the window or the other:
+    --
+    --   setup-limited (LRCLK arriving LATE at the part)  -> shift EARLIER, 105 deg
+    --   hold-limited  (LRCLK arriving EARLY at the part) -> shift LATER,   225 deg
+    --
+    -- Guessing costs a bench session. docs/LRCLK_PHASE_SHIFT.md step 0 is a
+    -- resistor test that determines the sign before anything is recompiled.
+    --
+    --   deg    ps      launch    hold margin   setup margin   C_BIT_ADJ
+    --   180  20345     20.345 ns    15.35         10.34          -1   (today)
+    --   105  11870     11.870 ns     7.87         18.82          -2
+    --   225  25431     25.431 ns    20.43          5.26          -1
+    --
+    -- C_BIT_ADJ (tdm8_rx.vhd) differs between the two because of where the
+    -- capture edge falls relative to lrclk_int's transition at 20.345 ns:
+    --   105 deg - clk_lr rises at 11.870, BEFORE lrclk_int changes, so it
+    --             carries the PREVIOUS cycle's value. One BCLK of added frame
+    --             latency. C_BIT_ADJ must go -1 -> -2.
+    --   225 deg - clk_lr rises at 25.431, AFTER lrclk_int changes, so it
+    --             carries the SAME cycle's value. No added latency.
+    --             C_BIT_ADJ stays at -1.
+    --
+    -- Setting this to 20345 reproduces today's timing through the new register
+    -- (one BCLK later, so C_BIT_ADJ = -2) and is the control build.
+    --
+    -- *** THIS CONSTANT DOES NOT SET THE PHASE. ***
+    -- The phase lives in the ALTPLL megafunction (ip/pll_audio), as
+    -- clk3_phase_shift, and can only be changed in the MegaWizard. Editing the
+    -- line below alone changes NOTHING about the built image. It exists so the
+    -- intended value is recorded in the source next to the reasoning, and so a
+    -- reader can tell at a glance which image they are looking at. Nothing in
+    -- the toolchain enforces that the two agree - if you change one, change the
+    -- other, and confirm against the fitter report as in step 5 of the doc.
+    constant C_LRCLK_PHASE_PS : integer := 25431;   -- 225 deg. MIRROR OF THE PLL.
+
+    -- ------------------------------------------------------------------
+    -- ...AND THE SWITCH THAT DECIDES WHETHER ANY OF THE ABOVE IS USED.
+    --
+    --   false - lrclk_out comes straight from tdm8_master, launched on the
+    --           FALLING edge of clk_18m at T/2 = 20.345 ns. This is what every
+    --           image up to and including 96K_ACT shipped, and 96K_ACT is the
+    --           build on which all 16 channels are known to work on real
+    --           hardware. c3 is still generated by the PLL and simply goes
+    --           unused; the LRCLK path itself is identical to ACT's.
+    --   true  - lrclk_out is re-timed onto c3 at C_LRCLK_PHASE_PS.
+    --
+    -- SET FALSE ON PURPOSE. The phase shift was built to chase intermittent
+    -- ADC3/ADC4 dropouts, and docs/LRCLK_PHASE_SHIFT.md step 0 is explicit that
+    -- the SIGN of the required shift is still unknown - 105 deg and 225 deg move
+    -- it opposite ways and only a bench measurement can say which is right.
+    -- Meanwhile the dropouts were traced to a misplaced DVDD decoupling cap and
+    -- a dead U37, both fixed in hardware, and all 16 channels now run clean.
+    --
+    -- So there is no longer a fault for this to fix, and turning it on would
+    -- change LRCLK timing at the same moment as the phantom readback goes in -
+    -- two variables in one flash, on four boards, with the known-good reference
+    -- image retired. If the dropouts ever return, the work is intact: flip this
+    -- to true, set the MegaWizard phase to match C_LRCLK_PHASE_PS, and follow
+    -- the doc. Until then it stays out of the signal path.
+    -- ------------------------------------------------------------------
+    constant C_LRCLK_RETIME : boolean := false;
+
     -- Audio Domain (18.432 MHz)
     signal lrclk_int     : std_logic;
+    signal clk_lr        : std_logic;               -- u_pll c3, phase shifted
+    signal lrclk_pin_r   : std_logic := '0';        -- re-timed, drives the pad
     signal ch_data_A_int : std_logic_vector(191 downto 0);
     signal ch_data_B_int : std_logic_vector(191 downto 0);
     signal tdm16_out_int : std_logic_vector(383 downto 0);
@@ -499,12 +605,73 @@ architecture rtl of top_system is
     signal udp_gain_int     : std_logic_vector(7 downto 0) := x"A0";
 
     -- ==========================================
-    -- HARDCODED NETWORK PARAMETERS (NODE 1)
+    -- NETWORK PARAMETERS
+    --
+    -- *** C_NODE IS THE ONLY PER-BOARD EDIT. ***
+    --
+    -- Everything else on the network side derives from it, so building the
+    -- image for board 3 means changing this one integer and nothing else.
+    -- That is deliberate: the previous arrangement had the MAC, the IP, the
+    -- UDP port and a hand-computed IP header checksum as four independent
+    -- literals in two files, and getting three of the four right produces a
+    -- board that transmits perfectly and delivers nothing.
+    --
+    --   node   MAC             IP               UDP port
+    --     1    DEADBEEF0001    192.168.1.101    5005
+    --     2    DEADBEEF0002    192.168.1.102    5006
+    --     3    DEADBEEF0003    192.168.1.103    5007
+    --     4    DEADBEEF0004    192.168.1.104    5008
+    --
+    -- ONE PORT PER BOARD, deliberately. Putting all four on 5005 was tried and
+    -- reverted: the RTL side is a one-line change, but the port is what the host
+    -- uses to tell the boards apart. Every tool here calls recv(), which
+    -- discards the sender, so four boards on one port would merge four
+    -- independent sequence-number streams into one socket. And on Windows two
+    -- sockets may both BIND the same UDP port with SO_REUSEADDR while only ONE
+    -- receives - measured on this machine, the second binds without error and
+    -- then sits silent - so a shared port also means only one capture process
+    -- can run at a time. Separate ports cost nothing and avoid both.
+    --
+    -- Node 1 reproduces the previous hardcoded values exactly.
     -- ==========================================
-    constant C_FPGA_MAC : std_logic_vector(47 downto 0) := x"DEADBEEF0001";
-    constant C_FPGA_IP  : std_logic_vector(31 downto 0) := x"C0A80165"; -- 192.168.1.101
-    constant C_PC_MAC   : std_logic_vector(47 downto 0) := x"FFFFFFFFFFFF"; -- Broadcast until ARP resolves
-    constant C_PC_IP    : std_logic_vector(31 downto 0) := x"C0A8010A"; -- 192.168.1.10
+    constant C_NODE : integer range 1 to 4 := 1;
+
+    constant C_FPGA_MAC : std_logic_vector(47 downto 0) :=
+        x"DEADBEEF00" & std_logic_vector(to_unsigned(C_NODE, 8));
+    constant C_FPGA_IP  : std_logic_vector(31 downto 0) :=
+        x"C0A801" & std_logic_vector(to_unsigned(100 + C_NODE, 8));
+    constant C_UDP_PORT : std_logic_vector(15 downto 0) :=
+        std_logic_vector(to_unsigned(5004 + C_NODE, 16));
+
+    -- The capture host. Same on every board.
+    --
+    -- C_PC_IP must match the static address set on the PC's wired adapter, and
+    -- it is load bearing twice over: the ADCs' destination, and the filter that
+    -- decides whose ARP we are willing to learn from.
+    constant C_PC_IP  : std_logic_vector(31 downto 0) := x"C0A8010A"; -- 192.168.1.10
+
+    -- Deployment PC, Realtek PCIe GbE, A0-AD-9F-22-4B-6E.
+    --
+    -- This is the RESET DEFAULT, not a fixed value - pc_mac_r below starts here
+    -- and is overwritten by whatever ARPs us from C_PC_IP. Two things follow:
+    -- the deployment PC works from the first packet with no ARP round trip, and
+    -- moving the array to a different host needs no reflash, just one packet in
+    -- our direction (a ping is enough) to teach us the new MAC.
+    --
+    -- It was x"FFFFFFFFFFFF" with the comment "Broadcast until ARP resolves",
+    -- but nothing ever resolved it - see pc_mac_r. Broadcast is flooded to every
+    -- switch port and is never suppressed by MAC learning, so with four boards
+    -- each 100 Mbit port would have seen all four streams, 183 Mbit/s offered
+    -- into a 100 Mbit link, and the I2C control path would have starved.
+    constant C_PC_MAC : std_logic_vector(47 downto 0) := x"A0AD9F224B6E";
+
+    -- The live destination MAC for audio frames. Starts at C_PC_MAC and tracks
+    -- whoever ARPs us from C_PC_IP. arp_responder already captured both the
+    -- sender MAC and the sender IP for its own reply path; all that was missing
+    -- was carrying them out to here.
+    signal pc_mac_r       : std_logic_vector(47 downto 0) := C_PC_MAC;
+    signal arp_learn_mac  : std_logic_vector(47 downto 0);
+    signal arp_learn_val  : std_logic;
 
     -- ==========================================
     -- LMK1C1104 OUTPUT ENABLE POLARITY
@@ -546,6 +713,42 @@ architecture rtl of top_system is
     -- to ~7 mA per pin by 32 x 6k81 feed resistors and could never have loaded
     -- the rail. Enabled 1000 ms after PLL lock, 500 ms after +/-15V.
     constant C_ENABLE_48V : boolean := true;
+
+    -- ------------------------------------------------------------------
+    -- PHANTOM WATCHDOG - a fail-safe, not a convention.
+    --
+    -- The host is supposed to turn 48 V off when it shuts down. That covers an
+    -- orderly app restart and nothing else: if the operator app CRASHES, if the
+    -- Ethernet cable is pulled, or if the PC loses power, then udp_flags bit 0
+    -- is still set inside the FPGA and 48 V stays live on the XLRs forever.
+    -- Nothing on the board notices, because nothing on the board was ever told
+    -- the host is gone.
+    --
+    -- With this true, the FPGA stops taking the host's word for it. Phantom
+    -- power is gated on having heard a flags-carrying packet within
+    -- C_PHANTOM_TIMEOUT_S, so the host must keep saying "yes, still on" or 48 V
+    -- drops on its own.
+    --
+    -- DEFAULT FALSE, deliberately. Turning it on makes a keepalive MANDATORY:
+    -- any host that sets phantom and then goes quiet will see 48 V drop
+    -- mid-capture, which during a real deployment is worse than the hazard it
+    -- prevents. Enable it only once the host actually sends keepalives, and
+    -- flash all four boards together - a board with the watchdog on and a board
+    -- with it off behave differently under exactly the conditions you would be
+    -- least able to diagnose in the water.
+    --
+    -- The gate is not latching. A keepalive that arrives after a trip restores
+    -- phantom power on the spot, because the flags byte it carries says what the
+    -- host wants. That is the right behaviour for a link that merely hiccupped;
+    -- a host that has genuinely restarted sends flags = 0x00 and phantom stays
+    -- off, which is the same thing arriving at the same answer from the other
+    -- side.
+    --
+    -- A trip is visible on the host with no new status bit: it is the only
+    -- state where dbg_status2 bits 5, 4 and 3 are all set while bit 6 is clear.
+    -- ------------------------------------------------------------------
+    constant C_PHANTOM_WATCHDOG  : boolean := false;
+    constant C_PHANTOM_TIMEOUT_S : integer := 120;
 
     -- The schematic net named /SCL lands on ADAU pin 17, which the datasheet
     -- calls SDA, so the pin assignment was crossed to compensate. That relies on
@@ -776,8 +979,42 @@ begin
         end if;
     end process;
 
-    -- Second status byte: results of the I2C output drive self test.
-    dbg_status2_int <= '1' & "0000"
+    -- Second status byte: the I2C output drive self test, plus the 48 V
+    -- phantom power READBACK in bits 6:3.
+    --
+    -- Phantom power used to be write-only: the host could command it and had no
+    -- way to ask what the board was actually doing. That leaves two divergences
+    -- nothing could detect, and they push the state opposite ways:
+    --
+    --   FPGA resets, GUI does not. udp_rx_core clears udp_flags to 0x00 on
+    --   sys_rst, which follows pll_locked, so phantom drops to off while the
+    --   checkbox still reads ON.
+    --
+    --   GUI restarts, FPGA does not. Nothing clears udp_flags, so 48 V stays
+    --   LIVE on the XLRs while a freshly started GUI shows off - and because
+    --   every gain command carries the flags byte, the next fader move sends
+    --   flags = 0x00 and switches phantom off without anyone asking it to.
+    --
+    -- All four gating terms are published, not just the pin, because "off" has
+    -- three causes that need different responses:
+    --   bit 6  en_48v as actually driven on the pin
+    --   bit 5  the host asked for it        (udp_flags bit 0)
+    --   bit 4  staged power-up reached 1000 ms
+    --   bit 3  this build permits it at all (C_ENABLE_48V)
+    -- bit 6 is the AND of the other three, so any disagreement names the cause.
+    --
+    -- This is what the FPGA ASSERTS, not what reaches the hydrophones. EN_48V
+    -- is an output and there is no sense line back from the 48 V supply, so a
+    -- dead DC-DC, a blown fuse or an open enable trace still reads here as on.
+    --
+    -- Bits 6:3 were the "0000" pad. i2c_scan.py decodes only 0x80, 0x02 and
+    -- 0x01 out of this byte, and check_sync.py only checks WHICH byte lands in
+    -- which frame, so filling the pad breaks no existing reader.
+    dbg_status2_int <= '1'
+                     & en_48v_drv           -- bit 6: EN_48V pin as driven
+                     & udp_flags_int(0)     -- bit 5: host requested it
+                     & en_48v_int           -- bit 4: staged power-up reached it
+                     & en48_permit          -- bit 3: build permits it
                      & i2c_st_done          -- bit 2: self test ran
                      & i2c_sda_drv_ok       -- bit 1: SDA pulled low successfully
                      & i2c_scl_drv_ok;      -- bit 0: SCL pulled low successfully
@@ -948,7 +1185,46 @@ begin
     -- and the host to have asked for it (udp_flags bit 0). The runtime flag
     -- defaults to 0, so phantom power never comes up on its own after a reset -
     -- it always takes a deliberate command from the GUI.
-    en_48v <= en_48v_int and udp_flags_int(0) when C_ENABLE_48V else '0';
+    en48_permit <= '1' when C_ENABLE_48V else '0';
+
+    -- Phantom watchdog counter. Prescaled to 1 Hz rather than counting cycles:
+    -- 120 s at 50 MHz is 6e9, which needs 33 bits, while 26 + 8 bits of
+    -- prescaler and seconds cost a third of that and are far easier to read in
+    -- a timing report.
+    --
+    -- Runs in rmii_ref_clk, the same domain udp_flags_wr_int and udp_flags_int
+    -- come from, so the kick needs no synchroniser. It runs even when
+    -- C_PHANTOM_WATCHDOG is false - a few hundred idle LUTs - so that enabling
+    -- the feature is a one-constant change with no untested logic behind it.
+    process(rmii_ref_clk)
+    begin
+        if rising_edge(rmii_ref_clk) then
+            if sys_rst = '1' or udp_flags_wr_int = '1' then
+                -- Reset on a flags-carrying packet, NOT on udp_req. A 2-byte
+                -- gain command proves the link is up but says nothing about
+                -- what the host wants phantom power to do, and feeding the
+                -- watchdog from it would let a stray `ctrl.py --set` re-arm
+                -- 48 V minutes after the app that asked for it had died.
+                ph_wd_tick <= (others => '0');
+                ph_wd_secs <= (others => '0');
+                ph_wd_trip <= '0';
+            elsif ph_wd_tick = 49999999 then        -- 1 s at 50 MHz
+                ph_wd_tick <= (others => '0');
+                if ph_wd_secs < C_PHANTOM_TIMEOUT_S then
+                    ph_wd_secs <= ph_wd_secs + 1;
+                else
+                    ph_wd_trip <= '1';              -- holds until the next kick
+                end if;
+            else
+                ph_wd_tick <= ph_wd_tick + 1;
+            end if;
+        end if;
+    end process;
+
+    ph_wd_gate <= '0' when (C_PHANTOM_WATCHDOG and ph_wd_trip = '1') else '1';
+
+    en_48v_drv  <= en_48v_int and udp_flags_int(0) and en48_permit and ph_wd_gate;
+    en_48v      <= en_48v_drv;
     
     -- Output physical clocks to the outside world
     bclk_out     <= lrclk_test when C_BCLK_TEST_SLOW else clk_18m;
@@ -972,7 +1248,39 @@ begin
     end process;
     lrclk_test <= std_logic(lrclk_div(25));   -- 18.432 MHz / 2^26 = 0.27 Hz, 3.6 s period
 
-    lrclk_out    <= lrclk_test when C_LRCLK_TEST_50PCT else lrclk_int;
+    -- Re-time LRCLK onto the phase shifted clock, immediately before the pad.
+    --
+    -- INACTIVE unless C_LRCLK_RETIME is true. With it false this register is
+    -- built and then stripped, because lrclk_pin_r drives nothing - the pad
+    -- takes lrclk_int directly, exactly as 96K_ACT did.
+    --
+    -- ONLY the pin moves. lrclk_int stays in the clk_18m domain and stays wired
+    -- to u_rx_A / u_rx_B as their frame reference, so no new clock crossing is
+    -- created inside the FPGA - which is the whole reason tdm8_master is NOT
+    -- moved into the clk_lr domain instead. clk_lr and clk_18m come from the
+    -- same PLL and derive_pll_clocks puts them in one synchronous group, so
+    -- this register is a normal, fully analysable synchronous path.
+    --
+    -- At 105 deg (11.870 ns) against lrclk_int changing at 20.345 ns:
+    --     setup  11.870 - (20.345 - 40.690) = 32.22 ns
+    --     hold   20.345 - 11.870            =  8.47 ns
+    -- At 225 deg (25.431 ns) the capture edge falls AFTER the data changes:
+    --     setup  25.431 - 20.345            =  5.09 ns
+    --     hold   (20.345 + 40.690) - 25.431 = 35.60 ns
+    -- Both directions are comfortable; the tool will confirm on the real paths.
+    process(clk_lr)
+    begin
+        if rising_edge(clk_lr) then
+            lrclk_pin_r <= lrclk_int;
+        end if;
+    end process;
+
+    -- The test mux stays on the RAW divider, not the re-timed copy: the 0.27 Hz
+    -- continuity square has nothing to do with frame timing and must not be
+    -- delayed by a register the test is not exercising.
+    lrclk_out    <= lrclk_test  when C_LRCLK_TEST_50PCT
+               else lrclk_pin_r when C_LRCLK_RETIME
+               else lrclk_int;
 
     -- ==========================================
     -- TX ARBITER (Collision-Free State Lock)
@@ -1029,6 +1337,7 @@ begin
         c0     => open,         -- 12.288 MHz -> 48 kHz, MCS=001, 32-BCLK slots
         c1     => open,         -- 18.432 MHz -> 96 kHz at 192 BCLK/frame, MCS=010
         c2     => clk_18m,      -- 24.576 MHz -> 96 kHz at 256 BCLK/frame, MCS=011
+        c3     => clk_lr,       -- 24.576 MHz phase shifted, LRCLK pad re-timing
         locked => pll_locked
     );
 
@@ -1167,8 +1476,9 @@ begin
         rst          => sys_rst,
         fpga_mac     => C_FPGA_MAC,
         fpga_ip      => C_FPGA_IP,
-        pc_mac       => C_PC_MAC,
+        pc_mac       => pc_mac_r,
         pc_ip        => C_PC_IP,
+        udp_port     => C_UDP_PORT,
         packet_ready => packet_ready_int,
         fifo_rd_en   => fifo_rd_en_int,
         fifo_rd_data => fifo_rd_data_int,
@@ -1177,11 +1487,64 @@ begin
         tx_ready     => udp_tx_ready_int 
     );
 
+    -- ==========================================
+    -- COMPILE TIME SELF TEST of work.net_pkg.ipv4_checksum
+    --
+    -- There is no simulator licence on this machine, so this is the regression
+    -- test for the checksum arithmetic. Every condition is static, so Analysis
+    -- & Synthesis evaluates it and the build FAILS if any node's checksum comes
+    -- out wrong - which is the only outcome that is safe, because a bad
+    -- checksum produces a board that transmits flawlessly and delivers nothing.
+    --
+    -- Expected values were derived independently (one's complement sum in
+    -- Python) and node 1 additionally reproduces the x"B577" literal that was
+    -- hand-computed in udp_tx_core and proven on hardware.
+    --
+    -- x"01B6" = 438 = 20 byte IP header + 8 byte UDP header + 410 byte payload.
+    -- ==========================================
+    assert ipv4_checksum(x"C0A80165", x"C0A8010A", x"01B6") = x"B577"
+        report "net_pkg.ipv4_checksum WRONG for node 1 (192.168.1.101), expected B577"
+        severity failure;
+    assert ipv4_checksum(x"C0A80166", x"C0A8010A", x"01B6") = x"B576"
+        report "net_pkg.ipv4_checksum WRONG for node 2 (192.168.1.102), expected B576"
+        severity failure;
+    assert ipv4_checksum(x"C0A80167", x"C0A8010A", x"01B6") = x"B575"
+        report "net_pkg.ipv4_checksum WRONG for node 3 (192.168.1.103), expected B575"
+        severity failure;
+    assert ipv4_checksum(x"C0A80168", x"C0A8010A", x"01B6") = x"B574"
+        report "net_pkg.ipv4_checksum WRONG for node 4 (192.168.1.104), expected B574"
+        severity failure;
+
+    -- A carry-fold case the four node addresses above do not exercise: this
+    -- one's inner sum overflows 16 bits more than once.
+    assert ipv4_checksum(x"FFFFFFFF", x"FFFFFFFF", x"FFFF") = x"3AEE"
+        report "net_pkg.ipv4_checksum WRONG on the all-ones carry-fold case"
+        severity failure;
+
+    -- Destination MAC tracking. arp_learn_val strobes only for an ARP request
+    -- that passed every check arp_responder already makes (EtherType, hardware
+    -- and protocol type, opcode, target IP = ours, clean CRC) AND whose sender
+    -- IP is C_PC_IP - so a stray host on the segment cannot redirect the audio
+    -- stream at us. Same clock domain as the responder, so no crossing.
+    process(rmii_ref_clk)
+    begin
+        if rising_edge(rmii_ref_clk) then
+            if sys_rst = '1' then
+                pc_mac_r <= C_PC_MAC;
+            elsif arp_learn_val = '1' then
+                pc_mac_r <= arp_learn_mac;
+            end if;
+        end if;
+    end process;
+
     u_arp : arp_responder port map (
         clk_50m      => rmii_ref_clk,
         rst          => sys_rst,
         fpga_mac     => C_FPGA_MAC,
         fpga_ip      => C_FPGA_IP,
+        pc_ip        => C_PC_IP,
+        learn_mac    => arp_learn_mac,
+        learn_valid  => arp_learn_val,
         rx_data      => rx_data_int,
         rx_valid     => rx_valid_int,
         rx_end       => rx_end_int,
@@ -1320,7 +1683,8 @@ begin
         udp_adc_sel  => udp_adc_sel_int,
         udp_ch_sel   => udp_ch_sel_int,
         udp_gain     => udp_gain_int,
-        udp_flags    => udp_flags_int
+        udp_flags    => udp_flags_int,
+        udp_flags_wr => udp_flags_wr_int
     );
 
 end architecture rtl;

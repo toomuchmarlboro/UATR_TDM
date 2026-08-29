@@ -48,6 +48,29 @@ Faders
     Off at every reset. The FPGA gates phantom power on the build constant
     C_ENABLE_48V, the staged power-up timer, AND this flag - so it never comes
     up on its own after a power cycle.
+
+    This GUI does not own phantom power - the operator app does, and this is a
+    debugger watching alongside it. So the checkbox FOLLOWS the board: it is
+    driven by the readback the FPGA puts in every packet, and it tracks changes
+    the app makes without this GUI being involved.
+
+    That is also why gain commands from here are phantom-neutral. The FPGA
+    parses one command format and every gain write carries the flags byte, so
+    there is no way to change a fader without saying something about phantom
+    power. flags() therefore sends back the board's OWN current state - "keep
+    doing what you are doing" - and only a click on the checkbox sends anything
+    different. Without that, moving a fader here would silently revert a
+    phantom change the app had just made.
+
+    A click is a request, not a result. The checkbox holds the requested value
+    while the command is in flight and waits for the board to confirm it. If the
+    FPGA refuses - C_ENABLE_48V false in the build, or the staged power-up not
+    yet at 1000 ms - it snaps back and names the reason, rather than showing an
+    ON that never happened.
+
+    Asserted, not measured. The FPGA has no sense line back from the 48 V
+    supply, so this reports what it is driving on EN_48V, not what reaches the
+    hydrophones. Treat a dead supply as still possible when it reads ON.
 """
 
 import argparse
@@ -75,6 +98,11 @@ OWNER = ([("U19", "0x11")] * 4 + [("U20", "0x31")] * 4 +
 
 DB_LO   = -100.0
 DECODE_MAX = 120        # packets decoded per redraw; see tick()
+# How long a 48 V toggle may go unconfirmed before the checkbox snaps back to
+# what the board reports. Generous: the command is one UDP datagram and the
+# readback is in the very next packet, so anything past this is a refusal or a
+# lost packet, not latency.
+PH_TIMEOUT_S = 1.5
 
 # Geometry is computed from the live canvas size in Mixer._metrics, not fixed.
 # The meters and the faders under them derive every x from ONE ch_w, and the
@@ -180,7 +208,13 @@ class Mixer(tk.Frame):
         self.rx, self.hold_s, self.ip = rx, hold, ip
         self.period = int(1000 / fps)
 
+        # The checkbox FOLLOWS the board - see _sync_phantom. It starts False
+        # only so the widget has a value before the first packet arrives.
         self.phantom = tk.BooleanVar(value=False)
+        self.ph_actual = None           # last phantom_state dict, None = unknown
+        self.ph_pending = None          # a user toggle awaiting confirmation
+        self.ph_wait = 0.0              # how long it has been awaiting it
+        self._ph_quiet = 0.0            # seconds since the last packet, for staleness
         self.gain_db = [tk.DoubleVar(value=0.0) for _ in range(um.CHANNELS)]
         self.muted = [tk.BooleanVar(value=False) for _ in range(um.CHANNELS)]
 
@@ -371,13 +405,42 @@ class Mixer(tk.Frame):
             command=self.on_phantom, bg=PANEL, fg=AMBER, selectcolor="#3a1d1d",
             activebackground=PANEL, activeforeground=RED,
             font=("Consolas", 10, "bold"), borderwidth=0, highlightthickness=0)
-        self.ph.pack(side="left", padx=18)
+        self.ph.pack(side="left", padx=(18, 4))
+        # What the board reports it is driving, from the readback in every
+        # packet. Normally it agrees with the checkbox; it turns red while a
+        # toggle is still in flight or has not taken effect.
+        self.ph_lab = tk.Label(self.bar, text="board: ?", bg=PANEL, fg=DIM,
+                               font=("Consolas", 9))
+        self.ph_lab.pack(side="left", padx=(0, 14))
         self.status = tk.Label(self.bar, text="ready", bg=PANEL, fg=DIM,
                                font=("Consolas", 8), anchor="e")
         self.status.pack(side="right", padx=10)
 
     # ----------------------------------------------------------------- logic
     def flags(self):
+        """The flags byte to attach to an outgoing command.
+
+        This is the BOARD's current phantom state, not the checkbox - and that
+        difference is the whole point of the method.
+
+        This GUI is not the only thing driving the board. The operator app owns
+        phantom power; this is a debugger watching alongside it. There is no
+        flags-only packet - the FPGA parses one command format and every gain
+        write carries the flags byte - so if this returned the checkbox, then
+        any fader moved here would re-assert whatever phantom state this GUI
+        last knew about and silently revert a change the app had made.
+
+        Returning the readback makes a gain command phantom-NEUTRAL: it tells
+        the board to keep doing what it is already doing. Only on_phantom, where
+        the user actually clicked, sends a value that differs.
+
+        Falls back to the checkbox when the board has not been heard from, which
+        is the old single-controller behaviour and the best available guess.
+        """
+        if self.ph_pending is not None:
+            return 0x01 if self.ph_pending else 0x00
+        if self.ph_actual is not None:
+            return 0x01 if self.ph_actual["on"] else 0x00
         return 0x01 if self.phantom.get() else 0x00
 
     def send(self, ch):
@@ -402,10 +465,76 @@ class Mixer(tk.Frame):
         self.send(ch)
 
     def on_phantom(self):
+        """The ONE place this GUI deliberately changes phantom power.
+
+        Everything else it sends is phantom-neutral - see flags(). A click here
+        raises ph_pending, which flags() then sends in place of the readback
+        until the board is seen to agree.
+        """
         on = self.phantom.get()
+        self.ph_pending = on
+        self.ph_wait = 0.0
         self.ph.config(fg=RED if on else AMBER)
         self.send(0)            # any command carries the flags byte
-        self.status.config(text="48 V %s" % ("ENABLED" if on else "disabled"),
+        self.status.config(text="48 V %s requested" % ("ON" if on else "off"),
+                           fg=RED if on else DIM)
+
+    def _sync_phantom(self, pkt, dt):
+        """Mirror the checkbox to whatever the board reports it is driving.
+
+        This GUI FOLLOWS the board; it does not hold an opinion of its own. The
+        operator app owns phantom power - it forces 48 V off at every start and
+        reload, and from then on only a deliberate user toggle turns it on - so
+        the truth lives in the FPGA, and this display exists to show it. An
+        earlier version seeded the checkbox once at startup and then let the two
+        drift apart, which was right when this GUI was the only controller and
+        wrong now: the app can change phantom at any moment, and a debugger
+        showing a stale toggle is worse than showing nothing.
+
+        The one exception is a click the user just made. ph_pending holds it,
+        the display stays on the requested value while the command is in flight,
+        and the board's own readback is what confirms it. That is deliberately
+        not a local assumption of success - if the FPGA refuses (C_ENABLE_48V
+        false in the build, or the staged power-up not yet at 1000 ms) the
+        checkbox snaps back and says so, rather than showing an ON that never
+        happened.
+        """
+        st = ctrl.phantom_state(pkt)
+        if st is None:
+            return
+        self.ph_actual = st
+
+        if self.ph_pending is not None:
+            if st["on"] == self.ph_pending:
+                self.ph_pending = None          # the board agrees; done
+            else:
+                self.ph_wait += dt
+                if self.ph_wait < PH_TIMEOUT_S:
+                    self.ph_lab.config(
+                        text="board: %s  (waiting)"
+                             % ("ON" if st["on"] else "off"), fg=AMBER)
+                    return
+                # It has had long enough. Name the gate holding it off - "build"
+                # and "power-up" are refusals the user cannot fix from here, and
+                # saying which one beats a bare "it did not work".
+                why = ("C_ENABLE_48V false in this build" if not st["permitted"]
+                       else "staged power-up not at 1000 ms yet"
+                       if not st["staged"] else
+                       "the FPGA did not receive it" if not st["requested"]
+                       else "watchdog has tripped - the FPGA is overriding")
+                self.ph_pending = None
+                self.phantom.set(st["on"])
+                self.ph.config(fg=RED if st["on"] else AMBER)
+                self.status.config(text="48 V refused: %s" % why, fg=RED)
+
+        on = st["on"]
+        if self.phantom.get() != on:
+            # Display only. This writes the BooleanVar, not the hardware: Tk
+            # does not fire the widget's command on a programmatic set, so
+            # following the board here can never send a packet.
+            self.phantom.set(on)
+            self.ph.config(fg=RED if on else AMBER)
+        self.ph_lab.config(text="board: %s" % ("ON" if on else "off"),
                            fg=RED if on else DIM)
 
     def set_all(self, db):
@@ -428,6 +557,21 @@ class Mixer(tk.Frame):
             self._job = self.after(self.period, self.tick)
             return
         raw, npk, lost = self.rx.take()
+        # 48 V readback, from the newest packet in hand. One packet per tick is
+        # enough - the state changes on human timescales - and it must be read
+        # before the stride below, which is free to drop the newest one.
+        if raw:
+            self._ph_quiet = 0.0
+            self._sync_phantom(raw[-1], self.period / 1000.0)
+        else:
+            self._ph_quiet += self.period / 1000.0
+            if self._ph_quiet > 2.0 and self.ph_actual is not None:
+                # Stop showing a reading the board is no longer confirming. The
+                # pin has not necessarily changed - the link has - but an
+                # indicator that keeps asserting "off" for an unplugged board is
+                # exactly the kind of thing that gets trusted around live 48 V.
+                self.ph_actual = None
+                self.ph_lab.config(text="board: ? (no packets)", fg=AMBER)
         # Decode a bounded, evenly-spread subset rather than everything. Full
         # decode runs at ~9,000 pkt/s against a 12,000 pkt/s stream, so the GUI
         # would fall further behind every frame and channels near the threshold

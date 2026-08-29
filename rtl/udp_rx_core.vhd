@@ -24,7 +24,14 @@ entity udp_rx_core is
         -- Optional 3rd payload byte. bit 0 = 48V phantom enable. A 2-byte
         -- packet still works and simply leaves the flags unchanged, so the
         -- original gain-only protocol is preserved.
-        udp_flags    : out std_logic_vector(7 downto 0)
+        udp_flags    : out std_logic_vector(7 downto 0);
+        -- One-cycle pulse each time a packet actually CARRIED a flags byte and
+        -- udp_flags was written from it. Not the same as udp_req: a 2-byte
+        -- gain-only packet raises udp_req and never pulses this. The phantom
+        -- watchdog in top_system uses it, and the distinction is the point -
+        -- the watchdog must be fed by a host that is still stating what it
+        -- wants phantom power to do, not merely by one still sending traffic.
+        udp_flags_wr : out std_logic
     );
 end entity udp_rx_core;
 
@@ -57,11 +64,13 @@ begin
                 udp_ch_sel   <= "00";
                 udp_gain     <= x"A0"; -- Default gain
                 udp_flags    <= x"00"; -- 48V off until commanded
+                udp_flags_wr <= '0';
                 have_flags   <= '0';
             else
                 case state is
                     
                     when IDLE =>
+                        udp_flags_wr <= '0';    -- one cycle only
                         byte_cnt <= 0;
                         is_valid_pkt <= '1'; -- Assume valid until a header check fails
                         if rx_valid = '1' then
@@ -152,8 +161,20 @@ begin
                         udp_ch_sel  <= int_ch_sel;
                         udp_gain    <= int_gain;
                         if have_flags = '1' then
-                            udp_flags <= int_flags;
+                            udp_flags    <= int_flags;
+                            udp_flags_wr <= '1';
                         end if;
+                        -- Clear it. have_flags used to latch for the lifetime
+                        -- of the design: once ANY 3-byte packet had arrived,
+                        -- every later 2-byte packet re-applied that stale
+                        -- int_flags, which contradicts the comment above about
+                        -- a 2-byte payload leaving the flag state alone. It
+                        -- made no behavioural difference - int_flags and
+                        -- udp_flags were equal by then, so the rewrite was a
+                        -- no-op - but it made "this packet carried flags"
+                        -- unusable as a signal, which the phantom watchdog
+                        -- needs it to be.
+                        have_flags  <= '0';
                         udp_req     <= '1';
                         state       <= IDLE;
 

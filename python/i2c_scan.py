@@ -156,6 +156,25 @@ def main():
               % ("yes" if selftest & 0x01 else "*** NO ***"))
         print("    FPGA drives SDA low   %s"
               % ("yes" if selftest & 0x02 else "*** NO ***"))
+        # Bits 6:3 of the same byte are the 48 V phantom readback. It has
+        # nothing to do with I2C, but it rides in the byte this tool already
+        # decodes, and "is 48 V on right now" is worth being able to answer
+        # without opening the GUI. Asserted, not measured: EN_48V is an FPGA
+        # output with no sense line back, so a dead supply still reads on.
+        gates = (("host requested it",         0x20),
+                 ("staged power-up reached",   0x10),
+                 ("build permits (C_ENABLE_48V)", 0x08))
+        on = bool(selftest & 0x40)
+        print("    48 V phantom          %s" % ("*** ON ***" if on else "off"))
+        if not on:
+            held = [name for name, bit in gates if not selftest & bit]
+            for name in held:
+                print("      held off by:        %s = no" % name)
+            if not held:
+                # Every gate set and the pin still low is the watchdog, and
+                # nothing else can produce that combination.
+                print("      held off by:        the WATCHDOG - no flags packet")
+                print("                          within C_PHANTOM_TIMEOUT_S")
     if status & 0x80:
         print("    line held low now     %s%s%s"
               % ("yes" if status & 0x02 else "no",

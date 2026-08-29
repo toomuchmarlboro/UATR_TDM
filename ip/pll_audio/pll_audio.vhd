@@ -40,6 +40,30 @@ USE ieee.std_logic_1164.all;
 LIBRARY altera_mf;
 USE altera_mf.all;
 
+-- ############################################################################
+-- HAND EDITED 2026-08-21 - c3 WAS ADDED WITHOUT THE MEGAWIZARD.
+--
+-- c3 is a phase shifted copy of c2, used only to re-time lrclk_out at the pad.
+-- See docs/LRCLK_PHASE_SHIFT.md and C_LRCLK_PHASE_PS in rtl/top_system.vhd.
+--
+-- The GUI state at the bottom of this file ("Retrieval info") was NOT updated,
+-- because it is already inconsistent with the generated code - it records
+-- CLK2_MULTIPLY_BY as 1 where the generic map below says 1536 - and inventing
+-- matching entries by hand would make that worse rather than better.
+--
+-- CONSEQUENCE: if you ever open this IP in the MegaWizard and click Finish, it
+-- will regenerate from that stale state and DROP c3. That fails loudly, not
+-- silently - top_system's component declaration names c3, so the build stops
+-- with a port mismatch on u_pll rather than quietly producing a wrong image.
+-- If it happens, re-apply the four clk3_* generics, port_clk3 => "PORT_USED",
+-- the c3 port, and the sub_wire8 assignment.
+--
+-- THE PHASE IS ONE STRING: clk3_phase_shift, in the generic map below, in ps.
+--     11870 = 105 deg    setup-limited      -> C_BIT_ADJ = -2
+--     25431 = 225 deg    hold-limited       -> C_BIT_ADJ = -1
+--     20345 = 180 deg    control build      -> C_BIT_ADJ = -2
+-- ############################################################################
+
 ENTITY pll_audio IS
 	PORT
 	(
@@ -48,7 +72,8 @@ ENTITY pll_audio IS
 		c0		: OUT STD_LOGIC ;
 		c1		: OUT STD_LOGIC ;
 		c2		: OUT STD_LOGIC ;
-		locked		: OUT STD_LOGIC 
+		c3		: OUT STD_LOGIC ;
+		locked		: OUT STD_LOGIC
 	);
 END pll_audio;
 
@@ -64,6 +89,7 @@ ARCHITECTURE SYN OF pll_audio IS
 	SIGNAL sub_wire5	: STD_LOGIC ;
 	SIGNAL sub_wire6	: STD_LOGIC ;
 	SIGNAL sub_wire7	: STD_LOGIC ;
+	SIGNAL sub_wire8	: STD_LOGIC ;	-- c3, hand added
 
 
 
@@ -82,6 +108,10 @@ ARCHITECTURE SYN OF pll_audio IS
 		clk2_duty_cycle		: NATURAL;
 		clk2_multiply_by		: NATURAL;
 		clk2_phase_shift		: STRING;
+		clk3_divide_by		: NATURAL;
+		clk3_duty_cycle		: NATURAL;
+		clk3_multiply_by		: NATURAL;
+		clk3_phase_shift		: STRING;
 		compensate_clock		: STRING;
 		inclk0_input_frequency		: NATURAL;
 		intended_device_family		: STRING;
@@ -146,12 +176,14 @@ BEGIN
 	sub_wire2    <= To_stdlogicvector(sub_wire2_bv);
 	sub_wire0    <= inclk0;
 	sub_wire1    <= sub_wire2(0 DOWNTO 0) & sub_wire0;
+	sub_wire8    <= sub_wire3(3);
 	sub_wire6    <= sub_wire3(2);
 	sub_wire5    <= sub_wire3(1);
 	sub_wire4    <= sub_wire3(0);
 	c0    <= sub_wire4;
 	c1    <= sub_wire5;
 	c2    <= sub_wire6;
+	c3    <= sub_wire8;
 	locked    <= sub_wire7;
 
 	altpll_component : altpll
@@ -169,6 +201,13 @@ BEGIN
 		clk2_duty_cycle => 50,
 		clk2_multiply_by => 1536,
 		clk2_phase_shift => "0",
+		-- c3: identical ratio to c2, so the two share a counter setting and are
+		-- frequency-identical by construction and can never drift. Only the VCO
+		-- phase tap differs. THIS is the phase knob - see the header.
+		clk3_divide_by => 3125,
+		clk3_duty_cycle => 50,
+		clk3_multiply_by => 1536,
+		clk3_phase_shift => "25431",
 		compensate_clock => "CLK2",
 		inclk0_input_frequency => 20000,
 		intended_device_family => "Cyclone IV E",
@@ -204,7 +243,7 @@ BEGIN
 		port_clk0 => "PORT_USED",
 		port_clk1 => "PORT_USED",
 		port_clk2 => "PORT_USED",
-		port_clk3 => "PORT_UNUSED",
+		port_clk3 => "PORT_USED",
 		port_clk4 => "PORT_UNUSED",
 		port_clk5 => "PORT_UNUSED",
 		port_clkena0 => "PORT_UNUSED",

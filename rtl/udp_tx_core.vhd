@@ -2,16 +2,25 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
+use work.net_pkg.all;
+
 entity udp_tx_core is
     port (
         clk_50m      : in  std_logic;
         rst          : in  std_logic;
 
-        -- IP Configuration (Hardcoded per FPGA node)
+        -- IP Configuration. All driven from C_NODE at the top level.
         fpga_mac     : in  std_logic_vector(47 downto 0);
         fpga_ip      : in  std_logic_vector(31 downto 0);
         pc_mac       : in  std_logic_vector(47 downto 0);
         pc_ip        : in  std_logic_vector(31 downto 0);
+
+        -- Used for BOTH source and destination UDP port. One port per board so
+        -- the host can open one socket per board: udp_monitor.py calls recv(),
+        -- not recvfrom(), so four boards sharing a port would interleave four
+        -- sequence-number streams into one socket and loss_report would show
+        -- enormous losses that are not real.
+        udp_port     : in  std_logic_vector(15 downto 0);
 
         -- Handshake from 18MHz Domain (packet_formatter)
         packet_ready : in  std_logic;
@@ -51,14 +60,31 @@ architecture rtl of udp_tx_core is
     signal tx_req    : std_logic := '0';
     signal next_byte : std_logic_vector(7 downto 0);
 
-    -- IPv4 header checksum. Every field this covers is a compile-time constant
-    -- (the IPs are hardcoded and the length is fixed at 438), so the checksum is
-    -- constant too. One's complement sum over:
-    --   4500 01B6 0000 4000 4011 0000 C0A8 0165 C0A8 010A  ->  0xB577
-    -- Recompute this if any of the IPs or the payload length ever change.
-    constant IP_CHECKSUM : std_logic_vector(15 downto 0) := x"B577";
+    -- IPv4 header total length, and the UDP length that shadows it.
+    constant IP_TOTAL_LEN : integer := 20 + 8 + PAYLOAD_BYTES;  -- 438
+    constant IP_LEN_V  : std_logic_vector(15 downto 0) :=
+        std_logic_vector(to_unsigned(IP_TOTAL_LEN, 16));
+    constant UDP_LEN_V : std_logic_vector(15 downto 0) :=
+        std_logic_vector(to_unsigned(8 + PAYLOAD_BYTES, 16));
+
+    -- IPv4 header checksum, COMPUTED (work.net_pkg) rather than hand-entered.
+    --
+    -- This was the literal x"B577", correct for 192.168.1.101 -> 192.168.1.10
+    -- and for nothing else. That is a trap as soon as there is more than one
+    -- node: change fpga_ip and forget the checksum, and the board transmits
+    -- perfectly, the frames appear in Wireshark, and the host kernel discards
+    -- every one of them at the IP layer before any socket sees them. You get a
+    -- board that looks alive on the wire and delivers nothing.
+    --
+    -- fpga_ip and pc_ip are driven by constants at the top level, so synthesis
+    -- constant-folds all of this back down to two literal bytes. It costs
+    -- nothing and it can never go stale. top_system asserts the same function
+    -- against known-good values for all four nodes at elaboration.
+    signal ip_checksum : std_logic_vector(15 downto 0);
 
 begin
+
+    ip_checksum <= ipv4_checksum(fpga_ip, pc_ip, IP_LEN_V);
 
     -- Clock Domain Crossing: Safely detect the toggle from the 18MHz clock
     process(clk_50m)
@@ -82,7 +108,8 @@ begin
     -- Combinational lookup of the byte at position byte_cnt. Anything at or past
     -- HDR_BYTES is payload and comes straight off the FIFO output register.
     -- ==========================================
-    process(byte_cnt, pc_mac, fpga_mac, fpga_ip, pc_ip, fifo_rd_data)
+    process(byte_cnt, pc_mac, fpga_mac, fpga_ip, pc_ip,
+            udp_port, ip_checksum, fifo_rd_data)
     begin
         case byte_cnt is
             -- ETHERNET HEADER
@@ -104,16 +131,16 @@ begin
             -- IPv4 HEADER
             when 14 => next_byte <= x"45";                  -- Version / IHL
             when 15 => next_byte <= x"00";                  -- DSCP / ECN
-            when 16 => next_byte <= x"01";                  -- Total Length MSB (438 = x01B6)
-            when 17 => next_byte <= x"B6";                  -- Total Length LSB
+            when 16 => next_byte <= IP_LEN_V(15 downto 8);  -- Total Length MSB (438 = x01B6)
+            when 17 => next_byte <= IP_LEN_V(7 downto 0);   -- Total Length LSB
             when 18 => next_byte <= x"00";                  -- Identification
             when 19 => next_byte <= x"00";
             when 20 => next_byte <= x"40";                  -- Flags (Don't Fragment)
             when 21 => next_byte <= x"00";                  -- Fragment Offset
             when 22 => next_byte <= x"40";                  -- TTL (64)
             when 23 => next_byte <= x"11";                  -- Protocol (UDP = 17)
-            when 24 => next_byte <= IP_CHECKSUM(15 downto 8);
-            when 25 => next_byte <= IP_CHECKSUM(7 downto 0);
+            when 24 => next_byte <= ip_checksum(15 downto 8);
+            when 25 => next_byte <= ip_checksum(7 downto 0);
             when 26 => next_byte <= fpga_ip(31 downto 24);  -- Source IP
             when 27 => next_byte <= fpga_ip(23 downto 16);
             when 28 => next_byte <= fpga_ip(15 downto 8);
@@ -124,12 +151,12 @@ begin
             when 33 => next_byte <= pc_ip(7 downto 0);
 
             -- UDP HEADER
-            when 34 => next_byte <= x"13";                  -- Source Port MSB (5005 = x138D)
-            when 35 => next_byte <= x"8D";                  -- Source Port LSB
-            when 36 => next_byte <= x"13";                  -- Dest Port MSB (5005)
-            when 37 => next_byte <= x"8D";                  -- Dest Port LSB
-            when 38 => next_byte <= x"01";                  -- Length MSB (8 + 410 = 418 = x01A2)
-            when 39 => next_byte <= x"A2";                  -- Length LSB
+            when 34 => next_byte <= udp_port(15 downto 8);  -- Source Port MSB (node 1 = 5005 = x138D)
+            when 35 => next_byte <= udp_port(7 downto 0);   -- Source Port LSB
+            when 36 => next_byte <= udp_port(15 downto 8);  -- Dest Port MSB
+            when 37 => next_byte <= udp_port(7 downto 0);   -- Dest Port LSB
+            when 38 => next_byte <= UDP_LEN_V(15 downto 8); -- Length MSB (8 + 410 = 418 = x01A2)
+            when 39 => next_byte <= UDP_LEN_V(7 downto 0);  -- Length LSB
             when 40 => next_byte <= x"00";                  -- Checksum (0x0000 = unused, legal for IPv4/UDP)
             when 41 => next_byte <= x"00";
 

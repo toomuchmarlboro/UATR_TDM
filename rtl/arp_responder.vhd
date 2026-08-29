@@ -8,7 +8,17 @@ entity arp_responder is
         rst          : in  std_logic;
         fpga_mac     : in  std_logic_vector(47 downto 0);
         fpga_ip      : in  std_logic_vector(31 downto 0);
-        
+
+        -- ARP learning, for udp_tx_core's destination MAC.
+        --
+        -- The sender MAC and sender IP of every request were already being
+        -- captured for the reply path; this just carries them out. learn_valid
+        -- is a one clock strobe, asserted with send_reply and additionally
+        -- gated on the sender being pc_ip.
+        pc_ip        : in  std_logic_vector(31 downto 0);
+        learn_mac    : out std_logic_vector(47 downto 0);
+        learn_valid  : out std_logic;
+
         -- MAC RX Interface
         rx_data      : in  std_logic_vector(7 downto 0);
         rx_valid     : in  std_logic;
@@ -51,6 +61,9 @@ architecture rtl of arp_responder is
 
 begin
 
+    -- Held continuously; only meaningful in the cycle learn_valid strobes.
+    learn_mac <= req_mac;
+
     -- ==========================================
     -- RX PROCESS: Parse incoming packets
     -- ==========================================
@@ -62,8 +75,10 @@ begin
                 rx_byte_cnt <= 0;
                 is_arp_req  <= '0';
                 send_reply  <= '0';
+                learn_valid <= '0';
             else
-                send_reply <= '0'; -- Default strobe
+                send_reply  <= '0'; -- Default strobe
+                learn_valid <= '0'; -- Default strobe
                 
                 case rx_state is
                     when RX_IDLE =>
@@ -133,6 +148,14 @@ begin
                             -- Only reply if it was a valid ARP request AND the CRC was clean
                             if is_arp_req = '1' and rx_error = '0' then
                                 send_reply <= '1';
+
+                                -- Same gate, plus "the sender really is the
+                                -- capture host". req_mac has been stable since
+                                -- byte 11 and req_ip since byte 31, both long
+                                -- before this state is reached.
+                                if req_ip = pc_ip then
+                                    learn_valid <= '1';
+                                end if;
                             end if;
                         end if;
                         

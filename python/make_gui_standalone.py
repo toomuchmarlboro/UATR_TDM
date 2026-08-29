@@ -220,7 +220,8 @@ def build():
     um_names = ["MAGIC", "HDR_LEN", "FRAME_LEN", "FRAMES_PKT", "PAYLOAD_LEN",
                 "CHANNELS", "SAMPLE_BYTES", "FULL_SCALE", "SAMPLE_RATE"]
     ct_names = ["FPGA_IP", "FPGA_PORT", "STREAM_PORT", "MUTE", "ZERO_DB",
-                "gain_byte", "gain_db", "send_gain", "send_flags", "decode"]
+                "PHANTOM_FRAME", "gain_byte", "gain_db", "send_gain",
+                "send_flags", "phantom_state", "phantom_reason", "decode"]
     gd_names = ["TALKER", "N_RAW", "DEFAULT_PORT", "BUOYS", "ACTIVE_BUOY",
                 "DEFAULT_HOST", "FIELDS", "DIO_OPEN", "DIO_CLOSE", "I_LEAK",
                 "AHRS_IDX", "PLAUSIBLE", "implausible", "checksum", "build",
@@ -246,8 +247,10 @@ def build():
         "         FULL_SCALE=FULL_SCALE, SAMPLE_RATE=SAMPLE_RATE)\n"
         "ctrl = _NS(FPGA_IP=FPGA_IP, FPGA_PORT=FPGA_PORT,\n"
         "           STREAM_PORT=STREAM_PORT, MUTE=MUTE, ZERO_DB=ZERO_DB,\n"
-        "           gain_byte=gain_byte, gain_db=gain_db, send_gain=send_gain,\n"
-        "           send_flags=send_flags, decode=decode)\n"
+        "           PHANTOM_FRAME=PHANTOM_FRAME, gain_byte=gain_byte,\n"
+        "           gain_db=gain_db, send_gain=send_gain,\n"
+        "           send_flags=send_flags, phantom_state=phantom_state,\n"
+        "           phantom_reason=phantom_reason, decode=decode)\n"
         "gdat2 = _NS(TALKER=TALKER, N_RAW=N_RAW, BUOYS=BUOYS,\n"
         "            ACTIVE_BUOY=ACTIVE_BUOY, DEFAULT_HOST=DEFAULT_HOST,\n"
         "            DEFAULT_PORT=DEFAULT_PORT, FIELDS=FIELDS,\n"

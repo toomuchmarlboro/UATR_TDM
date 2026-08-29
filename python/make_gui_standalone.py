@@ -152,9 +152,16 @@ HEADER = '''#!/usr/bin/env python3
 """
 mixer_gui_standalone.py - the UATR_TDM mixer + telemetry GUI in ONE file.
 
-    python mixer_gui_standalone.py                  # 16 meters + faders
+One tab per AFE (four boards, 64 channels) plus the aux_vcu telemetry tab.
+
+    python mixer_gui_standalone.py                  # all four AFEs
+    python mixer_gui_standalone.py --nodes 1,3      # only the boards you have
     python mixer_gui_standalone.py --gdat-connect   # also dial the aux_vcu
     python mixer_gui_standalone.py --gdat-buoy 3 --gdat-connect
+
+Each AFE tab has its own socket on that board's stream port (5005-5008) and its
+own control IP (192.168.1.101-.104). Only the visible tab decodes; background
+tabs keep draining their sockets so the loss counters stay honest.
 
 No imports from any other file in its directory - copy this one file wherever
 you like. It does use numpy and tkinter: numpy is an installed library (the same
@@ -220,8 +227,9 @@ def build():
     um_names = ["MAGIC", "HDR_LEN", "FRAME_LEN", "FRAMES_PKT", "PAYLOAD_LEN",
                 "CHANNELS", "SAMPLE_BYTES", "FULL_SCALE", "SAMPLE_RATE"]
     ct_names = ["FPGA_IP", "FPGA_PORT", "STREAM_PORT", "MUTE", "ZERO_DB",
-                "PHANTOM_FRAME", "gain_byte", "gain_db", "send_gain",
-                "send_flags", "phantom_state", "phantom_reason", "decode"]
+                "PHANTOM_FRAME", "node_ip", "node_stream_port", "gain_byte",
+                "gain_db", "send_gain", "send_flags", "phantom_state",
+                "phantom_reason", "decode"]
     gd_names = ["TALKER", "N_RAW", "DEFAULT_PORT", "BUOYS", "ACTIVE_BUOY",
                 "DEFAULT_HOST", "FIELDS", "DIO_OPEN", "DIO_CLOSE", "I_LEAK",
                 "AHRS_IDX", "PLAUSIBLE", "implausible", "checksum", "build",
@@ -250,7 +258,8 @@ def build():
         "           PHANTOM_FRAME=PHANTOM_FRAME, gain_byte=gain_byte,\n"
         "           gain_db=gain_db, send_gain=send_gain,\n"
         "           send_flags=send_flags, phantom_state=phantom_state,\n"
-        "           phantom_reason=phantom_reason, decode=decode)\n"
+        "           phantom_reason=phantom_reason, decode=decode,\n"
+        "           node_ip=node_ip, node_stream_port=node_stream_port)\n"
         "gdat2 = _NS(TALKER=TALKER, N_RAW=N_RAW, BUOYS=BUOYS,\n"
         "            ACTIVE_BUOY=ACTIVE_BUOY, DEFAULT_HOST=DEFAULT_HOST,\n"
         "            DEFAULT_PORT=DEFAULT_PORT, FIELDS=FIELDS,\n"

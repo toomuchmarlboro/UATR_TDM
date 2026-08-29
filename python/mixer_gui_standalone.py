@@ -2,9 +2,16 @@
 """
 mixer_gui_standalone.py - the UATR_TDM mixer + telemetry GUI in ONE file.
 
-    python mixer_gui_standalone.py                  # 16 meters + faders
+One tab per AFE (four boards, 64 channels) plus the aux_vcu telemetry tab.
+
+    python mixer_gui_standalone.py                  # all four AFEs
+    python mixer_gui_standalone.py --nodes 1,3      # only the boards you have
     python mixer_gui_standalone.py --gdat-connect   # also dial the aux_vcu
     python mixer_gui_standalone.py --gdat-buoy 3 --gdat-connect
+
+Each AFE tab has its own socket on that board's stream port (5005-5008) and its
+own control IP (192.168.1.101-.104). Only the visible tab decodes; background
+tabs keep draining their sockets so the loss counters stay honest.
 
 No imports from any other file in its directory - copy this one file wherever
 you like. It does use numpy and tkinter: numpy is an installed library (the same
@@ -94,6 +101,20 @@ MUTE = 0xFF
 ZERO_DB = 0xA0
 
 PHANTOM_FRAME = 1
+
+def node_ip(n):
+    """Node number -> board IP. Mirrors C_NODE in top_system.vhd."""
+    return "192.168.1.%d" % (100 + int(n))
+
+def node_stream_port(n):
+    """Node number -> the port that board's audio arrives on.
+
+    Each board transmits on its own port so the host can open one socket per
+    board. udp_monitor.capture() uses recv(), not recvfrom(), so boards sharing
+    a port would interleave their sequence numbers into a single socket and the
+    loss report would be meaningless.
+    """
+    return 5004 + int(n)
 
 def gain_byte(db):
     """dB -> register value. +60 dB at 0x00, -0.375 dB per step."""
@@ -770,7 +791,8 @@ ctrl = _NS(FPGA_IP=FPGA_IP, FPGA_PORT=FPGA_PORT,
            PHANTOM_FRAME=PHANTOM_FRAME, gain_byte=gain_byte,
            gain_db=gain_db, send_gain=send_gain,
            send_flags=send_flags, phantom_state=phantom_state,
-           phantom_reason=phantom_reason, decode=decode)
+           phantom_reason=phantom_reason, decode=decode,
+           node_ip=node_ip, node_stream_port=node_stream_port)
 gdat2 = _NS(TALKER=TALKER, N_RAW=N_RAW, BUOYS=BUOYS,
             ACTIVE_BUOY=ACTIVE_BUOY, DEFAULT_HOST=DEFAULT_HOST,
             DEFAULT_PORT=DEFAULT_PORT, FIELDS=FIELDS,
@@ -894,9 +916,14 @@ class Mixer(tk.Frame):
     below is unchanged apart from packing into self instead of into a root.
     """
 
-    def __init__(self, master, rx, fps, hold, ip):
+    def __init__(self, master, rx, fps, hold, ip, label=""):
         super().__init__(master, bg=BG)
         self.rx, self.hold_s, self.ip = rx, hold, ip
+        # Shown in the header. With four of these in one window, every panel
+        # looks identical, and a fader moved on the wrong board is silent and
+        # unrecoverable - so which board this is has to be on screen, not
+        # inferred from which tab you think you clicked.
+        self.label = label
         self.period = int(1000 / fps)
 
         # The checkbox FOLLOWS the board - see _sync_phantom. It starts False
@@ -1248,6 +1275,24 @@ class Mixer(tk.Frame):
             self._job = self.after(self.period, self.tick)
             return
         raw, npk, lost = self.rx.take()
+
+        # HIDDEN TAB: drain and drop, do not decode.
+        #
+        # This is what makes four boards in one window affordable. Decoding is
+        # the expensive half - a full decode runs at roughly 9,000 pkt/s against
+        # a 12,000 pkt/s stream from ONE board - so four tabs all decoding would
+        # be four times over budget and every meter would lag and flicker.
+        # Only the tab you are looking at does that work.
+        #
+        # take() is still called, not skipped: it swaps the buffer out under the
+        # lock, so the receive thread's backlog stays bounded and the packet and
+        # loss counters keep advancing while the tab is in the background. The
+        # thread itself never stops - the socket must keep being drained or the
+        # kernel buffer overflows and the loss figures become fiction.
+        if not self.winfo_viewable():
+            self._job = self.after(self.period, self.tick)
+            return
+
         # 48 V readback, from the newest packet in hand. One packet per tick is
         # enough - the state changes on human timescales - and it must be read
         # before the stride below, which is free to drop the newest one.
@@ -1280,8 +1325,8 @@ class Mixer(tk.Frame):
             rms = pk = np.zeros(um.CHANNELS)
 
         pps = npk * (1000.0 / self.period)
-        self.cv.itemconfigure(self.hdr, text="%d Hz   %5.0f pkt/s   lost %d"
-                              % (um.SAMPLE_RATE, pps, lost))
+        self.cv.itemconfigure(self.hdr, text="%s%d Hz   %5.0f pkt/s   lost %d"
+                              % (self.label, um.SAMPLE_RATE, pps, lost))
         self.cv.itemconfigure(self.sub, text="bar = RMS   white = held peak   "
                                              "faders write ADAU1978 reg 0x0A-0x0D over I2C")
 
@@ -1659,11 +1704,27 @@ class App(tk.Tk):
         nb = self.nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
 
-        self.rx = Receiver(a.port, a.bind)
-        self.rx.start()
-        self.mixer = Mixer(nb, self.rx, a.fps, a.peak_hold, a.ip)
+        # One tab per AFE. Each board streams on its OWN UDP port, so each tab
+        # gets its own socket and its own receive thread - they never share a
+        # port and cannot interleave. That separation is not a style choice: the
+        # receive loop uses recv(), which discards the sender, so two boards on
+        # one port would merge their sequence numbers into a single stream and
+        # the loss figure would be meaningless for both.
+        #
+        # --port / --ip still override, for pointing one window at one board.
+        self.rxs, self.mixers = [], []
+        for n in a.nodes:
+            port = a.port if a.port else ctrl.node_stream_port(n)
+            ip   = a.ip   if a.ip   else ctrl.node_ip(n)
+            rx = Receiver(port, a.bind)
+            rx.start()
+            mx = Mixer(nb, rx, a.fps, a.peak_hold, ip,
+                       label="AFE %d  %s:%d   " % (n, ip, port))
+            self.rxs.append(rx)
+            self.mixers.append(mx)
+            nb.add(mx, text="AFE %d" % n)
+
         self.tel = Telemetry(nb, a.gdat_mode, a.gdat_host, a.gdat_port)
-        nb.add(self.mixer, text="Mixer")
         nb.add(self.tel, text="Telemetry")
 
         if a.gdat_connect:
@@ -1694,18 +1755,27 @@ class App(tk.Tk):
         return "break"
 
     def close(self):
-        self.mixer.close()
+        for mx in self.mixers:
+            mx.close()
         self.tel.close()
         self.destroy()
 
 
 def main():
     ap = argparse.ArgumentParser(description="UATR control station GUI")
-    ap.add_argument("--port", type=int, default=5005)
+    ap.add_argument("--nodes", default="1,2,3,4",
+                    help="which AFEs to open tabs for, e.g. --nodes 1,3. "
+                         "Each gets its own IP and stream port from ctrl.py, "
+                         "mirroring C_NODE in top_system.vhd.")
+    ap.add_argument("--port", type=int, default=None,
+                    help="override the stream port for ALL tabs. Only useful "
+                         "with a single node; two tabs on one port would fight "
+                         "over the socket and one would receive nothing.")
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--fps", type=float, default=20.0)
     ap.add_argument("--peak-hold", type=float, default=2.0)
-    ap.add_argument("--ip", default=ctrl.FPGA_IP, help="board IP for control")
+    ap.add_argument("--ip", default=None,
+                    help="override the control IP for ALL tabs")
     ap.add_argument("--gdat-host", default=gdat2.DEFAULT_HOST,
                     help="aux_vcu address (client mode)")
     ap.add_argument("--gdat-buoy", type=int, choices=(1, 2, 3, 4),
@@ -1725,6 +1795,22 @@ def main():
     a = ap.parse_args()
     if a.gdat_buoy:
         a.gdat_host = gdat2.BUOYS[a.gdat_buoy - 1][1]
+
+    try:
+        a.nodes = [int(t) for t in a.nodes.replace(",", " ").split()]
+    except ValueError:
+        ap.error("--nodes wants a list of numbers, e.g. --nodes 1,2,3,4")
+    if not a.nodes or any(n < 1 or n > 4 for n in a.nodes):
+        ap.error("--nodes must be between 1 and 4")
+    if len(set(a.nodes)) != len(a.nodes):
+        ap.error("--nodes has a repeat. Two tabs on one board would open two "
+                 "sockets on the same port, and only one of them receives.")
+    # Fail here rather than opening four tabs that all watch one board and
+    # silently show three dead panels.
+    if a.port and len(a.nodes) > 1:
+        ap.error("--port overrides every tab, so it only makes sense with a "
+                 "single node: --nodes 2 --port 5006")
+
     App(a).mainloop()
 
 

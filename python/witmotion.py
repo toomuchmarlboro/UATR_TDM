@@ -78,6 +78,77 @@ WIT_PACKET_LEN = 11
 ANGLE_LIMITS = ((-180.0, 180.0), (-90.0, 90.0), (-180.0, 360.0))
 
 
+# ---------------------------------------------------------------- heading ---
+# What each unit READS while its bow is physically pointed north. Subtracting
+# it turns raw yaw into a compass heading.
+#
+# PER BUOY, not one global constant. This is not a property of the sensor, it
+# is the sum of how the IMU happens to be bolted into that hull and what
+# ferrous metal sits near it - so two units on the same bench will not share a
+# value, and a global number would be wrong the moment the second one is
+# calibrated.
+#
+#   buoy 3: measured -12.4 deg, 2026-08-29
+#
+# TO CALIBRATE: point the bow at north, read the RAW yaw (the compass caption
+# shows it in brackets, or `python witmotion.py --buoy N`), and put that number
+# here. Whether you sight true or magnetic north only decides what the
+# corrected heading then means - the arithmetic is the same either way, so
+# write down which one you used.
+HEADING_OFFSET_DEG = {1: 0.0, 2: 0.0, 3: -12.4, 4: 0.0}
+
+
+def heading(yaw, buoy=None, offset=None):
+    """Raw yaw -> corrected compass heading in [0, 360).
+
+    Wrapping is the whole reason this is a function. The offset pushes readings
+    across the +/-180 seam that raw yaw uses, so a buoy near north reads -12.4
+    one moment and +347 the next; taking it modulo 360 makes the number
+    continuous around the circle and puts it in the range a heading is normally
+    quoted in.
+    """
+    if offset is None:
+        offset = HEADING_OFFSET_DEG.get(buoy, 0.0) if buoy else 0.0
+    return (yaw - offset) % 360.0
+
+
+# What each unit reads for (roll, pitch) while it is physically LEVEL.
+# Subtracting it zeroes the horizon.
+#
+# Per buoy for the same reason as the heading offset: this is how the IMU is
+# bolted into that particular hull, not a property of the sensor.
+#
+#   buoy 3: roll +2.15, pitch -4.66, measured 2026-08-29 over 1215 angle
+#           packets - stdev 0.000 and 0.002 deg, so these are a real mounting
+#           tilt and not noise being frozen into a constant.
+#
+# TO CALIBRATE: sit the buoy level, average a few seconds of raw roll and pitch
+# (`python witmotion.py --buoy N`), and put them here.
+#
+# SMALL-ANGLE CORRECTION, deliberately. Strictly, a mounting misalignment is a
+# rotation, and undoing it means rotating the gravity vector rather than
+# subtracting two numbers - at large tilts roll and pitch interact and plain
+# subtraction drifts. For the few degrees seen here the error is second order
+# and far below what the display resolves. If a unit is ever mounted at a
+# serious angle, this is the assumption that breaks.
+LEVEL_OFFSET_DEG = {1: (0.0, 0.0), 2: (0.0, 0.0),
+                    3: (2.15, -4.66), 4: (0.0, 0.0)}
+
+
+def level(roll, pitch, buoy=None, offset=None):
+    """Raw (roll, pitch) -> levelled, in degrees.
+
+    Roll is wrapped back into [-180, 180) because the offset can push a reading
+    across the seam; pitch is left alone, since it is physically bounded to
+    +/-90 and wrapping it would turn an implausible value into a plausible one
+    and hide the fault.
+    """
+    if offset is None:
+        offset = LEVEL_OFFSET_DEG.get(buoy, (0.0, 0.0)) if buoy else (0.0, 0.0)
+    r = ((roll - offset[0] + 180.0) % 360.0) - 180.0
+    return r, pitch - offset[1]
+
+
 def wit_checksum(pkt10):
     """Sum of the first ten bytes, low 8 bits."""
     return sum(pkt10) & 0xFF
@@ -338,8 +409,39 @@ def _selftest():
     assert p.feed(bad) == []
     assert p.csum_err >= 1
 
+    # Heading correction. The measured case is the one that matters: buoy 3
+    # reading -12.4 while pointed north must correct to 0, not to 347.6.
+    assert abs(heading(-12.4, buoy=3) - 0.0) < 1e-6, heading(-12.4, buoy=3)
+    assert abs(heading(104.9, buoy=3) - 117.3) < 1e-6
+    assert abs(heading(0.0, buoy=3) - 12.4) < 1e-6
+    # Uncalibrated buoys pass straight through, wrapped into [0, 360).
+    assert abs(heading(-90.0, buoy=1) - 270.0) < 1e-6
+    assert abs(heading(-90.0) - 270.0) < 1e-6
+    # Every output is a legal heading, including across the seam.
+    for y in (-180.0, -179.9, -12.4, 0.0, 179.9, 180.0):
+        h = heading(y, buoy=3)
+        assert 0.0 <= h < 360.0, (y, h)
+    assert abs(heading(175.0, buoy=3) - 187.4) < 1e-6      # wraps past 180
+
+    # Level correction. The measured case: buoy 3 sitting level reads
+    # +2.15 / -4.66, and must come out at zero.
+    r, pch = level(2.15, -4.66, buoy=3)
+    assert abs(r) < 1e-9 and abs(pch) < 1e-9, (r, pch)
+    # A real tilt still shows through, reduced by the offset.
+    r, pch = level(12.15, 5.34, buoy=3)
+    assert abs(r - 10.0) < 1e-9 and abs(pch - 10.0) < 1e-9, (r, pch)
+    # Uncalibrated buoys pass straight through.
+    assert level(3.0, -4.0, buoy=1) == (3.0, -4.0)
+    assert level(3.0, -4.0) == (3.0, -4.0)
+    # Roll wraps at the seam rather than reading 181 degrees.
+    r, _ = level(-179.0, 0.0, buoy=3)
+    assert -180.0 <= r < 180.0 and abs(r - 178.85) < 1e-6, r
+    # Pitch is NOT wrapped: an implausible value must stay implausible.
+    _, pch = level(0.0, 95.0, buoy=3)
+    assert pch > 90.0, pch
+
     print("witmotion self-test OK  (real captured frame, split reads, "
-          "false 0x55 resync, bad checksum)")
+          "false 0x55 resync, bad checksum, heading + level offsets)")
     return 0
 
 

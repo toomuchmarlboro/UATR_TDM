@@ -6,7 +6,7 @@ Standard library only. No project imports, no third-party packages, no config.
 Copy this single file anywhere - a deployment laptop, a colleague's machine, a
 buoy-side box - and run it:
 
-    python imu_standalone.py                       # active unit, 192.168.3.130
+    python imu_standalone.py                       # active unit, 192.168.3.131
     python imu_standalone.py --selftest            # no hardware needed
     python imu_standalone.py --connect 10.0.0.7:8080
     python imu_standalone.py --expect moving       # warn if nothing changes
@@ -69,9 +69,11 @@ PROTOCOL, as confirmed against buoy 3 on 2026-08-19
     at 256 and works.
   * checksum: XOR of every byte between '$' and '*', both excluded.
   * the aux_vcu is the TCP SERVER. It streams on connect without being asked,
-    so a socket that opens and stays quiet is the WRONG DEVICE, not a silent
-    sensor. (192.168.3.131 is one such: an embedded web server on the same
-    port, one digit from the buoy address.)
+    so a socket that opens and stays quiet has not given you telemetry - but
+    do not conclude "wrong device" from that alone. An embedded web server was
+    once found answering 8080 on what is now a buoy telemetry address and then
+    waiting, which is what a config page does with no HTTP request. Same
+    symptom, different cause: it may be the wrong PORT on the right host.
 """
 
 import argparse
@@ -85,11 +87,16 @@ TALKER       = "GDAT2"
 N_RAW        = 10
 DEFAULT_PORT = 8080
 
-BUOYS = (("buoy 1", "192.168.3.110"),
-         ("buoy 2", "192.168.3.120"),
-         ("buoy 3", "192.168.3.130"),
-         ("buoy 4", "192.168.3.140"))
-ACTIVE_BUOY  = 3                      # the unit in service, 2026-08-19
+# 192.168.3.1<buoy><role>: role 1 = telemetry, role 2 = altimeter.
+# Re-addressed by the manufacturer 2026-08-29 (.1x0 -> .1x1) when the altimeter
+# was moved out to its own address. Older captures will show .110/.120/.130/.140.
+# This file is deliberately standalone, so this is a hand-kept copy of
+# gdat2.BUOYS - change one, change the other.
+BUOYS = (("buoy 1", "192.168.3.111"),
+         ("buoy 2", "192.168.3.121"),
+         ("buoy 3", "192.168.3.131"),
+         ("buoy 4", "192.168.3.141"))
+ACTIVE_BUOY  = 3                      # the unit in service
 DEFAULT_HOST = BUOYS[ACTIVE_BUOY - 1][1]
 
 # name, unit, kind

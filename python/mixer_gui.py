@@ -110,6 +110,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import udp_monitor as um
 import ctrl
 import gdat2
+import ping1d
+import witmotion
 import imu_test          # AxisWindow: one implementation of "has this moved?"
 
 # Which ADC owns which channels: matches get_i2c_addr in adau_sequencer.vhd and
@@ -693,14 +695,70 @@ class Telemetry(tk.Frame):
     ulRaw fields arrive as 8 hex digits; seq and cnt as decimal. The wire text
     is shown next to the decoded value for every field, so a decode that goes
     wrong can be checked against the bytes that produced it without a capture.
+
+    TWO VIEWS, ANSWERING DIFFERENT QUESTIONS.
+
+    The ALL BUOYS strip at the top compares four units at once: link state,
+    sentence rate, error and loss counts, seconds since the last good sentence,
+    and the three values worth scanning across a fleet - leak, depth, altimeter.
+    It exists because "which buoy is misbehaving" is not answerable by clicking
+    through them one at a time. A link that drops every thirty seconds looks
+    healthy in whichever moment you happen to be looking at it.
+
+    The table below is the single-buoy detail: every field, its wire bytes, and
+    whether it has ever been seen to change. That one asks "is this number
+    believable", which the overview cannot.
+
+    Links are keyed by address and SHARED between the two views. Plenty of
+    embedded TCP servers accept a single client, so opening a second connection
+    to a buoy the overview is already watching would either be refused or
+    silently displace the first.
     """
 
     ROW_H = 26
 
+    # The all-buoy overview. Link health first, because that is what decides
+    # whether the numbers after it mean anything, then the three values you
+    # would actually scan across four units: a leak, how deep it is, and how
+    # far off the bottom.
+    # THREE devices per buoy, each on its own address and its own protocol, so
+    # each gets its own state column. They fail independently - the commonest
+    # case in the water will be two of three alive - and a single "buoy OK"
+    # light would hide exactly that.
+    # ONE CELL PER DEVICE, then the values.
+    #
+    # This was thirteen columns: a state/rate/err/loss/age block for the
+    # aux_vcu and a state cell each for the altimeter and IMU. Five columns to
+    # say "is this link healthy" is four more than the question needs, and the
+    # numbers that matter were pushed off to the right behind a wall of zeros.
+    #
+    # Each device cell now carries its own verdict - rate when healthy, the
+    # fault when not - so a bad link is legible without reading four cells and
+    # doing the arithmetic yourself. The detail table below still has the full
+    # breakdown for whichever buoy is selected.
+    OV_COLS = (("buoy", 62, "w"),
+               ("gdat2", 108, "w"), ("imu", 96, "w"), ("altimeter", 104, "w"),
+               ("leak V", 76, "e"), ("depth m", 84, "e"),
+               ("alt m", 84, "e"), ("yaw", 74, "e"))
+
+    C_GDAT2, C_IMU, C_ALT = 1, 2, 3
+    C_LEAK, C_DEPTH, C_ALTMM, C_YAW = 4, 5, 6, 7
+
     def __init__(self, master, mode, host, port, fps=10.0):
         super().__init__(master, bg=BG)
         self.period = int(1000 / fps)
-        self.link = None
+        # One Link per address, shared. Deliberately NOT one for the overview
+        # and another for the detail table: plenty of embedded TCP servers
+        # accept a single client, so a second connection to a buoy already
+        # being watched would either be refused or would silently displace the
+        # first. Whoever wants that buoy's data reads this same object.
+        self.links = {}
+        # Ping1D altimeters, keyed the same way. A separate dict rather than a
+        # separate class: they are a different protocol on a different device,
+        # and mixing them into self.links would put two incompatible snapshot()
+        # shapes behind one lookup.
+        self.alt_links = {}
+        self.imu_links = {}
         self.mode = tk.StringVar(value=mode)
         self.host = tk.StringVar(value=host)
         self.port = tk.StringVar(value=str(port))
@@ -713,6 +771,31 @@ class Telemetry(tk.Frame):
         # sizes. Map fires when it first becomes visible; rescale then.
         self.bind("<Map>", self._on_resize)
         self._job = self.after(self.period, self.tick)
+
+    @property
+    def link(self):
+        """The link feeding the DETAIL table, i.e. whichever host is selected.
+
+        A lookup rather than a field, so the detail view and the overview can
+        never end up holding two different objects for one buoy. Returns None
+        when that host is not being watched, which every reader already treats
+        as "nothing to show".
+        """
+        return self.links.get(self.host.get().strip())
+
+    def _ensure_link(self, host, port, mode="client"):
+        """Open a link to host if there is not one already. -> the Link."""
+        host = host.strip()
+        if host not in self.links:
+            lk = gdat2.Link(mode, host, port)
+            lk.start()
+            self.links[host] = lk
+        return self.links[host]
+
+    def _drop_link(self, host):
+        lk = self.links.pop(host.strip(), None)
+        if lk:
+            lk.close()
 
     # Font sizes track the window so the table stays readable on a 4K panel and
     # still fits on a laptop. Column widths are weighted, so the table stretches
@@ -736,6 +819,11 @@ class Telemetry(tk.Frame):
             for i, lab in enumerate(row):
                 lab.config(font=big if i == 3 else cell)
         self.stats.config(font=cell)
+        for row in self.ov_rows:
+            for lab in row:
+                lab.config(font=cell)
+        for lab in self.ov_heads:
+            lab.config(font=("Consolas", max(7, base - 1)))
         for lab in self.heads:
             lab.config(font=("Consolas", max(7, base - 1)))
         self.rawbox.config(font=("Consolas", max(7, base - 1)))
@@ -749,10 +837,191 @@ class Telemetry(tk.Frame):
                 # another - the one disagreement this selector must not allow.
                 self.buoy.set(nm)
                 self.host.set(ip)
-                if self.link:           # retarget an open link immediately
-                    self.toggle()
-                    self.toggle()
+                # No teardown any more. Links are keyed by address and shared
+                # with the overview, so switching buoy just points the detail
+                # table at a different one - and tearing down would have closed
+                # a connection the overview is still using. tick() notices the
+                # target changed and resets the liveness trackers, so buoy 2's
+                # sentences can never be counted as proof that buoy 1 moved.
+                self._sync_detail_button()
                 break
+
+    @staticmethod
+    def _field_index(name):
+        """Index of a gdat2 field BY NAME, or raise.
+
+        Not a hardcoded number. The whole argument of gdat2.py's header is that
+        a field map and a second array indexed in step with it drift apart
+        silently, and the overview would be exactly that second array. If a
+        field is renamed or reordered upstream, this fails at construction
+        instead of quietly showing depth under the altimeter heading.
+        """
+        for i, (nm, _u, _k) in enumerate(gdat2.FIELDS):
+            if nm == name:
+                return i
+        raise SystemExit("mixer_gui: gdat2.FIELDS has no %r - the telemetry "
+                         "overview names it. Update OV_COLS." % name)
+
+    def _build_overview(self):
+        """All four buoys, one row each, above the single-buoy detail table.
+
+        This answers a different question from the table below it. The detail
+        table asks "is this field believable"; this asks "which of the four is
+        misbehaving", which is not answerable by clicking through them one at a
+        time - a link that drops every thirty seconds looks healthy in whichever
+        moment you happen to be looking at it.
+
+        Device health comes first because it qualifies everything after it: a
+        depth reading from a link with a rising checksum-error count is not a
+        depth reading. Each device cell shows its packet rate when healthy and
+        names the fault when not - STALE for a link that is open but silent,
+        which is the failure that otherwise presents as perfectly steady data.
+        """
+        # (overview column, gdat2 field index, format). Resolved by name here,
+        # once, so a rename upstream is a startup error and not a mislabelled
+        # number on screen.
+        # Altimeter is NOT taken from gdat2 here any more: the manufacturer
+        # moved it to its own Ping1D device, and their own reference parser
+        # skips ulRaw[7:9] entirely. Those fields read hard zero on this
+        # firmware, so showing them would be showing a number that is not a
+        # measurement. The alt columns come from ping1d instead.
+        self._OV_VALUE_COLS = (
+            (self.C_LEAK,  self._field_index("Leak sensor"), "%.2f"),
+            (self.C_DEPTH, self._field_index("Depth"),       "%.2f"),
+        )
+
+        wrap = tk.Frame(self, bg=BG)
+        wrap.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(wrap, text="ALL BUOYS", bg=BG, fg=TEXT, anchor="w",
+                 font=("Consolas", 9, "bold")).pack(fill="x")
+
+        grid = tk.Frame(wrap, bg=BG)
+        grid.pack(fill="x")
+        self.ov_heads = []
+        for c, (name, wid, _anc) in enumerate(self.OV_COLS):
+            grid.grid_columnconfigure(c, weight=wid, minsize=44)
+            lab = tk.Label(grid, text=name, bg=BG, fg=DIM, anchor="w",
+                           font=("Consolas", 8))
+            lab.grid(row=0, column=c, sticky="ew", padx=3)
+            self.ov_heads.append(lab)
+
+        self.ov_rows = []
+        for r, (nm, ip) in enumerate(gdat2.BUOYS, start=1):
+            row = []
+            for c, (_n, _w, anc) in enumerate(self.OV_COLS):
+                txt = nm if c == 0 else "-"
+                lab = tk.Label(grid, text=txt, bg=BG, fg=DIM, anchor=anc,
+                               font=("Consolas", 9))
+                lab.grid(row=r, column=c, sticky="ew", padx=3)
+                row.append(lab)
+            self.ov_rows.append(row)
+
+        tk.Frame(wrap, bg=GRID, height=1).pack(fill="x", pady=(6, 0))
+
+    @staticmethod
+    def _dev_cell(snap, now, fresh_s=1.0, errors=0):
+        """One device's health as (text, colour). Shared by all three.
+
+        The rule is the same whichever protocol is underneath, which is why it
+        is written once: STALE outranks connected, because a socket that is
+        open while the far end has stopped talking is the failure that a naive
+        "connected" light hides. Errors are shown in the same cell rather than
+        a column of their own - they are rare, and when they happen they are
+        the most important thing about that link.
+        """
+        if snap is None:
+            return "-", DIM
+        st = snap["state"]
+        age = None if snap["t"] is None else now - snap["t"]
+        live = age is not None and age <= fresh_s
+        if st == "connected" and not live:
+            return ("STALE" if snap["t"] else "no data"), RED
+        if st == "connected":
+            txt = "%.0f/s" % snap["rate"]
+            if errors:
+                return "%s  %d err" % (txt, errors), RED
+            return txt, GREEN
+        if "connect" in st:
+            return "connecting", AMBER
+        return st[:14], RED
+
+    @staticmethod
+    def _is_live(snap, now, fresh_s=1.0):
+        if snap is None or snap["t"] is None:
+            return False
+        return (now - snap["t"]) <= fresh_s
+
+    def _update_overview(self):
+        now = time.time()
+        for r, (_nm, ip) in enumerate(gdat2.BUOYS):
+            row = self.ov_rows[r]
+
+            # ---- aux_vcu -----------------------------------------------
+            lk = self.links.get(ip)
+            g = lk.snapshot() if lk else None
+            if g is not None:
+                # gdat2.Link timestamps the sentence, not the socket read, so
+                # normalise it to the shape _dev_cell expects.
+                g = dict(g, t=None if g["last"] is None else g["last"]["t"])
+                gerr = g["csum_err"] + g["parse_err"] + g["lost"]
+            else:
+                gerr = 0
+            txt, fg = self._dev_cell(g, now, errors=gerr)
+            row[self.C_GDAT2].config(text=txt, fg=fg)
+
+            glive = self._is_live(g, now)
+            rr = lk.snapshot()["last"] if lk else None
+            vals = rr["vals"] if rr else [None] * len(gdat2.FIELDS)
+            bad = set(i for i, _v, _lo, _hi in gdat2.implausible(vals)) if rr else set()
+            for col, idx, fmt in self._OV_VALUE_COLS:
+                v = vals[idx]
+                row[col].config(
+                    text="-" if v is None else fmt % v,
+                    fg=DIM if not glive else (RED if idx in bad else TEXT))
+
+            # ---- IMU ---------------------------------------------------
+            im = self.imu_links.get(gdat2.buoy_ip(r + 1, gdat2.ROLE_IMU))
+            i = im.snapshot() if im else None
+            txt, fg = self._dev_cell(i, now, errors=(i["bad"] if i else 0))
+            row[self.C_IMU].config(text=txt, fg=fg)
+            ang = i["angle"] if i else None
+            ilive = self._is_live(i, now)
+            if ang is None:
+                row[self.C_YAW].config(text="-", fg=DIM)
+            else:
+                lo, hi = witmotion.ANGLE_LIMITS[2]
+                row[self.C_YAW].config(
+                    text="%+.1f" % ang["yaw"],
+                    fg=DIM if not ilive else
+                    (TEXT if lo <= ang["yaw"] <= hi else RED))
+
+            # ---- altimeter ---------------------------------------------
+            al = self.alt_links.get(gdat2.buoy_ip(r + 1, gdat2.ROLE_ALTIMETER))
+            a = al.snapshot() if al else None
+            # A Ping1D answers on request, so "fresh" is looser than for the
+            # two streaming devices - it legitimately goes quiet between polls.
+            txt, fg = self._dev_cell(a, now, fresh_s=3.0,
+                                     errors=(a["bad"] if a else 0))
+            row[self.C_ALT].config(text=txt, fg=fg)
+            alive = self._is_live(a, now, fresh_s=3.0)
+            d = a["dist"] if a else None
+            c = a["conf"] if a else None
+            if d is None:
+                row[self.C_ALTMM].config(text="-", fg=DIM)
+            else:
+                # Confidence, not range, is what says whether the sonar found
+                # anything - so it colours the distance rather than occupying a
+                # column of its own. Amber below 30 % means "this is a number,
+                # not a measurement".
+                # Metres, not millimetres. The sonar reports mm, but a range
+                # to the seabed is read in metres by everyone who uses it, and
+                # a five-digit millimetre count is harder to compare across
+                # four buoys at a glance than 86.75.
+                row[self.C_ALTMM].config(
+                    text="%.2f" % (d / 1000.0),
+                    fg=DIM if not alive else
+                    (RED if d > ping1d.DIST_MAX_MM else
+                     TEXT if (c or 0) >= 30 else AMBER))
 
     # ------------------------------------------------------------- layout --
     def _build(self):
@@ -788,9 +1057,15 @@ class Telemetry(tk.Frame):
                              bg=GRID, fg=TEXT, font=("Consolas", 9),
                              borderwidth=0, activebackground=GREEN, padx=12)
         self.btn.pack(side="left", padx=10)
+        self.all_btn = tk.Button(bar, text="watch all", command=self.watch_all,
+                                 bg=GRID, fg=TEXT, font=("Consolas", 9),
+                                 borderwidth=0, activebackground=GREEN, padx=12)
+        self.all_btn.pack(side="left")
         self.state_lab = tk.Label(bar, text="idle", bg=PANEL, fg=DIM,
                                   font=("Consolas", 8), anchor="e")
         self.state_lab.pack(side="right", padx=10)
+
+        self._build_overview()
 
         self.stats = tk.Label(self, text="", bg=BG, fg=DIM, anchor="w",
                               font=("Consolas", 9), justify="left")
@@ -850,9 +1125,9 @@ class Telemetry(tk.Frame):
 
     # -------------------------------------------------------------- logic --
     def toggle(self):
+        """Connect or disconnect the selected host only."""
         if self.link:
-            self.link.close()
-            self.link = None
+            self._drop_link(self.host.get())
             self.btn.config(text="connect", activebackground=GREEN)
             self.state_lab.config(text="disconnected", fg=DIM)
             return
@@ -863,14 +1138,79 @@ class Telemetry(tk.Frame):
             return
         # A fresh link is a fresh session: carrying "it moved earlier" across a
         # reconnect would let a dead field inherit a previous unit's proof.
+        self._reset_watch()
+        self._ensure_link(self.host.get(), port, self.mode.get())
+        self.btn.config(text="disconnect", activebackground=RED)
+
+    def watch_all(self):
+        """Open a link to every buoy at once, so the overview is populated.
+
+        The point of the overview is comparing four units, and a column that is
+        blank because nobody dialled it looks exactly like a unit that is down.
+        So this dials all of them, and the state column tells them apart.
+        """
+        try:
+            port = int(self.port.get())
+        except ValueError:
+            self.state_lab.config(text="bad port", fg=RED)
+            return
+        ips = [ip for _n, ip in gdat2.BUOYS]
+        alts = [gdat2.buoy_ip(n, 2) for n in (1, 2, 3, 4)]
+        if all(ip in self.links for ip in ips):     # already up: take them down
+            for ip in ips:
+                self._drop_link(ip)
+            for ip in alts:
+                lk = self.alt_links.pop(ip, None)
+                if lk:
+                    lk.close()
+            for n in (1, 2, 3, 4):
+                lk = self.imu_links.pop(gdat2.buoy_ip(n, gdat2.ROLE_IMU), None)
+                if lk:
+                    lk.close()
+            self.all_btn.config(text="watch all", activebackground=GREEN)
+            return
+        for ip in ips:
+            self._ensure_link(ip, port, "client")
+        for ip in alts:
+            if ip not in self.alt_links:
+                lk = ping1d.PingLink(ip, ping1d.PING_PORT)
+                lk.start()
+                self.alt_links[ip] = lk
+        for n in (1, 2, 3, 4):
+            ip = gdat2.buoy_ip(n, gdat2.ROLE_IMU)
+            if ip not in self.imu_links:
+                lk = witmotion.WitLink(ip, witmotion.WIT_PORT)
+                lk.start()
+                self.imu_links[ip] = lk
+        self.all_btn.config(text="drop all", activebackground=RED)
+        # The detail table follows whichever buoy is selected; if that is not
+        # one of them (a custom host), leave it alone.
+        self._sync_detail_button()
+
+    def _reset_watch(self):
         for w in self.watch:
             w.__init__(w.name)
         self.last_t = None
-        self.link = gdat2.Link(self.mode.get(), self.host.get().strip(), port)
-        self.link.start()
-        self.btn.config(text="disconnect", activebackground=RED)
+
+    def _sync_detail_button(self):
+        up = self.link is not None
+        self.btn.config(text="disconnect" if up else "connect",
+                        activebackground=RED if up else GREEN)
 
     def tick(self):
+        self._update_overview()
+
+        # The detail table follows the selected host, and the liveness trackers
+        # below are per-field evidence about ONE unit. Switching buoy without
+        # clearing them would let buoy 2's sentences stand as proof that buoy
+        # 1's field had moved - a false "live" on a dead channel, which is the
+        # exact claim this tab exists to make trustworthy. Detected here rather
+        # than in pick_buoy so that typing an address by hand is covered too.
+        key = self.host.get().strip()
+        if key != getattr(self, "_detail_key", None):
+            self._detail_key = key
+            self._reset_watch()
+
         if self.link:
             s = self.link.snapshot()
             ok = s["state"] == "connected"
@@ -969,6 +1309,271 @@ class Telemetry(tk.Frame):
             if getattr(self, attr, None):
                 self.after_cancel(getattr(self, attr))
                 setattr(self, attr, None)
+        for lk in (list(self.links.values()) + list(self.alt_links.values())
+                   + list(self.imu_links.values())):
+            lk.close()
+        self.links.clear()
+        self.alt_links.clear()
+        self.imu_links.clear()
+
+
+class Altimeter(tk.Frame):
+    """Ping1D altimeter panel, modelled on the manufacturer's Ping1DPanel.
+
+    Their GUI is the reference for this sensor and it exposes four settings -
+    ping enable, gain, ping interval, speed of sound - behind an "Apply
+    Settings" button. Those are not decoration. Measured on buoy 3, the device
+    powers up at ping_interval = 250 ms, which reads confidence 0 and a range
+    wandering 54-92 m; writing their defaults (50 ms) took confidence to
+    22-51 % and settled the range. So the controls are reproduced here, with
+    their ranges and their defaults.
+
+    The transport underneath is ping1d.PingLink rather than brping. That was
+    checked against their code on the real device, not assumed: brping's
+    get_distance() and this decoder return the same distances and the same
+    confidences. brping is also not safe to depend on here - the version
+    installed on this machine has no connect_tcp(), which is exactly why their
+    own code carries a TCPSocketIO fallback, and the standalone GUI must run
+    with nothing installed but numpy.
+    """
+
+    # Their combo, verbatim: the index is the gain setting written to the
+    # device, the number in brackets is the amplifier gain it selects.
+    GAINS = ("0 (0.6)", "1 (1.8)", "2 (5.5)", "3 (12.9)",
+             "4 (30.2)", "5 (66.1)", "6 (144.0)")
+
+    def __init__(self, master, fps=10.0):
+        super().__init__(master, bg=BG)
+        self.period = int(1000 / fps)
+        self.link = None
+        self.buoy = tk.StringVar(value="buoy %d" % gdat2.ACTIVE_BUOY)
+        self.host = tk.StringVar(
+            value=gdat2.buoy_ip(gdat2.ACTIVE_BUOY, gdat2.ROLE_ALTIMETER))
+        self.port = tk.StringVar(value=str(ping1d.PING_PORT))
+        self.enable = tk.BooleanVar(value=bool(ping1d.VENDOR_DEFAULTS["enable"]))
+        self.gain = tk.StringVar(value=self.GAINS[ping1d.VENDOR_DEFAULTS["gain"]])
+        self.interval = tk.IntVar(value=ping1d.VENDOR_DEFAULTS["interval"])
+        self.sos = tk.IntVar(value=ping1d.VENDOR_DEFAULTS["sos"])
+        self._build()
+        self._job = self.after(self.period, self.tick)
+
+    # ------------------------------------------------------------ layout --
+    def _build(self):
+        bar = tk.Frame(self, bg=PANEL)
+        bar.pack(fill="x")
+        tk.Label(bar, text=" Ping1D ", bg=PANEL, fg=TEXT,
+                 font=("Consolas", 10, "bold")).pack(side="left",
+                                                     padx=(8, 2), pady=7)
+        om = tk.OptionMenu(bar, self.buoy, *[n for n, _ip in gdat2.ALTIMETERS],
+                           command=self.pick_buoy)
+        om.config(bg=GRID, fg=TEXT, font=("Consolas", 9), borderwidth=0,
+                  highlightthickness=0, activebackground=GREEN, width=7)
+        om["menu"].config(bg=PANEL, fg=TEXT, font=("Consolas", 9))
+        om.pack(side="left", padx=(4, 8))
+        tk.Entry(bar, textvariable=self.host, width=15, bg=BG, fg=TEXT,
+                 insertbackground=TEXT, font=("Consolas", 9),
+                 borderwidth=0).pack(side="left", padx=(6, 2))
+        tk.Label(bar, text=":", bg=PANEL, fg=DIM).pack(side="left")
+        tk.Entry(bar, textvariable=self.port, width=6, bg=BG, fg=TEXT,
+                 insertbackground=TEXT, font=("Consolas", 9),
+                 borderwidth=0).pack(side="left", padx=2)
+        self.btn = tk.Button(bar, text="connect", command=self.toggle,
+                             bg=GRID, fg=TEXT, font=("Consolas", 9),
+                             borderwidth=0, activebackground=GREEN, padx=12)
+        self.btn.pack(side="left", padx=10)
+        self.state_lab = tk.Label(bar, text="idle", bg=PANEL, fg=DIM,
+                                  font=("Consolas", 8), anchor="e")
+        self.state_lab.pack(side="right", padx=10)
+
+        # ---- readout, their layout: distance large, confidence beneath it
+        read = tk.Frame(self, bg=BG)
+        read.pack(fill="x", pady=(26, 8))
+        self.lbl_dist = tk.Label(read, text="--- m", bg=BG, fg=DIM,
+                                 font=("Consolas", 40, "bold"))
+        self.lbl_dist.pack()
+        self.lbl_conf = tk.Label(read, text="confidence --", bg=BG, fg=DIM,
+                                 font=("Consolas", 16))
+        self.lbl_conf.pack(pady=(2, 0))
+        # Their GUI shows a bare percentage. This adds what the percentage
+        # MEANS, because 90 m at 0 % is not a reading and the number alone
+        # does not say so.
+        self.lbl_note = tk.Label(read, text="", bg=BG, fg=DIM,
+                                 font=("Consolas", 9))
+        self.lbl_note.pack(pady=(6, 0))
+
+        # ---- settings: their controls, their ranges, their defaults
+        box = tk.LabelFrame(self, text=" sensor settings ", bg=BG, fg=DIM,
+                            font=("Consolas", 9), borderwidth=1,
+                            relief="solid")
+        box.pack(fill="x", padx=40, pady=(18, 10))
+        grid = tk.Frame(box, bg=BG)
+        grid.pack(padx=14, pady=10)
+
+        def label(txt, r):
+            tk.Label(grid, text=txt, bg=BG, fg=TEXT, anchor="w",
+                     font=("Consolas", 9)).grid(row=r, column=0, sticky="w",
+                                                padx=(0, 12), pady=3)
+
+        label("ping", 0)
+        self.cb_en = tk.Checkbutton(
+            grid, text=" enabled", variable=self.enable, bg=BG, fg=TEXT,
+            selectcolor=GRID, activebackground=BG, activeforeground=TEXT,
+            font=("Consolas", 9), borderwidth=0, highlightthickness=0)
+        self.cb_en.grid(row=0, column=1, sticky="w")
+
+        label("gain", 1)
+        gm = tk.OptionMenu(grid, self.gain, *self.GAINS)
+        gm.config(bg=GRID, fg=TEXT, font=("Consolas", 9), borderwidth=0,
+                  highlightthickness=0, width=10, anchor="w")
+        gm["menu"].config(bg=PANEL, fg=TEXT, font=("Consolas", 9))
+        gm.grid(row=1, column=1, sticky="w", pady=3)
+
+        label("interval", 2)
+        tk.Spinbox(grid, from_=10, to=5000, textvariable=self.interval,
+                   width=8, bg=BG, fg=TEXT, buttonbackground=GRID,
+                   insertbackground=TEXT, font=("Consolas", 9),
+                   borderwidth=0, highlightthickness=0).grid(
+                       row=2, column=1, sticky="w", pady=3)
+        tk.Label(grid, text="ms   (device boots at 250 - that reads conf 0)",
+                 bg=BG, fg=DIM, font=("Consolas", 8)).grid(row=2, column=2,
+                                                           sticky="w", padx=8)
+
+        label("sound velocity", 3)
+        tk.Spinbox(grid, from_=300000, to=2000000, increment=1000,
+                   textvariable=self.sos, width=8, bg=BG, fg=TEXT,
+                   buttonbackground=GRID, insertbackground=TEXT,
+                   font=("Consolas", 9), borderwidth=0,
+                   highlightthickness=0).grid(row=3, column=1, sticky="w",
+                                              pady=3)
+        tk.Label(grid, text="mm/s  (1500000 water, ~343000 air)",
+                 bg=BG, fg=DIM, font=("Consolas", 8)).grid(row=3, column=2,
+                                                           sticky="w", padx=8)
+
+        self.apply_btn = tk.Button(grid, text="apply settings",
+                                   command=self.apply_settings, bg=GRID,
+                                   fg=TEXT, font=("Consolas", 9),
+                                   borderwidth=0, activebackground=GREEN,
+                                   padx=14)
+        self.apply_btn.grid(row=4, column=1, sticky="w", pady=(10, 2))
+        self.applied_lab = tk.Label(grid, text="", bg=BG, fg=DIM,
+                                    font=("Consolas", 8))
+        self.applied_lab.grid(row=4, column=2, sticky="w", padx=8)
+
+        self.info_lab = tk.Label(self, text="", bg=BG, fg=DIM, anchor="w",
+                                 font=("Consolas", 9), justify="left")
+        self.info_lab.pack(fill="x", padx=40, pady=(4, 12))
+
+    # ------------------------------------------------------------- logic --
+    def pick_buoy(self, name):
+        for nm, ip in gdat2.ALTIMETERS:
+            if nm == name:
+                self.host.set(ip)
+                if self.link:           # retarget an open link
+                    self.toggle()
+                    self.toggle()
+                break
+
+    def settings_dict(self):
+        return {"enable": 1 if self.enable.get() else 0,
+                "gain": self.GAINS.index(self.gain.get()),
+                "interval": int(self.interval.get()),
+                "sos": int(self.sos.get())}
+
+    def toggle(self):
+        if self.link:
+            self.link.close()
+            self.link = None
+            self.btn.config(text="connect", activebackground=GREEN)
+            self.state_lab.config(text="disconnected", fg=DIM)
+            return
+        try:
+            port = int(self.port.get())
+        except ValueError:
+            self.state_lab.config(text="bad port", fg=RED)
+            return
+        self.link = ping1d.PingLink(self.host.get().strip(), port,
+                                    settings=self.settings_dict())
+        self.link.start()
+        self.btn.config(text="disconnect", activebackground=RED)
+
+    def apply_settings(self):
+        """Write the settings to a live sensor, as their Apply button does."""
+        if not self.link or not self.link.sock:
+            self.applied_lab.config(text="not connected", fg=AMBER)
+            return
+        st = self.settings_dict()
+        try:
+            for key in ("enable", "gain", "interval", "sos"):
+                self.link.sock.sendall(ping1d.set_message(key, st[key]))
+                time.sleep(0.25)
+        except OSError as e:
+            self.applied_lab.config(text="send failed: %s" % e, fg=RED)
+            return
+        with self.link.lock:
+            self.link.applied = dict(st)
+        self.applied_lab.config(
+            text="sent: interval %d ms, gain %d, sos %d, ping %s"
+                 % (st["interval"], st["gain"], st["sos"],
+                    "on" if st["enable"] else "off"), fg=GREEN)
+
+    def tick(self):
+        if self.link:
+            s = self.link.snapshot()
+            live = s["t"] is not None and (time.time() - s["t"]) <= 3.0
+            ok = s["state"] == "connected"
+            self.state_lab.config(
+                text="%s   %.0f/s   good %d   csum %d   timeouts %d"
+                     % (s["state"], s["rate"], s["good"], s["bad"],
+                        s["timeouts"]),
+                fg=GREEN if (ok and live) else
+                AMBER if "connect" in s["state"] else RED)
+
+            d, c = s["dist"], s["conf"]
+            if d is None:
+                self.lbl_dist.config(text="--- m", fg=DIM)
+                self.lbl_conf.config(text="confidence --", fg=DIM)
+                self.lbl_note.config(text="")
+            else:
+                # Confidence decides how the range is PRESENTED. A number the
+                # sonar has no faith in is shown dimmed and captioned rather
+                # than in the same weight as a real fix - the difference
+                # between a reading and a shrug, which their bare percentage
+                # leaves the operator to work out.
+                conf = c or 0
+                strong = conf >= 30
+                # Metres. The wire value is millimetres - see ping1d - and
+                # the raw count stays in the caption so a decode can still be
+                # checked against the bytes without converting in your head.
+                self.lbl_dist.config(
+                    text="%.2f m" % (d / 1000.0),
+                    fg=DIM if not live else (TEXT if strong else AMBER))
+                self.lbl_conf.config(
+                    text="confidence %d %%" % conf,
+                    fg=DIM if not live else (GREEN if strong else AMBER))
+                if not live:
+                    note = "stale - no reply within 3 s"
+                elif conf == 0:
+                    note = ("no echo. In air this is normal; the range shown "
+                            "is the sonar's ceiling, not a measurement.")
+                elif not strong:
+                    note = "weak echo - treat the range as approximate"
+                else:
+                    note = "%d mm" % d
+                self.lbl_note.config(
+                    text=note, fg=DIM if (conf < 30 or not live) else TEXT)
+
+            ap = s["applied"]
+            self.info_lab.config(
+                text=("answering on msg %s   |   settings written: %s"
+                      % (s["answered_id"],
+                         ", ".join("%s=%s" % kv for kv in sorted(ap.items()))
+                         if ap else "none")))
+        self._job = self.after(self.period, self.tick)
+
+    def close(self):
+        if getattr(self, "_job", None):
+            self.after_cancel(self._job)
+            self._job = None
         if self.link:
             self.link.close()
             self.link = None
@@ -1034,6 +1639,8 @@ class App(tk.Tk):
 
         self.tel = Telemetry(nb, a.gdat_mode, a.gdat_host, a.gdat_port)
         nb.add(self.tel, text="Telemetry")
+        self.alt = Altimeter(nb)
+        nb.add(self.alt, text="Altimeter")
 
         if a.gdat_connect:
             self.tel.toggle()
@@ -1066,6 +1673,7 @@ class App(tk.Tk):
         for mx in self.mixers:
             mx.close()
         self.tel.close()
+        self.alt.close()
         self.destroy()
 
 

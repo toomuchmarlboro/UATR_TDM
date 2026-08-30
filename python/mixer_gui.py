@@ -95,6 +95,7 @@ Faders
 """
 
 import argparse
+import math
 import os
 import socket
 import struct
@@ -685,6 +686,171 @@ class Mixer(tk.Frame):
             pass
 
 
+class CompassWidget(tk.Canvas):
+    """Heading rose, ported from the manufacturer's CompassWidget.
+
+    Theirs is QPainter: a circle, N/S/E/W, then painter.rotate(yaw) and a red
+    needle drawn "up" with a white tail. Same geometry here, with the rotation
+    done in the coordinate arithmetic because a tk Canvas has no transform.
+
+    Screen convention throughout: y grows DOWNWARD, so a positive angle turns
+    clockwise and "up" is negative y. Yaw 0 puts the needle on N, yaw 90 on E,
+    which is what their rotate(yaw) produces.
+    """
+
+    def __init__(self, master, size=150):
+        super().__init__(master, width=size, height=size, bg=BG,
+                         highlightthickness=0, bd=0)
+        self.size = size
+        self.yaw = None                 # corrected heading, degrees
+        self.raw_yaw = None             # what the IMU reported, for recalibration
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self._redraw()
+
+    def set_yaw(self, yaw, raw=None):
+        if (yaw, raw) != (self.yaw, self.raw_yaw):
+            self.yaw, self.raw_yaw = yaw, raw
+            self._redraw()
+
+    def _redraw(self):
+        self.delete("all")
+        w = max(self.winfo_width(), self.size)
+        h = max(self.winfo_height(), self.size)
+        cx, cy = w / 2.0, h / 2.0
+        r = min(cx, cy) - 15
+        if r < 10:
+            return
+
+        self.create_oval(cx - r, cy - r, cx + r, cy + r, outline=TEXT, width=2)
+        for txt, dx, dy in (("N", 0, -1), ("S", 0, 1), ("E", 1, 0), ("W", -1, 0)):
+            self.create_text(cx + dx * (r - 12), cy + dy * (r - 12), text=txt,
+                             fill=TEXT, font=("Consolas", 9, "bold"))
+
+        if self.yaw is None:
+            self.create_text(cx, cy + r + 8, text="hdg --", fill=DIM,
+                             font=("Consolas", 9))
+            return
+
+        a = math.radians(self.yaw)
+        sa, ca = math.sin(a), math.cos(a)
+
+        def rot(x, y):
+            """Rotate clockwise by yaw, screen coords."""
+            return cx + x * ca - y * sa, cy + x * sa + y * ca
+
+        tip = r - 20
+        # Red half points to the heading, white half trails it - theirs.
+        self.create_polygon(*rot(-5, 0), *rot(5, 0), *rot(0, -tip),
+                            fill=RED, outline="")
+        self.create_polygon(*rot(-5, 0), *rot(5, 0), *rot(0, tip),
+                            fill="#e6e6e6", outline="")
+        cap = "hdg %.1f" % self.yaw
+        if self.raw_yaw is not None and abs(self.raw_yaw - self.yaw) > 0.05:
+            # The uncorrected number stays on screen: it is what you read off
+            # to recalibrate, and it makes an applied offset visible rather
+            # than silently baked in.
+            cap += "   (raw %+.1f)" % self.raw_yaw
+        self.create_text(cx, cy + r + 8, text=cap,
+                         fill=AMBER, font=("Consolas", 9))
+
+
+class AttitudeWidget(tk.Canvas):
+    """Artificial horizon, ported from the manufacturer's AttitudeWidget.
+
+    Theirs clips to a circle with QPainterPath, rotates by -roll, translates by
+    pitch*2, then fills a blue rectangle above the horizon and a brown one
+    below. A tk Canvas cannot clip, so the ground is computed instead: the
+    horizon is a chord of the circle, and the ground is the circular segment on
+    its far side.
+
+    The geometry, once set up, is small. With the ground normal n at angle phi
+    and the horizon offset d = pitch * PITCH_PX from centre, a point at angle t
+    on the rim is ground when cos(t - phi) > d/r. So the segment runs from
+    phi - acos(d/r) to phi + acos(d/r), and |d| >= r means the view is entirely
+    sky or entirely ground - which is what a buoy past 45 degrees would show.
+    """
+
+    PITCH_PX = 2.0          # pixels per degree of pitch, as in their code
+
+    def __init__(self, master, size=150):
+        super().__init__(master, width=size, height=size, bg=BG,
+                         highlightthickness=0, bd=0)
+        self.size = size
+        self.roll = None                # levelled
+        self.pitch = None
+        self.raw = None                 # as reported, for recalibration
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self._redraw()
+
+    def set_attitude(self, roll, pitch, raw=None):
+        if (roll, pitch, raw) != (self.roll, self.pitch, self.raw):
+            self.roll, self.pitch, self.raw = roll, pitch, raw
+            self._redraw()
+
+    def _redraw(self):
+        self.delete("all")
+        w = max(self.winfo_width(), self.size)
+        h = max(self.winfo_height(), self.size)
+        cx, cy = w / 2.0, h / 2.0
+        r = min(cx, cy) - 10
+        if r < 10:
+            return
+
+        if self.roll is None:
+            self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                             outline=GRID, width=2)
+            self.create_text(cx, cy, text="--", fill=DIM,
+                             font=("Consolas", 10))
+            return
+
+        # Whole disc is sky; the ground segment goes on top of it.
+        self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                         fill="#1e5f9e", outline="")
+
+        a = math.radians(-self.roll)             # their painter.rotate(-roll)
+        # Ground normal = local +y rotated by a. Offset of the horizon from the
+        # centre along that normal is the pitch translation.
+        nx, ny = -math.sin(a), math.cos(a)
+        d = self.pitch * self.PITCH_PX
+        phi = math.atan2(ny, nx)
+
+        if d >= r:
+            pass                                  # all sky
+        elif d <= -r:
+            self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                             fill="#6b4423", outline="")
+        else:
+            alpha = math.acos(max(-1.0, min(1.0, d / r)))
+            pts = []
+            steps = 36
+            for i in range(steps + 1):
+                t = (phi - alpha) + (2 * alpha) * i / float(steps)
+                pts += [cx + r * math.cos(t), cy + r * math.sin(t)]
+            self.create_polygon(*pts, fill="#6b4423", outline="")
+            # Horizon line: the chord itself.
+            ux, uy = -ny, nx                      # along the horizon
+            hx, hy = cx + d * nx, cy + d * ny     # midpoint of the chord
+            half = math.sqrt(max(0.0, r * r - d * d))
+            self.create_line(hx - ux * half, hy - uy * half,
+                             hx + ux * half, hy + uy * half,
+                             fill="#ffffff", width=2)
+
+        self.create_oval(cx - r, cy - r, cx + r, cy + r, outline=GRID, width=2)
+        # Fixed aircraft reference, theirs: two bars and a centre dot.
+        self.create_line(cx - 30, cy, cx - 10, cy, fill=AMBER, width=3)
+        self.create_line(cx + 10, cy, cx + 30, cy, fill=AMBER, width=3)
+        self.create_oval(cx - 2, cy - 2, cx + 2, cy + 2, fill=AMBER,
+                         outline="")
+        cap = "R %+.1f  P %+.1f" % (self.roll, self.pitch)
+        if self.raw is not None and (abs(self.raw[0] - self.roll) > 0.05 or
+                                     abs(self.raw[1] - self.pitch) > 0.05):
+            # Same rule as the compass: an applied offset stays visible, and
+            # the uncorrected pair is what you read off to recalibrate.
+            cap += "   (raw %+.1f / %+.1f)" % self.raw
+        self.create_text(cx, cy + r + 8, text=cap,
+                         fill=TEXT, font=("Consolas", 9))
+
+
 class Telemetry(tk.Frame):
     """$GDAT2 sensor telemetry from the aux_vcu, over TCP.
 
@@ -739,7 +905,7 @@ class Telemetry(tk.Frame):
     OV_COLS = (("buoy", 62, "w"),
                ("gdat2", 108, "w"), ("imu", 96, "w"), ("altimeter", 104, "w"),
                ("leak V", 76, "e"), ("depth m", 84, "e"),
-               ("alt m", 84, "e"), ("yaw", 74, "e"))
+               ("alt m", 84, "e"), ("hdg", 74, "e"))
 
     C_GDAT2, C_IMU, C_ALT = 1, 2, 3
     C_LEAK, C_DEPTH, C_ALTMM, C_YAW = 4, 5, 6, 7
@@ -951,6 +1117,55 @@ class Telemetry(tk.Frame):
             return False
         return (now - snap["t"]) <= fresh_s
 
+    def _update_instruments(self, now):
+        """Point the compass and horizon at the SELECTED buoy.
+
+        Preference is the IMU, because it is the origin of the number - the
+        aux_vcu relays the same attitude into the sentence at a twentieth of
+        the rate. Falling back to $GDAT2 means the instruments still work on a
+        buoy whose IMU link is down, which is when you most want them.
+        """
+        try:
+            n = [ip for _nm, ip in gdat2.BUOYS].index(
+                self.host.get().strip()) + 1
+        except ValueError:
+            n = None
+
+        roll = pitch = yaw = None
+        src = ""
+        if n is not None:
+            im = self.imu_links.get(gdat2.buoy_ip(n, gdat2.ROLE_IMU))
+            s = im.snapshot() if im else None
+            if s and s["angle"] and self._is_live(s, now):
+                a = s["angle"]
+                roll, pitch, yaw = a["roll"], a["pitch"], a["yaw"]
+                src = "from IMU  %.0f pkt/s" % s["rate"]
+
+        if roll is None:
+            lk = self.links.get(self.host.get().strip())
+            g = lk.snapshot() if lk else None
+            r = g["last"] if g else None
+            if r is not None and (now - r["t"]) <= 1.0:
+                i_r = self._field_index("AHRS Roll")
+                vals = r["vals"]
+                roll, pitch, yaw = vals[i_r], vals[i_r + 1], vals[i_r + 2]
+                src = "from $GDAT2 relay"
+
+        if roll is None or pitch is None or yaw is None:
+            self.compass.set_yaw(None, None)
+            self.horizon.set_attitude(None, None, None)
+            self.att_src.config(text="attitude: no live source", fg=DIM)
+            return
+        # All three axes carry this buoy's installation offset. Gravity gives
+        # roll and pitch an absolute reference, but that reference is to the
+        # SENSOR's frame, not the hull's - so a unit bolted in a few degrees
+        # off reads a steady tilt while floating perfectly level, and the
+        # correction is what makes the horizon agree with the water.
+        lr, lp = witmotion.level(roll, pitch, buoy=n)
+        self.compass.set_yaw(witmotion.heading(yaw, buoy=n), raw=yaw)
+        self.horizon.set_attitude(lr, lp, raw=(roll, pitch))
+        self.att_src.config(text="attitude %s" % src, fg=DIM)
+
     def _update_overview(self):
         now = time.time()
         for r, (_nm, ip) in enumerate(gdat2.BUOYS):
@@ -989,11 +1204,13 @@ class Telemetry(tk.Frame):
             if ang is None:
                 row[self.C_YAW].config(text="-", fg=DIM)
             else:
-                lo, hi = witmotion.ANGLE_LIMITS[2]
+                # Corrected heading, not raw yaw - see witmotion.heading. The
+                # column is titled "hdg" for that reason: comparing four buoys
+                # is only meaningful once each one's own installation offset
+                # has been taken out.
+                hdg = witmotion.heading(ang["yaw"], buoy=r + 1)
                 row[self.C_YAW].config(
-                    text="%+.1f" % ang["yaw"],
-                    fg=DIM if not ilive else
-                    (TEXT if lo <= ang["yaw"] <= hi else RED))
+                    text="%.1f" % hdg, fg=DIM if not ilive else TEXT)
 
             # ---- altimeter ---------------------------------------------
             al = self.alt_links.get(gdat2.buoy_ip(r + 1, gdat2.ROLE_ALTIMETER))
@@ -1066,6 +1283,21 @@ class Telemetry(tk.Frame):
         self.state_lab.pack(side="right", padx=10)
 
         self._build_overview()
+
+        inst = tk.Frame(self, bg=BG)
+        inst.pack(fill="x", padx=12, pady=(6, 2))
+        self.compass = CompassWidget(inst, size=132)
+        self.compass.pack(side="left", padx=(0, 10))
+        self.horizon = AttitudeWidget(inst, size=132)
+        self.horizon.pack(side="left", padx=(0, 14))
+        # Which unit the needles are actually following. The aux_vcu RELAYS the
+        # IMU's attitude into $GDAT2 fields 4-6, so the two agree - but the IMU
+        # is the direct source at ~1000 packets/s against the sentence's 50, and
+        # saying which one is driving keeps "the compass is stuck" from turning
+        # into a hunt across two devices.
+        self.att_src = tk.Label(inst, text="", bg=BG, fg=DIM, anchor="w",
+                                font=("Consolas", 8), justify="left")
+        self.att_src.pack(side="left", anchor="s", pady=(0, 18))
 
         self.stats = tk.Label(self, text="", bg=BG, fg=DIM, anchor="w",
                               font=("Consolas", 9), justify="left")
@@ -1199,6 +1431,7 @@ class Telemetry(tk.Frame):
 
     def tick(self):
         self._update_overview()
+        self._update_instruments(time.time())
 
         # The detail table follows the selected host, and the liveness trackers
         # below are per-field evidence about ONE unit. Switching buoy without

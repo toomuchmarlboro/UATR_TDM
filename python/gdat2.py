@@ -54,12 +54,20 @@ STILL OPEN: CLIENT OR SERVER
 Unknown which end listens, so Link does either: mode="client" dials the
 aux_vcu, mode="server" waits for it to dial in. Does not block bring-up.
 
-One aux_vcu per buoy on port 8080:
-    buoy 1  192.168.3.110      buoy 3  192.168.3.130
-    buoy 2  192.168.3.120      buoy 4  192.168.3.140
+ADDRESSING: 192.168.3.1<buoy><role>. THREE devices per buoy, all on 8080:
+
+    role 0  .1x0  aux_vcu, $GDAT2 ASCII  <- this file
+    role 1  .1x1  WitMotion IMU, binary  <- witmotion.py, NOT this format
+    role 2  .1x2  Ping1D altimeter       <- ping1d.py
+
+Verified on hardware 2026-08-29 against buoy 3 (.130/.131/.132).
+
+FIELDS[7:9] ("Altimeter dist"/"conf") read hard zero: the altimeter is its own
+device at role 2 and is not wired into this sentence. The manufacturer's own
+reference parser skips those two fields for the same reason.
 
     python gdat2.py --buoy 2                         # dial that buoy
-    python gdat2.py --connect 192.168.3.110:8080
+    python gdat2.py --connect 192.168.3.130:8080
     python gdat2.py --listen 8080                    # wait for it
     python gdat2.py --sim                            # fake source, no hardware
 """
@@ -79,26 +87,88 @@ N_RAW    = 10                     # ulRaw[0..9]
 PERIOD_S = 0.020                  # ~20 ms broadcast
 DEFAULT_PORT = 8080
 
-# One aux_vcu per buoy, all on port 8080.
-BUOYS = (("buoy 1", "192.168.3.110"),
-         ("buoy 2", "192.168.3.120"),
-         ("buoy 3", "192.168.3.130"),
-         ("buoy 4", "192.168.3.140"))
+ROLE_GDAT2 = 0          # aux_vcu, $GDAT2 ASCII      - gdat2.py
+ROLE_IMU = 1            # WitMotion binary IMU/AHRS  - witmotion.py
+ROLE_ALTIMETER = 2      # Blue Robotics Ping1D       - ping1d.py
+
+
+def buoy_ip(n, role=ROLE_GDAT2):
+    """192.168.3.1<buoy><role>. THREE devices per buoy, one digit apart.
+
+    VERIFIED ON HARDWARE 2026-08-29 by scanning the wired segment; buoy 3 was
+    powered and all three answered:
+
+        192.168.3.130:8080   streams $GDAT2            -> role 0
+        192.168.3.131:8080   streams WitMotion 0x55..  -> role 1
+        192.168.3.132:8080   answers Ping protocol     -> role 2
+
+    This corrects a wrong turn. The addresses were briefly changed to .1x1 for
+    telemetry on the understanding that the manufacturer had re-addressed
+    everything when the altimeter moved out. They had not: telemetry is still
+    .1x0, exactly where it always was, and .1x1 is a THIRD device - an IMU -
+    that did not previously exist in this file at all.
+
+    Three roles one digit apart is the easiest kind of address to mistype and
+    the hardest to notice, which is why this is a rule and not twelve literals:
+    a wrong digit reaches a real device that is simply not the one you meant,
+    and the symptom is a decoder finding nothing rather than an error.
+    """
+    if not 1 <= n <= 4:
+        raise ValueError("buoy must be 1-4, got %r" % (n,))
+    if role not in (ROLE_GDAT2, ROLE_IMU, ROLE_ALTIMETER):
+        raise ValueError("role must be 0 (GDAT2), 1 (IMU) or 2 (altimeter)")
+    return "192.168.3.1%d%d" % (n, role)
+
+
+# One aux_vcu per buoy, all on port 8080. Unchanged since the start - see
+# buoy_ip for why this briefly said .1x1 and why that was wrong.
+BUOYS = tuple(("buoy %d" % n, buoy_ip(n, ROLE_GDAT2)) for n in (1, 2, 3, 4))
+
+# The IMU. WitMotion binary, NOT $GDAT2 - 11-byte packets, 0x55 header, type
+# byte, 8 data bytes, sum-of-bytes checksum. Five packet types at ~60 Hz each,
+# so ~300 packets/s. Pointing a GDAT2 reader at these gives 300 unparsable
+# "sentences" per second, which is what led here.
+IMUS = tuple(("buoy %d" % n, buoy_ip(n, ROLE_IMU)) for n in (1, 2, 3, 4))
+
+# Blue Robotics Ping1D altimeter behind a serial-to-TCP bridge. See ping1d.py.
+# This is why FIELDS[7:9] ("Altimeter dist"/"conf") read hard zero in the
+# GDAT2 sentence: the sensor is not wired into it, and the manufacturer's own
+# reference parser skips those two fields entirely.
+ALTIMETERS = tuple(("buoy %d" % n, buoy_ip(n, ROLE_ALTIMETER))
+                   for n in (1, 2, 3, 4))
 
 # The unit actually in service, so a bare run dials the one that exists rather
-# than the one that happens to be first in the table. 2026-08-19: buoy 3,
-# 192.168.3.130 - operator confirmed. Earlier notes name buoy 1 as the only
-# live unit; that is superseded.
+# than the one that happens to be first in the table. buoy 3 at .130 -
+# operator-confirmed 2026-08-19 and re-confirmed on the wire 2026-08-29.
 ACTIVE_BUOY  = 3
 DEFAULT_HOST = BUOYS[ACTIVE_BUOY - 1][1]
 
-# Not a buoy: 192.168.3.131 answers on 8080 with an Embedthis embedded web
-# server. It is one digit from the address above and open on the same port, and
-# it accepts the connection and then sends nothing - which reads exactly like a
-# silent aux_vcu. It is a different device. A GDAT2 source streams immediately
-# on connect and needs no request; if a socket opens and stays quiet, check
-# what answered before suspecting the telemetry.
-
+# WHAT ELSE IS ON THESE ADDRESSES - settled by measurement, 2026-08-29.
+#
+# An old note here read "Not a buoy: 192.168.3.131 answers on 8080 with an
+# Embedthis embedded web server ... accepts the connection and then sends
+# nothing, which reads exactly like a silent aux_vcu."
+#
+# The conclusion was right - .131 is not a GDAT2 source - but the reason was
+# wrong. .131 is a WitMotion IMU streaming BINARY on 8080. A reader expecting
+# ASCII sentences finds no '$', no newlines it trusts, and reports nothing,
+# which is indistinguishable from silence unless you dump the bytes. It was
+# measured at ~300 packets/s with a 100% checksum pass rate.
+#
+# So all three of .1x0/.1x1/.1x2 are real devices that accept TCP on 8080 and
+# talk immediately. Which one you reached is decided by the LAST DIGIT, and
+# each speaks a different protocol:
+#
+#     $GDAT2,...     ASCII, starts with '$'   -> role 0, this file
+#     0x55 0x5x ...  11-byte binary packets   -> role 1, witmotion.py
+#     'B','R' ...    Ping protocol frames     -> role 2, ping1d.py
+#
+# A GDAT2 source streams immediately on connect and needs no request. If a
+# socket opens and produces nothing this decoder likes, dump the first bytes
+# before suspecting the sensor:
+#
+#     python altimeter_probe.py 192.168.3.131
+#
 # name, unit, kind. kind drives how a bare integer token is reinterpreted.
 FIELDS = (
     ("Leak sensor",     "V",    "f32"),

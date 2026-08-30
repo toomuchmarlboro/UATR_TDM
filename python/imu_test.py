@@ -69,7 +69,7 @@ RUNNING IT
     python gdat2.py --sim                         # fake aux_vcu, one terminal
     python imu_test.py --connect 127.0.0.1        # this one, in another
 
-    python imu_test.py --buoy 1                   # 192.168.3.110:8080
+    python imu_test.py --buoy 1                   # 192.168.3.111:8080
     python imu_test.py --buoy 1 --expect still    # bench: should be steady
     python imu_test.py --buoy 1 --expect moving   # in the water: should move
     python imu_test.py --buoy 1 --n-frames 200    # stop after 200 good frames

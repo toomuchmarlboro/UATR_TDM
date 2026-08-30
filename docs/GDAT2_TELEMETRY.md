@@ -4,28 +4,50 @@ New protocol, separate hardware. This is **not** the FPGA soundcard: different
 device, different transport (TCP, not UDP), different framing. Implemented in
 `gdat2.py`, displayed in the **Telemetry** tab of `mixer_gui.py`.
 
-One aux_vcu per buoy, all on **port 8080**:
+Addressing is **`192.168.3.1<buoy><role>`**, role `1` = telemetry, `2` =
+altimeter. One aux_vcu per buoy on **port 8080**:
 
-| | address | |
-|---|---|---|
-| buoy 1 | `192.168.3.110` | |
-| buoy 2 | `192.168.3.120` | |
-| buoy 3 | `192.168.3.130` | **active unit** (2026-08-19) |
-| buoy 4 | `192.168.3.140` | |
+| | telemetry | altimeter | |
+|---|---|---|---|
+| buoy 1 | `192.168.3.111` | `192.168.3.112` | |
+| buoy 2 | `192.168.3.121` | `192.168.3.122` | |
+| buoy 3 | `192.168.3.131` | `192.168.3.132` | **active unit** |
+| buoy 4 | `192.168.3.141` | `192.168.3.142` | |
+
+> **Re-addressed 2026-08-29.** Telemetry moved `.1x0` → `.1x1` when the
+> manufacturer gave the altimeter its own address at `.1x2`. Captures and notes
+> written before that date refer to `.110/.120/.130/.140`.
+
+`gdat2.buoy_ip(n, role)` is the one definition of the scheme — written as a
+rule, not eight literals, because the two roles differ by a single digit in the
+last octet. That is the easiest kind of address to mistype and the hardest to
+notice: a wrong one connects to a real device that simply is not the one you
+meant, and the symptom is a silent link rather than an error.
 
 `gdat2.ACTIVE_BUOY` names the unit in service and `DEFAULT_HOST` follows it, so
 a bare `python imu_test.py` dials the buoy that exists rather than whichever is
 first in the table. Change it in that one place when the active unit changes.
 
-> ### ⚠ `192.168.3.131` is not a buoy
+> ### ⚠ A socket that opens and stays quiet
 >
-> One digit from buoy 3, open on the same port 8080, and it **accepts the
-> connection and then sends nothing** — which reads exactly like a silent
-> aux_vcu. It is a different device: an `Embedthis-http` embedded web server.
+> An `Embedthis-http` embedded web server was found answering **port 8080** on
+> what is now buoy 3's telemetry address, **accepting the connection and then
+> sending nothing** — which reads exactly like a silent aux_vcu.
 >
-> The discriminator is simple. **A GDAT2 source streams on connect without being
-> asked.** A socket that opens and stays quiet is the wrong device, not a broken
-> sensor. `imu_test.py --raw` settles it in seconds.
+> This was originally recorded as "`.131` is not a buoy", on the reasoning that
+> telemetry lived at `.130` and `.131` was a decoy one digit away. Under the
+> current scheme `.131` **is** buoy 3's telemetry, so the conclusion no longer
+> holds even though the observation does. What it most likely recorded is a web
+> **config page** on that host, which is exactly what sits silent when handed no
+> HTTP request.
+>
+> **So the open question is the port, not the address.** The discriminator is
+> unchanged: **a GDAT2 source streams on connect without being asked.** If
+> `.1x1:8080` connects and stays quiet, sweep for the real port:
+>
+> ```
+> python python/altimeter_probe.py --buoy 3 --role 1
+> ```
 
 ## OUTGOING PACKETS (aux_vcu → Control Station)
 
@@ -81,7 +103,7 @@ regardless.
 
 ## First real capture from buoy 3 (2026-08-19)
 
-399 sentences in 8 s from `192.168.3.130:8080`, **0 checksum errors, 0 parse
+399 sentences in 8 s from `192.168.3.130:8080` (pre-2026-08-29 address; now `.131`), **0 checksum errors, 0 parse
 errors, 0 counter gaps**. Framing, checksum and field layout are now confirmed
 against hardware rather than against the makers' example.
 
@@ -163,8 +185,8 @@ Also tolerated: sentences with 11 fields (no `seq`) as well as the documented
 ```sh
 python gdat2.py --selftest              # decoder round-trip, no hardware
 python gdat2.py --sim                   # fake aux_vcu on :8080
-python gdat2.py --buoy 2                # CLI readout from 192.168.3.120:8080
-python gdat2.py --connect 192.168.3.110:8080
+python gdat2.py --buoy 2                # CLI readout from 192.168.3.121:8080
+python gdat2.py --connect 192.168.3.111:8080
 python gdat2.py --listen 8080
 
 python mixer_gui.py --gdat-buoy 2 --gdat-connect

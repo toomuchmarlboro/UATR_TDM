@@ -225,19 +225,170 @@ netsh interface ipv4 delete address name="Ethernet" 192.168.3.240
 
 ---
 
-## 5. Link speed
+## 5. Which image, and what it costs on the wire
 
-| configuration | aggregate | needs |
+Two image sets exist. They are the **same design** — same 16 channels, same
+24-bit samples, same packet layout, same addressing. The only difference is
+whether the on-FPGA decimator is in the signal path.
+
+| | `96K_*` | `24K_*` |
 |---|---|---|
-| 4 boards @ 24 kHz + telemetry | 46.6 Mbit/s | 100 Mbit is enough |
-| 4 boards @ 96 kHz + telemetry | 183.6 Mbit/s | **gigabit NIC and uplink** |
+| `C_DECIMATE` | false | true |
+| sample rate | 96 kHz | 24 kHz |
+| usable band | 0–42 kHz (ADC limit) | **0–11 kHz** |
+| logic used | 3,429–3,455 LE (55%) | 5,308–5,343 LE (85%) |
 
-The four board links stay at 100 Mbit either way — each carries only its own
-stream. It is the **switch uplink and the host NIC** that must be gigabit for
-the 96 kHz images.
+### Where the 4× comes from
 
-Telemetry is 0.9 Mbit/s total, under 2% of the audio. It has never been a
-constraint.
+Every packet carries exactly 8 audio frames at either rate, so **the packet
+size never changes — only how often one is sent**:
+
+```
+                          96 kHz        24 kHz
+audio frames per packet        8             8
+packets per second        12,000         3,000     <- the only thing that changes
+bytes per packet             476           476
+```
+
+Which gives, per board:
+
+```
+                          96 kHz          24 kHz
+audio payload         36.864 Mbit/s    9.216 Mbit/s   16ch x 24bit x fs
++ 10-byte header      39.360           9.840          UDP payload
++ eth/IP/UDP hdrs     45.696          11.424          ON THE WIRE
+                      -------------   -------------
+of 100BASE-TX           45.7%           11.4%
+```
+
+Four boards:
+
+```
+                          96 kHz          24 kHz
+aggregate            182.784 Mbit/s   45.696 Mbit/s
+of 100BASE-TX            183%  <- does not fit      46%
+of gigabit                18%                        4.6%
+disk, all 4 boards      18.4 MB/s       4.6 MB/s
+                        66 GB/hour      16 GB/hour
+```
+
+### Why the wire figure is bigger than the audio
+
+The 476 bytes on the wire per 410 bytes of payload is **86% efficiency**, and
+the overhead is fixed per packet:
+
+```
+410 B  UDP payload      (10-byte header + 8 frames x 50 B)
+ +8 B  UDP header
++20 B  IPv4 header
++14 B  Ethernet header
+       -----
+452 B  frame body
+ +8 B  preamble + start-frame delimiter
+ +4 B  Ethernet FCS
++12 B  inter-frame gap
+       -----
+476 B  actually occupied on the link
+```
+
+Because that 66 bytes is **per packet**, sending 4× fewer packets saves the
+overhead 4× over as well — which is why the wire rate scales cleanly by 4.00
+and not slightly less.
+
+### What this decides
+
+| | |
+|---|---|
+| **96 kHz, four boards** | 183 Mbit/s — **needs a gigabit NIC and uplink.** Does not fit 100BASE-TX |
+| **24 kHz, four boards** | 46 Mbit/s — fits 100BASE-TX end to end, including the 7 km fibre link |
+
+The four **board** links stay at 100 Mbit either way, since each carries only
+its own stream. It is the **switch uplink and the host NIC** that must be
+gigabit for the 96 kHz set.
+
+Packet rate matters more than bit rate in practice: 48,000 pkt/s across four
+Python processes is where drops actually appear, and 12,000 pkt/s is
+comfortable. See §9.
+
+Telemetry is 0.9 Mbit/s total, under 2% of the audio either way. It has never
+been a constraint.
+
+### Choosing
+
+Use **`24K_*`** unless you need content above 11 kHz. It costs nothing in
+quality inside that band — 0.00015 dB passband ripple, −102.5 dB alias
+rejection, below the converter's own noise floor — and it removes the gigabit
+requirement, cuts host CPU 4×, and quarters the disk rate.
+
+Use **`96K_*`** if you need the full 0–42 kHz the ADC passes, or as the
+fallback: it is the configuration that has actually run on hardware.
+
+---
+
+## 5a. Which .jic to flash — there are 97 of them
+
+`output_files/` has accumulated every image ever built. Only eight are current.
+
+### Use these
+
+Built 2026-09-08 15:18–15:25 in one locked run. They carry both decimator
+fixes and the 192.168.3.x addressing.
+
+```
+24K_NODE1_192-168-3-101.jic      96K_NODE1_192-168-3-101.jic
+24K_NODE2_192-168-3-102.jic      96K_NODE2_192-168-3-102.jic
+24K_NODE3_192-168-3-103.jic      96K_NODE3_192-168-3-103.jic
+24K_NODE4_192-168-3-104.jic      96K_NODE4_192-168-3-104.jic
+```
+
+All eight verified distinct by MD5, TNS 0.0 on all five timing checks.
+
+### ⚠ Do NOT flash these
+
+`24K_NODE*_192-168-1-*.jic` (2026-09-07 23:29–23:33) — the **first** decimator
+build, carrying both bugs that were found afterwards:
+
+- misaligned pipeline: every coefficient multiplied the wrong sample, so all
+  16 channels would be noise
+- schedule overrun: engine 2 needed 1,440 cycles against 1,024, so output
+  frames were dropped silently
+
+They look like ordinary images and the filename gives no hint. Delete them:
+
+```bash
+rm output_files/24K_NODE*_192-168-1-*.jic
+```
+
+### Keep as fallback
+
+`96K_NODE*_192-168-1-*.jic` (2026-08-29) — the last images **known good on
+hardware**. Pre-decimation, pre-migration, so they need the host to hold
+`192.168.1.10`. Keep them until the new set has been proven wet.
+
+`96K_ACT.jic` is the older single-board reference for the same reason.
+
+### The naming rule
+
+```
+<RATE>_NODE<n>_<board-ip>.jic
+  |       |        |
+  |       |        +-- must match the board you are about to flash
+  |       +----------- 1-4, sets MAC, IP and UDP port
+  +------------------- 24K = decimating, 96K = plain
+```
+
+**Check the number in the filename against the board actually connected.**
+Four near-identical images per set is exactly where the wrong one lands on the
+wrong board, and the symptom — two boards claiming one IP — reads as a network
+fault rather than a flashing mistake.
+
+```
+quartus_pgm -m jtag -o "pi;output_files/24K_NODE2_192-168-3-102.jic"
+ping 192.168.3.102
+arp -a | findstr 192.168.3.102        # expect de-ad-be-ef-00-02
+```
+
+The MAC in the ARP table proves you flashed the image you meant to.
 
 ---
 

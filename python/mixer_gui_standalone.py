@@ -1498,6 +1498,11 @@ class Receiver(threading.Thread):
         self.lock = threading.Lock()
         self.raw, self.pkts, self.lost, self.seq_prev = [], 0, 0, 0
         self.stop = False
+        # The address this board is actually transmitting from, learned from
+        # the packets we are already receiving. Costs nothing - recvfrom
+        # returns it anyway - and it is authoritative in a way that assuming a
+        # subnet is not. None until the first packet arrives.
+        self.src = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -1517,7 +1522,9 @@ class Receiver(threading.Thread):
         local = []
         while not self.stop:
             try:
-                d = self.sock.recv(2048)
+                d, addr = self.sock.recvfrom(2048)
+                if self.src != addr[0]:
+                    self.src = addr[0]
             except socket.timeout:
                 if local:
                     self._flush(local)
@@ -1559,9 +1566,29 @@ class Mixer(tk.Frame):
     below is unchanged apart from packing into self instead of into a root.
     """
 
+    @property
+    def ip(self):
+        """Where control commands go for this board.
+
+        Prefers the address the board is actually transmitting from, which the
+        Receiver learned from its own packets. Falls back to the configured
+        node_ip() until the first packet arrives, and never overrides an
+        explicit --ip.
+
+        This is what makes the GUI correct on a mixed array: a board still
+        running a 192.168.1.x image is controlled at 192.168.1.x even though
+        ctrl.SUBNET says 192.168.3, with no flag and no configuration.
+        """
+        if self.ip_fixed:
+            return self._ip_cfg
+        return getattr(self.rx, "src", None) or self._ip_cfg
+
     def __init__(self, master, rx, fps, hold, ip, label=""):
         super().__init__(master, bg=BG)
-        self.rx, self.hold_s, self.ip = rx, hold, ip
+        self.rx, self.hold_s = rx, hold
+        self._ip_cfg = ip          # configured fallback
+        self.ip_fixed = False      # True when --ip was given: never override
+        self.node = None
         # Shown in the header. With four of these in one window, every panel
         # looks identical, and a fader moved on the wrong board is silent and
         # unrecoverable - so which board this is has to be on screen, not
@@ -1974,10 +2001,24 @@ class Mixer(tk.Frame):
         # 24K_* and a 96K_* image on the same array is a real state, and
         # displaying one global constant for both would misreport one of them.
         # Falls back to um.SAMPLE_RATE while the packet rate is still settling.
-        _fs, _ok = um.detect_rate([None] * int(npk), self.period / 1000.0)
+        #
+        # npk + lost is what the board SENT, not what arrived. That matters
+        # because loss only ever lowers the measured rate and the two rates are
+        # exactly 4x apart: a 96 kHz board losing 75% of its packets measures
+        # 24000 and would be displayed as a healthy 24 kHz board. The Receiver
+        # already counts `lost` from the sequence numbers, so this costs
+        # nothing and closes the same hole detect_rate's seqs= argument does.
+        _fs, _ok = um.detect_rate([None] * int(npk + lost),
+                                  self.period / 1000.0)
         _shown = int(_fs) if _ok else um.SAMPLE_RATE
-        self.cv.itemconfigure(self.hdr, text="%s%d Hz   %5.0f pkt/s   lost %d"
-                              % (self.label, _shown, pps, lost))
+        # The address is read LIVE, not baked in at construction: it is learned
+        # from the board's own packets and may differ from the configured
+        # subnet on a mixed array. Showing the stale one would say
+        # 192.168.3.103 while control correctly went to 192.168.1.103, which is
+        # exactly the kind of quiet disagreement this header exists to prevent.
+        self.cv.itemconfigure(self.hdr, text="%s%s:%d   %d Hz   %5.0f pkt/s   lost %d"
+                              % (self.label, self.ip, getattr(self, "port", 0),
+                                 _shown, pps, lost))
         self.cv.itemconfigure(self.sub, text="bar = RMS   white = held peak   "
                                              "faders write ADAU1978 reg 0x0A-0x0D over I2C")
 
@@ -3198,14 +3239,33 @@ class App(tk.Tk):
         # the loss figure would be meaningless for both.
         #
         # --port / --ip still override, for pointing one window at one board.
+        # CONTROL IP FOLLOWS THE BOARD, IT IS NOT ASSUMED.
+        #
+        # Receiving never needed this - the socket binds INADDR_ANY, so audio
+        # arrives whatever subnet the board is on. SENDING does: a gain or
+        # phantom command goes TO an address, and a board only ever answers on
+        # the address its own flashed image was built with. An array part-way
+        # through the 192.168.1.x -> 192.168.3.x migration legitimately has
+        # boards on both, and a static ctrl.node_ip() would address all of them
+        # on the configured subnet - faders would appear to work and change
+        # nothing on the boards that are elsewhere.
+        #
+        # The Receiver learns the address from the packets it is already
+        # taking, so no extra socket is opened. That matters: probing with a
+        # second socket on the same port would contend with the Receiver, and
+        # on Windows two sockets can both bind with SO_REUSEADDR while only ONE
+        # receives. ctrl.node_ip() is the fallback until the first packet
+        # arrives; --ip still overrides for pointing one window at one board.
         self.rxs, self.mixers = [], []
         for n in a.nodes:
             port = a.port if a.port else ctrl.node_stream_port(n)
-            ip   = a.ip   if a.ip   else ctrl.node_ip(n)
+            ip   = a.ip if a.ip else ctrl.node_ip(n)
             rx = Receiver(port, a.bind)
             rx.start()
-            mx = Mixer(nb, rx, a.fps, a.peak_hold, ip,
-                       label="AFE %d  %s:%d   " % (n, ip, port))
+            mx = Mixer(nb, rx, a.fps, a.peak_hold, ip, label="AFE %d  " % n)
+            mx.node = n
+            mx.port = port
+            mx.ip_fixed = bool(a.ip)
             self.rxs.append(rx)
             self.mixers.append(mx)
             nb.add(mx, text="AFE %d" % n)

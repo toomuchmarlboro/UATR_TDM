@@ -1,5 +1,15 @@
 # Running four boards
 
+> **PARTLY SUPERSEDED, 2026-09-08.** The addresses below are the pre-migration
+> `192.168.1.x` set. The array is now on `192.168.3.x` and there are two image
+> variants (96 kHz and 24 kHz decimating). For current addressing and host
+> configuration read **`docs/HOST_SETUP.md`**; for the decimator read
+> `docs/DECIMATION.md`.
+>
+> Everything else here still applies: why one UDP port per board, the ARP and
+> checksum reasoning, the bandwidth arithmetic, and the cross-board timing
+> section at the end.
+
 Four soundcards, 16 channels each, all streaming to one host.
 
 Everything per-board derives from **one integer**, `C_NODE` in `rtl/top_system.vhd`.

@@ -111,10 +111,40 @@ fs   = bclk / div
 # Not every rate is a round number of kHz: 44.1 kHz cannot be generated exactly
 # from 50 MHz (needs 3528/15625) and the closest ALTPLL ratio lands +64 ppm off.
 # Compare within 0.1% rather than rounding to the nearest kHz.
+# C_DECIMATE divides the ADC rate by 4 on the way out, so the rate the HOST
+# sees is not the rate the ADC runs at. The packet layout is byte-identical
+# either way, so nothing downstream can notice a mismatch on its own - this is
+# the only place the two sides are compared.
+_decim = re.search(r'constant\s+C_DECIMATE\s*:\s*boolean\s*:=\s*(true|false)', top)
+_dec_on = bool(_decim and _decim.group(1) == "true")
+_ratio = 4 if _dec_on else 1
+_host_fs = fs / _ratio
+
 _want = pyconst(mon, "SAMPLE_RATE")
-chk("SAMPLE_RATE", abs(_want - fs) / fs < 1e-3, True,
-    "BCLK %.4f MHz / %d = %.1f Hz, udp_monitor says %d (%+.0f ppm)"
-    % (bclk / 1e6, div, fs, _want, (_want - fs) / fs * 1e6))
+chk("SAMPLE_RATE", abs(_want - _host_fs) / _host_fs < 1e-3, True,
+    "BCLK %.4f MHz / %d = %.1f Hz at the ADC, C_DECIMATE=%s -> /%d -> %.1f Hz "
+    "on the wire, udp_monitor says %d (%+.0f ppm)"
+    % (bclk / 1e6, div, fs, str(_dec_on).lower(), _ratio, _host_fs, _want,
+       (_want - _host_fs) / _host_fs * 1e6))
+
+# The decimator is only in the datapath when its files are in the project.
+# C_DECIMATE = true without them is a build that cannot work; the reverse is
+# harmless (the instance is stripped), so only one direction is an error.
+if _dec_on:
+    _qsf = rd(ROOT / "TDM_UATR.qsf")
+    chk("decimator in QSF", ("decimator.vhd" in _qsf
+                             and "decim_coef_pkg.vhd" in _qsf), True,
+        "C_DECIMATE is true, so rtl/decimator.vhd and rtl/decim_coef_pkg.vhd "
+        "must both be listed in TDM_UATR.qsf")
+
+    # Coefficients are generated; the package must match what the design script
+    # currently produces or the filter is not the one that was verified.
+    _cf = rd(RTL / "decim_coef_pkg.vhd")
+    _n1 = re.search(r'C_N1\s*:\s*integer\s*:=\s*(\d+)', _cf)
+    _n2 = re.search(r'C_N2\s*:\s*integer\s*:=\s*(\d+)', _cf)
+    chk("decim coefficients present", bool(_n1 and _n2), True,
+        "decim_coef_pkg.vhd declares C_N1/C_N2 (regenerate with "
+        "python/design_decimator.py)")
 
 # slot width and data width are no longer the same: 32 BCLK slots carry 24-bit
 # samples, so the shift register (frame in BCLKs) is wider than the data output.
@@ -328,36 +358,64 @@ for name, src in (("tdm8_rx", trx), ("tdm16_merge", rd(RTL / "tdm16_merge.vhd"))
         "must not level-test LRCLK")
 
 # ------------------------------------------------- 8. IP/UDP header fields ---
-# udp_tx_core hardcodes the IPv4 header checksum as a constant, but the header it
-# covers contains fpga_ip and pc_ip, which are declared in top_system. Change an
-# IP address and the checksum silently becomes wrong - the FPGA keeps sending and
-# the PC's stack drops every frame, which looks exactly like a dead link. Same
-# class of cross-file coupling as cfg_ok_i vs VFY_LIST, so guard it the same way.
-fpga_ip = int(re.search(r'C_FPGA_IP\s*:\s*std_logic_vector\(31 downto 0\)\s*:=\s*x"([0-9A-Fa-f]{8})"', top).group(1), 16)
-pc_ip   = int(re.search(r'C_PC_IP\s*:\s*std_logic_vector\(31 downto 0\)\s*:=\s*x"([0-9A-Fa-f]{8})"', top).group(1), 16)
-ck_rtl  = int(re.search(r'IP_CHECKSUM\s*:\s*std_logic_vector\(15 downto 0\)\s*:=\s*x"([0-9A-Fa-f]{4})"', utx).group(1), 16)
+# The IPv4 header checksum used to be the literal IP_CHECKSUM in udp_tx_core,
+# and this block recomputed it. It is now work.net_pkg.ipv4_checksum, evaluated
+# at elaboration from C_FPGA_IP and C_PC_IP, with static assertions in
+# top_system that FAIL THE BUILD on a wrong value - a stronger guard than this
+# script can offer, and one that cannot be skipped.
+#
+# What is checked here instead is the part Quartus cannot see: that the
+# addresses compiled into the RTL are the ones the host tools will talk to.
+# C_FPGA_IP is an expression (x"C0A803" & C_NODE), so it is reconstructed from
+# its parts rather than read as a literal - the old regex expected a literal and
+# silently stopped matching when the expression was introduced, which is exactly
+# the kind of drift this file exists to catch.
+_sub = re.search(r'x"C0A8([0-9A-Fa-f]{2})"\s*&\s*std_logic_vector\(to_unsigned\(100 \+ C_NODE', top)
+_node = re.search(r'constant\s+C_NODE\s*:\s*integer\s+range 1 to 4\s*:=\s*(\d+)', top)
+_pc = re.search(r'C_PC_IP\s*:\s*std_logic_vector\(31 downto 0\)\s*:=\s*x"([0-9A-Fa-f]{8})"', top)
+
+if _sub and _node and _pc:
+    _third = int(_sub.group(1), 16)
+    _n = int(_node.group(1))
+    rtl_board = "192.168.%d.%d" % (_third, 100 + _n)
+    _pcv = int(_pc.group(1), 16)
+    rtl_host = "%d.%d.%d.%d" % (_pcv >> 24, (_pcv >> 16) & 0xFF,
+                                (_pcv >> 8) & 0xFF, _pcv & 0xFF)
+
+    import ctrl as _ctrl
+    chk("board IP vs ctrl.py", _ctrl.node_ip(_n), rtl_board,
+        "C_NODE=%d in top_system -> %s; ctrl.node_ip(%d) must agree "
+        "(docs/CHANGING_IP.md)" % (_n, rtl_board, _n))
+    chk("host IP vs ctrl.py", _ctrl.HOST_IP, rtl_host,
+        "C_PC_IP in top_system is %s; ctrl.HOST_IP must agree, and the PC's "
+        "adapter must actually be set to it" % rtl_host)
+    chk("board subnet is known", rtl_board.rsplit(".", 1)[0] in _ctrl.KNOWN_SUBNETS,
+        True, "ctrl.KNOWN_SUBNETS must list %s or discovery cannot find this "
+        "board" % rtl_board.rsplit(".", 1)[0])
+    chk("host on board subnet", rtl_host.rsplit(".", 1)[0],
+        rtl_board.rsplit(".", 1)[0],
+        "a board cannot deliver to a host on another subnet, and C_PC_IP is "
+        "also the ARP filter")
+else:
+    FAIL.append(("IP address extraction", "no match", "regex matches",
+                 "C_FPGA_IP / C_PC_IP / C_NODE not in the expected form"))
 
 
-def _byte(src, n):
-    """the literal udp_tx_core emits for byte_cnt = n, as an int"""
-    m = re.search(r'when %d\s*=>\s*next_byte <= x"([0-9A-Fa-f]{2})"' % n, src)
-    return int(m.group(1), 16) if m else None
+# IP/UDP total length used to be literal bytes in the byte_cnt case statement
+# and is now derived from PAYLOAD_BYTES, so read the expression's inputs rather
+# than the emitted bytes. Same drift as the checksum above: the old regex
+# matched literals that no longer exist and the check quietly did nothing.
+_pb = re.search(r'PAYLOAD_BYTES\s*:\s*integer\s*:=\s*(\d+)', utx)
+if not _pb:
+    _pb = re.search(r'PAYLOAD_BYTES\s*:\s*integer\s*:=\s*(\d+)', top)
+_payload_rtl = int(_pb.group(1)) if _pb else None
 
+chk("PAYLOAD_BYTES vs host", _payload_rtl, pyconst(mon, "PAYLOAD_LEN"),
+    "udp_tx_core PAYLOAD_BYTES drives IP and UDP length; udp_monitor "
+    "PAYLOAD_LEN must match or the host rejects every packet")
 
-ip_total  = (_byte(utx, 16) << 8) | _byte(utx, 17)
-udp_total = (_byte(utx, 38) << 8) | _byte(utx, 39)
-_words = [(_byte(utx, 14) << 8) | _byte(utx, 15), ip_total,
-          (_byte(utx, 18) << 8) | _byte(utx, 19),
-          (_byte(utx, 20) << 8) | _byte(utx, 21),
-          (_byte(utx, 22) << 8) | _byte(utx, 23), 0x0000,
-          fpga_ip >> 16, fpga_ip & 0xFFFF, pc_ip >> 16, pc_ip & 0xFFFF]
-_s = sum(_words)
-while _s >> 16:
-    _s = (_s & 0xFFFF) + (_s >> 16)
-chk("IPv4 header checksum", ck_rtl, (~_s) & 0xFFFF,
-    "udp_tx_core IP_CHECKSUM vs %d.%d.%d.%d -> %d.%d.%d.%d in top_system"
-    % (fpga_ip >> 24, (fpga_ip >> 16) & 0xFF, (fpga_ip >> 8) & 0xFF, fpga_ip & 0xFF,
-       pc_ip >> 24, (pc_ip >> 16) & 0xFF, (pc_ip >> 8) & 0xFF, pc_ip & 0xFF))
+ip_total  = 20 + 8 + (_payload_rtl or 0)
+udp_total = 8 + (_payload_rtl or 0)
 chk("IPv4 total length", ip_total, 20 + 8 + pyconst(mon, "PAYLOAD_LEN"),
     "20 IP + 8 UDP + payload")
 chk("UDP length", udp_total, 8 + pyconst(mon, "PAYLOAD_LEN"), "8 UDP + payload")

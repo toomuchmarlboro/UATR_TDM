@@ -92,7 +92,9 @@ def rms_db(blocks):
     """(rms_dbfs, all_exact_zero, fraction_of_samples_that_are_zero).
 
     The zero FRACTION is what matters, not just all-or-nothing. A window is
-    24000 samples at 96 kHz, so np.all(x == 0) is only true if the part was
+    24000 samples at 96 kHz (6000 at 24 kHz - windows are wall-clock seconds,
+    so this tool is rate-independent), so np.all(x == 0) is only true if the
+    part was
     silent for the entire quarter second. A part that drops out for 50 ms inside
     the window still left 200 ms of audio, so it counted as fully live and the
     channel was reported "steady" - while a level meter updating every 10 ms

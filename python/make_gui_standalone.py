@@ -236,11 +236,20 @@ READING THE TELEMETRY TAB
 
 IF NOTHING CONNECTS
 ===================
-The host needs an address on the sensors' subnet. An adapter configured for the
-FPGA soundcards (192.168.1.x) cannot reach 192.168.3.x at all, and the traffic
-leaves over Wi-Fi instead. Windows allows a second address on one NIC:
+The host needs an address on the subnet of whatever it is talking to, and
+unicast UDP is filtered by DESTINATION address: a socket bound to INADDR_ANY
+still only receives packets addressed to an IP this host actually owns.
 
-    netsh interface ipv4 add address name="Ethernet" 192.168.3.240 255.255.255.0
+The soundcards moved to 192.168.3.x on 2026-09-07, so they and the sensors now
+share a subnet - but boards still carrying an older image are on 192.168.1.x and
+send to 192.168.1.10. Windows allows several addresses on one NIC, and you need
+one matching each image's compiled-in C_PC_IP:
+
+    netsh interface ipv4 add address name="Ethernet" 192.168.3.10  255.255.255.0
+    netsh interface ipv4 add address name="Ethernet" 192.168.1.10  255.255.255.0
+
+Check what you actually have with:  Get-NetIPAddress -AddressFamily IPv4
+See docs/NETWORK_SETUP.md and docs/CHANGING_IP.md.
 
 If a link connects but decodes nothing, dump the bytes before suspecting the
 sensor - that is how the IMU was found being read as $GDAT2.
@@ -283,10 +292,19 @@ def build():
                  "import numpy as np\n")
     parts.append(NS_DOC)
 
+    # KNOWN_RATES must precede detect_rate: it is read at call time, but keeping
+    # definition order matching the source avoids surprises if that ever changes.
     um_names = ["MAGIC", "HDR_LEN", "FRAME_LEN", "FRAMES_PKT", "PAYLOAD_LEN",
-                "CHANNELS", "SAMPLE_BYTES", "FULL_SCALE", "SAMPLE_RATE"]
-    ct_names = ["FPGA_IP", "FPGA_PORT", "STREAM_PORT", "MUTE", "ZERO_DB",
-                "PHANTOM_FRAME", "node_ip", "node_stream_port", "gain_byte",
+                "CHANNELS", "SAMPLE_BYTES", "FULL_SCALE", "SAMPLE_RATE",
+                "KNOWN_RATES", "detect_rate"]
+    # SUBNET / KNOWN_SUBNETS / HOST_IP MUST precede FPGA_IP: FPGA_IP is
+    # "SUBNET + '.101'", evaluated at module level in the generated file, and
+    # these are emitted in list order. Same trap as buoy_ip/BUOYS below - it
+    # fails with NameError on import, which is at least loud.
+    ct_names = ["SUBNET", "KNOWN_SUBNETS", "HOST_IP",
+                "FPGA_IP", "FPGA_PORT", "STREAM_PORT", "MUTE", "ZERO_DB",
+                "PHANTOM_FRAME", "node_ip", "node_ips", "node_stream_port",
+                "find_node", "resolve_node", "gain_byte",
                 "gain_db", "send_gain", "send_flags", "phantom_state",
                 "phantom_reason", "decode"]
     # buoy_ip MUST precede BUOYS: BUOYS calls it at module level, and these are
@@ -344,13 +362,17 @@ def build():
         "um = _NS(MAGIC=MAGIC, HDR_LEN=HDR_LEN, FRAME_LEN=FRAME_LEN,\n"
         "         FRAMES_PKT=FRAMES_PKT, PAYLOAD_LEN=PAYLOAD_LEN,\n"
         "         CHANNELS=CHANNELS, SAMPLE_BYTES=SAMPLE_BYTES,\n"
-        "         FULL_SCALE=FULL_SCALE, SAMPLE_RATE=SAMPLE_RATE)\n"
+        "         FULL_SCALE=FULL_SCALE, SAMPLE_RATE=SAMPLE_RATE,\n"
+        "         KNOWN_RATES=KNOWN_RATES, detect_rate=detect_rate)\n"
         "ctrl = _NS(FPGA_IP=FPGA_IP, FPGA_PORT=FPGA_PORT,\n"
         "           STREAM_PORT=STREAM_PORT, MUTE=MUTE, ZERO_DB=ZERO_DB,\n"
         "           PHANTOM_FRAME=PHANTOM_FRAME, gain_byte=gain_byte,\n"
         "           gain_db=gain_db, send_gain=send_gain,\n"
         "           send_flags=send_flags, phantom_state=phantom_state,\n"
         "           phantom_reason=phantom_reason, decode=decode,\n"
+        "           SUBNET=SUBNET, KNOWN_SUBNETS=KNOWN_SUBNETS,\n"
+        "           HOST_IP=HOST_IP, node_ips=node_ips,\n"
+        "           find_node=find_node, resolve_node=resolve_node,\n"
         "           node_ip=node_ip, node_stream_port=node_stream_port)\n"
         "gdat2 = _NS(TALKER=TALKER, N_RAW=N_RAW, BUOYS=BUOYS, IMUS=IMUS,\n"
         "            ALTIMETERS=ALTIMETERS, buoy_ip=buoy_ip,\n"

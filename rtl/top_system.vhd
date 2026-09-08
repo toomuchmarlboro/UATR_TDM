@@ -677,10 +677,16 @@ architecture rtl of top_system is
     -- board that transmits perfectly and delivers nothing.
     --
     --   node   MAC             IP               UDP port
-    --     1    DEADBEEF0001    192.168.1.101    5005
-    --     2    DEADBEEF0002    192.168.1.102    5006
-    --     3    DEADBEEF0003    192.168.1.103    5007
-    --     4    DEADBEEF0004    192.168.1.104    5008
+    --     1    DEADBEEF0001    192.168.3.101    5005
+    --     2    DEADBEEF0002    192.168.3.102    5006
+    --     3    DEADBEEF0003    192.168.3.103    5007
+    --     4    DEADBEEF0004    192.168.3.104    5008
+    --
+    -- SUBNET MOVED 192.168.1.x -> 192.168.3.x on 2026-09-07. C_PC_IP moved with
+    -- it: a board cannot deliver to a host on another subnet, and C_PC_IP is
+    -- also the filter deciding whose ARP we will learn from. The buoy telemetry
+    -- occupies 192.168.3.110-.142 (docs/TELEMETRY_INTEGRATION.md), so .101-.104
+    -- and .10 are clear of it. Procedure: docs/CHANGING_IP.md
     --
     -- ONE PORT PER BOARD, deliberately. Putting all four on 5005 was tried and
     -- reverted: the RTL side is a one-line change, but the port is what the host
@@ -699,7 +705,7 @@ architecture rtl of top_system is
     constant C_FPGA_MAC : std_logic_vector(47 downto 0) :=
         x"DEADBEEF00" & std_logic_vector(to_unsigned(C_NODE, 8));
     constant C_FPGA_IP  : std_logic_vector(31 downto 0) :=
-        x"C0A801" & std_logic_vector(to_unsigned(100 + C_NODE, 8));
+        x"C0A803" & std_logic_vector(to_unsigned(100 + C_NODE, 8));
     constant C_UDP_PORT : std_logic_vector(15 downto 0) :=
         std_logic_vector(to_unsigned(5004 + C_NODE, 16));
 
@@ -708,7 +714,7 @@ architecture rtl of top_system is
     -- C_PC_IP must match the static address set on the PC's wired adapter, and
     -- it is load bearing twice over: the ADCs' destination, and the filter that
     -- decides whose ARP we are willing to learn from.
-    constant C_PC_IP  : std_logic_vector(31 downto 0) := x"C0A8010A"; -- 192.168.1.10
+    constant C_PC_IP  : std_logic_vector(31 downto 0) := x"C0A8030A"; -- 192.168.3.10
 
     -- Deployment PC, Realtek PCIe GbE, A0-AD-9F-22-4B-6E.
     --
@@ -1585,17 +1591,21 @@ begin
     --
     -- x"01B6" = 438 = 20 byte IP header + 8 byte UDP header + 410 byte payload.
     -- ==========================================
-    assert ipv4_checksum(x"C0A80165", x"C0A8010A", x"01B6") = x"B577"
-        report "net_pkg.ipv4_checksum WRONG for node 1 (192.168.1.101), expected B577"
+    -- Values recomputed for the 192.168.3.x subnet. The old 192.168.1.x set was
+    -- B577/B576/B575/B574; node 1's B577 was the hand-computed literal proven on
+    -- hardware, and the new B177 differs from it by exactly the 0x0400 the
+    -- third octet contributes, which is the cheap check that this edit is right.
+    assert ipv4_checksum(x"C0A80365", x"C0A8030A", x"01B6") = x"B177"
+        report "net_pkg.ipv4_checksum WRONG for node 1 (192.168.3.101), expected B177"
         severity failure;
-    assert ipv4_checksum(x"C0A80166", x"C0A8010A", x"01B6") = x"B576"
-        report "net_pkg.ipv4_checksum WRONG for node 2 (192.168.1.102), expected B576"
+    assert ipv4_checksum(x"C0A80366", x"C0A8030A", x"01B6") = x"B176"
+        report "net_pkg.ipv4_checksum WRONG for node 2 (192.168.3.102), expected B176"
         severity failure;
-    assert ipv4_checksum(x"C0A80167", x"C0A8010A", x"01B6") = x"B575"
-        report "net_pkg.ipv4_checksum WRONG for node 3 (192.168.1.103), expected B575"
+    assert ipv4_checksum(x"C0A80367", x"C0A8030A", x"01B6") = x"B175"
+        report "net_pkg.ipv4_checksum WRONG for node 3 (192.168.3.103), expected B175"
         severity failure;
-    assert ipv4_checksum(x"C0A80168", x"C0A8010A", x"01B6") = x"B574"
-        report "net_pkg.ipv4_checksum WRONG for node 4 (192.168.1.104), expected B574"
+    assert ipv4_checksum(x"C0A80368", x"C0A8030A", x"01B6") = x"B174"
+        report "net_pkg.ipv4_checksum WRONG for node 4 (192.168.3.104), expected B174"
         severity failure;
 
     -- A carry-fold case the four node addresses above do not exercise: this

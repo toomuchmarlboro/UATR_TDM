@@ -97,7 +97,7 @@ def main():
         print("No valid packet on %s:%d within %.1f s."
               % (a.bind or "0.0.0.0", a.port, a.timeout))
         print("  - is the FPGA powered and the link up?")
-        print("  - is this PC on 192.168.1.0/24 at the address in C_PC_IP?")
+        print("  - is this PC at the address in C_PC_IP (see ctrl.HOST_IP)?")
         print("  - Windows Firewall silently drops inbound UDP; allow python.")
         return 1
 

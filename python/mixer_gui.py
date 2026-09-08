@@ -13,7 +13,7 @@ UATR control station GUI. One tab per AFE, plus telemetry:
     python mixer_gui.py --fullscreen          # or --maximized
 
 Each AFE tab owns its own socket on that board's own stream port (5005-5008)
-and its own control IP (192.168.1.101-.104), both derived from ctrl.py so they
+and its own control IP (ctrl.SUBNET .101-.104), both derived from ctrl.py so they
 cannot drift from C_NODE in top_system.vhd. Boards never share a port: the
 receive loop uses recv(), which discards the sender, so two boards on one
 socket would interleave their sequence numbers and the loss figure would be
@@ -636,8 +636,16 @@ class Mixer(tk.Frame):
             rms = pk = np.zeros(um.CHANNELS)
 
         pps = npk * (1000.0 / self.period)
+
+        # Show the rate this BOARD is actually running, not the module default.
+        # Each tab is a different board and they can legitimately differ - a
+        # 24K_* and a 96K_* image on the same array is a real state, and
+        # displaying one global constant for both would misreport one of them.
+        # Falls back to um.SAMPLE_RATE while the packet rate is still settling.
+        _fs, _ok = um.detect_rate([None] * int(npk), self.period / 1000.0)
+        _shown = int(_fs) if _ok else um.SAMPLE_RATE
         self.cv.itemconfigure(self.hdr, text="%s%d Hz   %5.0f pkt/s   lost %d"
-                              % (self.label, um.SAMPLE_RATE, pps, lost))
+                              % (self.label, _shown, pps, lost))
         self.cv.itemconfigure(self.sub, text="bar = RMS   white = held peak   "
                                              "faders write ADAU1978 reg 0x0A-0x0D over I2C")
 

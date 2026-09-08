@@ -2,27 +2,31 @@
 
 **16-channel 24-bit audio capture — 4× ADAU1978 → Cyclone IV FPGA → LAN8720A → Fiber → 7km Subsea → PC**
 
-> **Status (2026-08-18):**
+> **Status (2026-09-08):**
+> - ✅ **All 16 channels stream clean.** The ADC3/ADC4 dropouts were traced to a
+>   misplaced DVDD decoupling cap and a dead U37, both fixed in hardware. The LRCLK
+>   phase-shift work is intact but out of the signal path (`C_LRCLK_RETIME = false`) —
+>   see [docs/LRCLK_PHASE_SHIFT.md](docs/LRCLK_PHASE_SHIFT.md).
 > - ✅ **Ethernet stack complete and verified on hardware** — ~11,950 packets/s, 0 FPGA-side
 >   sequence gaps, FCS and IP checksum confirmed in Wireshark.
 > - ✅ **ADAU1978 I2C bring-up complete** — all four parts answer, every register read back
 >   byte-exact and cross-checked field-by-field against the datasheet.
-> - ✅ **Analog supplies and VREF good** — 1.5 V on all four parts, ±15 V stable.
-> - ✅ **Clock buffers fixed — all four ADCs frame and produce data.** Both LMK1C1104
->   fan-out buffers (U1, U2), previously damaged and blocking MCLK/BCLK/LRCLK, are no
->   longer the blocker. See [Hardware Bring-Up Log](#hardware-bring-up-log) (marked
->   RESOLVED — superseded by the LRCLK hold-spec finding below).
+> - ✅ **On-FPGA 96 kHz → 24 kHz decimation added.** Two cascaded halfband FIR stages,
+>   0.00015 dB passband ripple to 11 kHz, −102.5 dB alias rejection. Cuts the uplink 4×,
+>   which takes the four-board array from *needs gigabit* to *fits in 100BASE-TX*.
+>   See [docs/DECIMATION.md](docs/DECIMATION.md).
+> - ✅ **Array moved to `192.168.3.x`**, boards and host together. Host setup:
+>   [docs/HOST_SETUP.md](docs/HOST_SETUP.md).
 > - 🟡 **Active configuration is 2× TDM8 (16 ch, 24-bit) — not TDM16.** TDM16 was built and
 >   tested (`output_files/96K_TDM16.jic`) but reverted: timing analysis showed the capture
 >   path was never the fault, so merging all four parts onto one net would only have traded
 >   24-bit samples for 16-bit. Procedure kept in
 >   [docs/TDM16_BRINGUP.md](docs/TDM16_BRINGUP.md) in case it's revisited.
-> - 🔴 **OPEN: channel dropouts on 3 of 4 ADCs.** Root-caused to the FPGA violating the
->   ADAU1978's LRCLK hold spec (tALH = 5 ns min) by ~4 ns, compounding with per-part output
->   delay through the U1 buffer — U20 alone reads 0% dropouts. See
->   [docs/LRCLK_HOLD_VIOLATION.md](docs/LRCLK_HOLD_VIOLATION.md) and
->   [docs/TDM2_NETLIST_FINDINGS.md](docs/TDM2_NETLIST_FINDINGS.md). Known-good fallback
->   image: `output_files/96K_LRCLK_FIX.jic`.
+> - 🔴 **The decimating images have never run on hardware.** Verified numerically
+>   (bit-exact against a scipy reference) and structurally (Quartus, TNS 0.0), but the
+>   first capture is the real test. **Read the packet rate first: ~3,000/s is success,
+>   ~12,000/s means `valid_out` is being ignored downstream.** Bugs found and design
+>   decisions: [docs/DECIMATOR_FINDINGS.md](docs/DECIMATOR_FINDINGS.md).
 
 ---
 
@@ -76,7 +80,8 @@ SUBSEA ARRAY                   TOPSIDE FPGA BOARD              TOPSIDE NETWORK
 | Chips | 4 |
 | Total channels | 16 (4 channels per chip) |
 | Resolution | 24-bit |
-| Sample rate | 96 kHz |
+| ADC sample rate | 96 kHz — always, both image sets |
+| Output sample rate | 96 kHz (`96K_*`) or **24 kHz** (`24K_*`, on-FPGA 4× decimation) |
 | TDM architecture | 2× TDM8 — chip pairs share one SDATAOUT wire |
 | Slot width | **32 BCLK per slot**, 24-bit data left-justified, 8 pad bits |
 | BCLK | **24.576 MHz** (96k × 8 slots × 32 BCLK) |
@@ -85,8 +90,8 @@ SUBSEA ARRAY                   TOPSIDE FPGA BOARD              TOPSIDE NETWORK
 | FPGA | Altera Cyclone IV E, minimum system board, IO pins only |
 | Board oscillator | 50 MHz |
 | Ethernet PHY module | LAN8720A breakout module (RMII, 100 Mbps) |
-| Required throughput | 36.864 Mbps (16ch × 24b × 96kHz) |
-| Available throughput | 100 Mbps — 2.7× headroom |
+| Required throughput | 36.864 Mbps at 96 kHz, 9.216 Mbps at 24 kHz (16ch × 24b × fs) |
+| Available throughput | 100 Mbps — 2.2× headroom at 96 kHz, 8.8× at 24 kHz (one board) |
 | Fiber link | Single-mode, BiDi WDM, up to 20 km rated |
 | Subsea cable | Hybrid (Power + 8× SM fiber), 7 km |
 | Subsea power | 24V topside → 2.5mm² copper conductors → 9V buck subsea |
@@ -428,14 +433,57 @@ LRCLK        = 1 BCLK wide pulse, 40.7 ns, once per 10.42 us
 discarding the pad bits. `C_BIT_ADJ = -1` shifts the capture window by one BCLK;
 that offset was found by measurement (`udp_monitor.py --align`), not derived.
 
-### Throughput
+### Throughput — and why there are two image sets
+
+Two builds exist from the same design, differing only in whether the on-FPGA
+decimator is in the signal path (`C_DECIMATE` in `top_system.vhd`).
+
+**The packet never changes size — only how often one is sent.** Every packet
+carries exactly 8 audio frames at either rate:
 
 ```
-payload  16 ch x 24 bit x 96 kHz            = 36.864 Mbit/s
-packet   10 B header + 8 frames x 50 B      = 410 B, one per 8 audio frames
-wire     452 B + preamble + IFG, 12000/s    = 45 Mbit/s = 45% of 100BASE-TX
-disk     16 x 96000 x 3 B                   = 4.6 MB/s = 16.6 GB/hour
+                          96 kHz (96K_*)   24 kHz (24K_*)
+packets per second            12,000           3,000
+bytes on the wire                476             476
 ```
+
+Per board:
+
+```
+payload  16 ch x 24 bit x fs        36.864 Mbit/s     9.216 Mbit/s
++ 10 B packet header                39.360            9.840
++ eth/IP/UDP + preamble/FCS/IFG     45.696           11.424   <- on the wire
+of 100BASE-TX                          45.7%            11.4%
+disk  16 x fs x 3 B                  4.6 MB/s         1.15 MB/s
+                                    16.6 GB/hour      4.1 GB/hour
+```
+
+Four boards:
+
+```
+aggregate                          182.784 Mbit/s   45.696 Mbit/s
+                                   needs GIGABIT    fits 100BASE-TX
+```
+
+The wire figure exceeds the audio because 66 bytes of framing ride on every
+packet — 410 B payload inside 476 B on the link, 86% efficiency:
+
+```
+410 B payload + 8 UDP + 20 IPv4 + 14 Ethernet = 452 B frame body
+      + 8 B preamble/SFD + 4 B FCS + 12 B inter-frame gap = 476 B
+```
+
+Because that overhead is **per packet**, sending 4x fewer packets saves it 4x
+over too, so the wire rate scales by exactly 4.00.
+
+**Which to use:** `24K_*` unless you need content above 11 kHz — inside that
+band it costs nothing measurable (0.00015 dB ripple, −102.5 dB alias
+rejection, below the converter's own noise floor) and it removes the gigabit
+requirement, cuts host CPU 4x and quarters the disk rate. `96K_*` for the full
+0–42 kHz the ADC passes, or as the fallback that has actually run on hardware.
+
+See [docs/DECIMATION.md](docs/DECIMATION.md) and
+[docs/HOST_SETUP.md](docs/HOST_SETUP.md).
 
 
 ## Ethernet / UDP Details
@@ -443,11 +491,23 @@ disk     16 x 96000 x 3 B                   = 4.6 MB/s = 16.6 GB/hour
 ### Network configuration (static — no DHCP)
 
 ```vhdl
-FPGA_MAC  : x"DEADBEEF0001"
-FPGA_IP   : 192.168.1.101
-PC_IP     : 192.168.1.10
-UDP_PORT  : 5005
+-- Everything derives from C_NODE (1-4) in top_system.vhd.
+FPGA_MAC  : x"DEADBEEF00" & C_NODE      -- DE:AD:BE:EF:00:0n
+FPGA_IP   : 192.168.3.(100 + C_NODE)    -- .101 .102 .103 .104
+PC_IP     : 192.168.3.10                -- C_PC_IP
+UDP_PORT  : 5004 + C_NODE               -- 5005 5006 5007 5008
 ```
+
+Moved from `192.168.1.x` on 2026-09-07. `C_PC_IP` moved with the boards: it is
+both the audio destination *and* the filter deciding whose ARP the board will
+learn from, so changing only the board addresses gives four boards
+transmitting into nothing.
+
+⚠ **The host must hold BOTH `192.168.3.10` and `192.168.1.10`** while boards of
+either generation are in use — `C_PC_IP` is one value per image, so the host is
+the side that carries both. Full procedure:
+[docs/HOST_SETUP.md](docs/HOST_SETUP.md), addressing changes:
+[docs/CHANGING_IP.md](docs/CHANGING_IP.md).
 
 ### UDP packet format (sent every 8 audio frames = 83.3 µs at 96 kHz)
 
@@ -619,14 +679,36 @@ otherwise resolves `modelsim.ini` from the current directory and would silently 
 back to the install default. ModelSim's own `*.mpf` project cache is machine-specific
 — it's gitignored and regenerates from the `vcom`/`vsim` lines above.)
 
-### Bring-up logs (`docs/`)
+### Documentation (`docs/`)
+
+**Start here**
+
+| File | Description |
+|------|-------------|
+| `HOST_SETUP.md` | **The complete host procedure** — adapter, firewall, which `.jic` to flash, verifying audio and telemetry |
+| `DECIMATION.md` | The 96→24 kHz decimator, and the ADC gain budget that goes with it |
+| `CHANGING_IP.md` | Changing the array's addressing — the four things that must agree |
+| `NETWORK_SETUP.md` | Why the network is arranged this way: capacity, collisions, Python limits |
+| `DECIMATOR_FINDINGS.md` | Design decisions, and every bug found building the decimator |
+
+**Reference**
+
+| File | Description |
+|------|-------------|
+| `ETHERNET_TRANSMISSION.md` | The UDP/IP/Ethernet transmit path end to end |
+| `MULTI_BOARD.md` | Four-board deployment (address table pre-migration — see `HOST_SETUP.md`) |
+| `PHANTOM_POWER.md` | 48 V control, readback and the optional watchdog |
+| `TELEMETRY_INTEGRATION.md` | The three buoy sensors and how to lift them into an app |
+| `GDAT2_TELEMETRY.md` | `$GDAT2` field map, and the AHRS quantisation trap |
+
+**Bring-up history**
 
 | File | Description |
 |------|-------------|
 | `TDM16_BRINGUP.md` | TDM16 procedure and why it was reverted |
-| `LRCLK_HOLD_VIOLATION.md` | The ~4 ns LRCLK hold-spec violation behind the current dropouts |
-| `TDM2_NETLIST_FINDINGS.md` | Netlist trace of the LMK1C1104 buffer fan-out, superseded as the headline by the hold-violation finding but still composing with it |
-| `GDAT2_TELEMETRY.md` | Notes on the `gdat2.py` serial telemetry GUI tab |
+| `LRCLK_HOLD_VIOLATION.md` | The ~4 ns LRCLK hold-spec violation; fixed, kept for the reasoning |
+| `LRCLK_PHASE_SHIFT.md` | The phase-shift investigation — intact but out of the signal path |
+| `TDM2_NETLIST_FINDINGS.md` | Netlist trace of the LMK1C1104 buffer fan-out; composes with the hold-violation finding |
 
 ---
 

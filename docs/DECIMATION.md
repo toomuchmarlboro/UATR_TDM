@@ -446,12 +446,16 @@ Built with `C_DECIMATE = true`. `C_NODE` is the only per-board edit.
 
 | node | IP | UDP port | image |
 |---|---|---|---|
-| 1 | 192.168.1.101 | 5005 | `output_files/24K_NODE1_192-168-1-101.jic` |
-| 2 | 192.168.1.102 | 5006 | `output_files/24K_NODE2_192-168-1-102.jic` |
-| 3 | 192.168.1.103 | 5007 | `output_files/24K_NODE3_192-168-1-103.jic` |
-| 4 | 192.168.1.104 | 5008 | `output_files/24K_NODE4_192-168-1-104.jic` |
+| 1 | 192.168.3.101 | 5005 | `output_files/24K_NODE1_192-168-3-101.jic` |
+| 2 | 192.168.3.102 | 5006 | `output_files/24K_NODE2_192-168-3-102.jic` |
+| 3 | 192.168.3.103 | 5007 | `output_files/24K_NODE3_192-168-3-103.jic` |
+| 4 | 192.168.3.104 | 5008 | `output_files/24K_NODE4_192-168-3-104.jic` |
 
-The 96 kHz `96K_NODE*` images remain in `output_files/` and are the fallback.
+The matching non-decimating set is `96K_NODE*_192-168-3-10*.jic`, same
+addresses, 96 kHz. Host setup for either: `docs/HOST_SETUP.md`.
+
+The older `*_192-168-1-*` images are the pre-migration set and send to
+`192.168.1.10`; see `docs/CHANGING_IP.md` before mixing them in.
 
 **Flash and verify one board at a time**, per `docs/MULTI_BOARD.md` — check the
 number in the filename against the board actually connected, then `ping`,

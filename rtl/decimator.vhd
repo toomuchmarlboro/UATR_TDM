@@ -24,8 +24,13 @@ use work.decim_coef_pkg.all;
 -- over. Two multipliers, each free-running against its own deadline, is what
 -- fits, and it fits with room:
 --
---     engine 1   fires every 2 frames ( 512 cyc)  uses 192  ->  38%
---     engine 2   fires every 4 frames (1024 cyc)  uses 768  ->  75%
+--     engine 1   fires every 2 frames ( 512 cyc)  uses 160  ->  31%
+--     engine 2   fires every 4 frames (1024 cyc)  uses 736  ->  72%
+--
+-- Both engines are PIPELINED: one tap issued per cycle, accumulated two
+-- cycles later. An ADDR/MAC two-state loop costs two cycles per tap, which
+-- puts engine 2 at 1440 cycles - over its deadline, where e2_go pulses are
+-- missed and output frames vanish with no error anywhere.
 --
 -- Cyclone IV EP4CE6 has 30 multipliers and the shipping build uses ZERO, while
 -- LEs are at 64% (4,025 of 6,272) and registers at 3,047. Sixteen parallel FIR
@@ -166,8 +171,10 @@ architecture rtl of decimator is
     signal wr2_data : std_logic_vector(DW-1 downto 0) := (others => '0');
 
     -- Engine 1: 96k -> 48k
-    type st1_t is (E1_IDLE, E1_ADDR, E1_MAC, E1_DONE);
+    type st1_t is (E1_IDLE, E1_RUN, E1_DONE);
     signal st1   : st1_t := E1_IDLE;
+    signal v1_a  : std_logic := '0';
+    signal cnt1  : integer range 0 to 63 := 0;
     signal ch1   : integer range 0 to CH-1 := 0;
     signal tap1  : integer range 0 to 15 := 0;
     signal acc1  : signed(C_ACC_BITS-1 downto 0) := (others => '0');
@@ -178,8 +185,10 @@ architecture rtl of decimator is
     signal e1_go : std_logic := '0';
 
     -- Engine 2: 48k -> 24k
-    type st2_t is (E2_IDLE, E2_ADDR, E2_MAC, E2_DONE);
+    type st2_t is (E2_IDLE, E2_RUN, E2_DONE);
     signal st2   : st2_t := E2_IDLE;
+    signal v2_a  : std_logic := '0';
+    signal cnt2  : integer range 0 to 63 := 0;
     signal ch2   : integer range 0 to CH-1 := 0;
     signal tap2  : integer range 0 to 63 := 0;
     signal acc2  : signed(C_ACC_BITS-1 downto 0) := (others => '0');
@@ -264,8 +273,11 @@ begin
             wp1     <= (others => '0');
             ph1     <= '0';
             e1_go   <= '0';
-            wr_busy <= '0';
-            wr_ch   <= 0;
+            wr_busy  <= '0';
+            wr_ch    <= 0;
+            wr1_en   <= '0';
+            wr1_addr <= 0;
+            wr1_data <= (others => '0');
         elsif rising_edge(clk) then
             e1_go   <= '0';
             wr1_en  <= '0';
@@ -306,8 +318,8 @@ begin
     end process;
 
     -- =====================================================================
-    -- Engine 1: 96 kHz -> 48 kHz.  16 channels x 8 folded taps = 192 cycles,
-    -- against 512 available. 38% utilised.
+    -- Engine 1: 96 kHz -> 48 kHz.  Pipelined, one tap per cycle.
+    -- 16 channels x 8 folded taps = 160 cycles against 512 available, 31%.
     -- =====================================================================
     process(clk, rst)
         variable pre  : signed(DW downto 0);
@@ -322,7 +334,12 @@ begin
             vld1   <= '0';
             wp2    <= (others => '0');
             sat1_r <= '0';
-            wr2_en <= '0';
+            wr2_en   <= '0';
+            wr2_addr <= 0;
+            wr2_data <= (others => '0');
+            v1_a     <= '0';
+            cnt1   <= 0;
+            rp1    <= (others => '0');
         elsif rising_edge(clk) then
             vld1   <= '0';
             wr2_en <= '0';
@@ -334,40 +351,58 @@ begin
                         tap1 <= 0;
                         acc1 <= (others => '0');
                         rp1  <= wp1 - 1;      -- newest sample written
-                        st1  <= E1_ADDR;
+                        v1_a <= '0';
+                        st1  <= E1_RUN;
                     end if;
 
-                -- Present both symmetric tap addresses. M9K is synchronous, so
-                -- the data is available in the next state.
-                when E1_ADDR =>
-                    -- Unsigned pointer arithmetic wraps naturally at the RAM
-                    -- depth, so no mod operator and no divider is inferred.
-                    ia := ch1*D1 + to_integer(rp1 - to_unsigned(C_IDX1(tap1), AW1));
-                    ib := ch1*D1 + to_integer(rp1 - to_unsigned(C_N1-1 - C_IDX1(tap1), AW1));
-                    a1_a <= signed(ram1_a(ia));
-                    a1_b <= signed(ram1_b(ib));
-                    cf1  <= C_COEF1(tap1);
-                    if C_IDX1(tap1) = (C_N1-1)/2 then
-                        mid1 <= '1';       -- centre tap is its own mirror
-                    else
-                        mid1 <= '0';
-                    end if;
-                    st1 <= E1_MAC;
-
-                when E1_MAC =>
-                    if mid1 = '1' then
-                        pre := resize(a1_a, DW+1);
-                    else
-                        pre := resize(a1_a, DW+1) + resize(a1_b, DW+1);
-                    end if;
-                    prod := pre * cf1;
-                    acc1 <= acc1 + resize(prod, C_ACC_BITS);
-
-                    if tap1 = F1-1 then
-                        st1 <= E1_DONE;
-                    else
+                -- ONE TAP PER CYCLE, two-stage pipeline.
+                --   stage A: issue the tap - present both RAM addresses and
+                --            register the coefficient alongside them
+                --   stage B: one cycle later, everything stage A registered is
+                --            available together; multiply and accumulate
+                -- v1_a is the valid bit that walks with them, so stage B only
+                -- fires for cycles that actually issued a tap.
+                when E1_RUN =>
+                    -- stage A: issue
+                    if tap1 < F1 then
+                        ia := ch1*D1 + to_integer(rp1 - to_unsigned(C_IDX1(tap1), AW1));
+                        ib := ch1*D1 + to_integer(rp1 - to_unsigned(C_N1-1 - C_IDX1(tap1), AW1));
+                        a1_a <= signed(ram1_a(ia));
+                        a1_b <= signed(ram1_b(ib));
+                        cf1  <= C_COEF1(tap1);
+                        if C_IDX1(tap1) = (C_N1-1)/2 then
+                            mid1 <= '1';   -- centre tap is its own mirror
+                        else
+                            mid1 <= '0';
+                        end if;
+                        v1_a <= '1';
                         tap1 <= tap1 + 1;
-                        st1  <= E1_ADDR;
+                    else
+                        v1_a <= '0';
+                    end if;
+
+                    -- stage B: accumulate what stage A fetched last cycle.
+                    --
+                    -- a1_a/a1_b, cf1 and mid1 are ALL assigned in stage A and
+                    -- all land on the same clock edge, so they must be consumed
+                    -- together, one cycle later. An extra cf1_d/mid1_d register
+                    -- on the coefficient path alone would delay the coefficient
+                    -- one cycle past its sample and multiply mismatched pairs -
+                    -- verified wrong against a direct convolution, and invisible
+                    -- to synthesis and to timing analysis.
+                    if v1_a = '1' then
+                        if mid1 = '1' then
+                            pre := resize(a1_a, DW+1);
+                        else
+                            pre := resize(a1_a, DW+1) + resize(a1_b, DW+1);
+                        end if;
+                        prod := pre * cf1;
+                        acc1 <= acc1 + resize(prod, C_ACC_BITS);
+                        cnt1 <= cnt1 + 1;
+                        if cnt1 = F1-1 then
+                            st1  <= E1_DONE;
+                            cnt1 <= 0;
+                        end if;
                     end if;
 
                 when E1_DONE =>
@@ -379,6 +414,7 @@ begin
                     wr2_data <= std_logic_vector(round_sat(acc1));
                     acc1 <= (others => '0');
                     tap1 <= 0;
+                    v1_a <= '0';
 
                     if ch1 = CH-1 then
                         vld1 <= '1';          -- whole frame written
@@ -391,7 +427,7 @@ begin
                         st1  <= E1_IDLE;
                     else
                         ch1 <= ch1 + 1;
-                        st1 <= E1_ADDR;
+                        st1 <= E1_RUN;
                     end if;
             end case;
         end if;
@@ -415,9 +451,11 @@ begin
     end process;
 
     -- =====================================================================
-    -- Engine 2: 48 kHz -> 24 kHz.  16 channels x 44 folded taps = 768 cycles,
-    -- against 1024 available. 75% utilised - the tightest path in the design,
-    -- and the reason stage 2's length is not tuned by hand.
+    -- Engine 2: 48 kHz -> 24 kHz.  Pipelined, one tap per cycle.
+    -- 16 channels x 44 folded taps = 736 cycles against 1024 available, 72%.
+    -- This is the tightest path in the design and the reason stage 2's length
+    -- is not tuned by hand. At TWO cycles per tap it needs 1440 and silently
+    -- drops output frames - see the E2_RUN comment.
     -- =====================================================================
     process(clk, rst)
         variable pre  : signed(DW downto 0);
@@ -433,6 +471,8 @@ begin
             rp2    <= (others => '0');
             vout_r <= '0';
             sat2_r <= '0';
+            v2_a   <= '0';
+            cnt2   <= 0;
         elsif rising_edge(clk) then
             vout_r <= '0';
 
@@ -448,41 +488,54 @@ begin
                         else
                             rp2 <= wp2 - 1;
                         end if;
-                        st2  <= E2_ADDR;
+                        v2_a <= '0';
+                        st2  <= E2_RUN;
                     end if;
 
-                when E2_ADDR =>
-                    -- Conditional subtract, not mod: D2 is not a power of two.
-                    oa := to_integer(rp2) - C_IDX2(tap2);
-                    ob := to_integer(rp2) - (C_N2-1 - C_IDX2(tap2));
-                    if oa < 0 then oa := oa + D2; end if;
-                    if ob < 0 then ob := ob + D2; end if;
-                    ia := ch2*D2 + oa;
-                    ib := ch2*D2 + ob;
-                    a2_a <= signed(ram2(ia));
-                    a2_b <= signed(ram2(ib));
-                    cf2  <= C_COEF2(tap2);
-                    if C_IDX2(tap2) = (C_N2-1)/2 then
-                        mid2 <= '1';
-                    else
-                        mid2 <= '0';
-                    end if;
-                    st2 <= E2_MAC;
-
-                when E2_MAC =>
-                    if mid2 = '1' then
-                        pre := resize(a2_a, DW+1);
-                    else
-                        pre := resize(a2_a, DW+1) + resize(a2_b, DW+1);
-                    end if;
-                    prod := pre * cf2;
-                    acc2 <= acc2 + resize(prod, C_ACC_BITS);
-
-                    if tap2 = F2-1 then
-                        st2 <= E2_DONE;
-                    else
+                -- ONE TAP PER CYCLE, same three-stage pipeline as engine 1.
+                -- This is what makes the schedule fit: at two cycles per tap
+                -- engine 2 needs 1440 cycles against the 1024 available and
+                -- silently drops output frames.
+                when E2_RUN =>
+                    -- stage A: issue
+                    if tap2 < F2 then
+                        oa := to_integer(rp2) - C_IDX2(tap2);
+                        ob := to_integer(rp2) - (C_N2-1 - C_IDX2(tap2));
+                        if oa < 0 then oa := oa + D2; end if;
+                        if ob < 0 then ob := ob + D2; end if;
+                        ia := ch2*D2 + oa;
+                        ib := ch2*D2 + ob;
+                        a2_a <= signed(ram2(ia));
+                        a2_b <= signed(ram2(ib));
+                        cf2  <= C_COEF2(tap2);
+                        if C_IDX2(tap2) = (C_N2-1)/2 then
+                            mid2 <= '1';
+                        else
+                            mid2 <= '0';
+                        end if;
+                        v2_a <= '1';
                         tap2 <= tap2 + 1;
-                        st2  <= E2_ADDR;
+                    else
+                        v2_a <= '0';
+                    end if;
+
+                    -- stage B: accumulate what stage A fetched last cycle.
+                    -- Same one-cycle alignment as engine 1 - see the comment
+                    -- there for why the coefficient must NOT carry an extra
+                    -- register.
+                    if v2_a = '1' then
+                        if mid2 = '1' then
+                            pre := resize(a2_a, DW+1);
+                        else
+                            pre := resize(a2_a, DW+1) + resize(a2_b, DW+1);
+                        end if;
+                        prod := pre * cf2;
+                        acc2 <= acc2 + resize(prod, C_ACC_BITS);
+                        cnt2 <= cnt2 + 1;
+                        if cnt2 = F2-1 then
+                            st2  <= E2_DONE;
+                            cnt2 <= 0;
+                        end if;
                     end if;
 
                 when E2_DONE =>
@@ -493,13 +546,14 @@ begin
                         <= std_logic_vector(round_sat(acc2));
                     acc2 <= (others => '0');
                     tap2 <= 0;
+                    v2_a <= '0';
 
                     if ch2 = CH-1 then
                         vout_r <= '1';        -- all 16 channels updated
                         st2    <= E2_IDLE;
                     else
                         ch2 <= ch2 + 1;
-                        st2 <= E2_ADDR;
+                        st2 <= E2_RUN;
                     end if;
             end case;
         end if;

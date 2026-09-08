@@ -86,11 +86,20 @@ READING THE TELEMETRY TAB
 
 IF NOTHING CONNECTS
 ===================
-The host needs an address on the sensors' subnet. An adapter configured for the
-FPGA soundcards (192.168.1.x) cannot reach 192.168.3.x at all, and the traffic
-leaves over Wi-Fi instead. Windows allows a second address on one NIC:
+The host needs an address on the subnet of whatever it is talking to, and
+unicast UDP is filtered by DESTINATION address: a socket bound to INADDR_ANY
+still only receives packets addressed to an IP this host actually owns.
 
-    netsh interface ipv4 add address name="Ethernet" 192.168.3.240 255.255.255.0
+The soundcards moved to 192.168.3.x on 2026-09-07, so they and the sensors now
+share a subnet - but boards still carrying an older image are on 192.168.1.x and
+send to 192.168.1.10. Windows allows several addresses on one NIC, and you need
+one matching each image's compiled-in C_PC_IP:
+
+    netsh interface ipv4 add address name="Ethernet" 192.168.3.10  255.255.255.0
+    netsh interface ipv4 add address name="Ethernet" 192.168.1.10  255.255.255.0
+
+Check what you actually have with:  Get-NetIPAddress -AddressFamily IPv4
+See docs/NETWORK_SETUP.md and docs/CHANGING_IP.md.
 
 If a link connects but decodes nothing, dump the bytes before suspecting the
 sensor - that is how the IMU was found being read as $GDAT2.
@@ -144,10 +153,57 @@ SAMPLE_BYTES = 3
 
 FULL_SCALE   = 1 << 23                                # 24-bit signed
 
-SAMPLE_RATE   = 96000
+SAMPLE_RATE  = 24000
+
+KNOWN_RATES = (96000, 24000)
+
+def detect_rate(pkts, elapsed, tol=0.15, seqs=None):
+    """Infer the board's sample rate from the measured packet rate.
+
+    Every packet carries exactly FRAMES_PKT audio frames at both rates, so
+
+        fs = packets/second x FRAMES_PKT
+
+    is a direct measurement of what the FPGA is producing. It needs no help
+    from the bitstream and no configuration, which is the point: the payload is
+    byte-identical at 96 kHz and 24 kHz, so this is the only thing that
+    distinguishes them.
+
+    Returns (rate, confident). `confident` is False when the measurement is not
+    within `tol` of a known rate - a short or lossy capture - and the caller
+    should keep whatever rate it already had rather than trust this.
+
+    LOSS ONLY EVER LOWERS THE MEASURED RATE, which matters because the rates
+    are exactly 4x apart: a 96 kHz board losing 75% of its packets measures
+    24000 and would otherwise be reported as a healthy 24 kHz board. Pass
+    `seqs` (the 32-bit sequence numbers) to close that hole - the FPGA
+    increments them per packet SENT, so the span between first and last is how
+    many it sent regardless of how many arrived, and scaling by that recovers
+    the true rate. Without `seqs` the ambiguity is left to the caller, who
+    should be reading the loss report anyway.
+    """
+    if not pkts or elapsed <= 0:
+        return SAMPLE_RATE, False
+
+    n = len(pkts)
+    if seqs and len(seqs) >= 2:
+        span = (seqs[-1] - seqs[0]) & 0xFFFFFFFF
+        # A sane span means no counter wrap and no reset mid-capture.
+        if 0 < span < 10 * n + 1000:
+            n = span + 1
+
+    meas = (n / elapsed) * FRAMES_PKT
+    best = min(KNOWN_RATES, key=lambda r: abs(meas - r))
+    return (best, True) if abs(meas - best) <= best * tol else (meas, False)
 
 # ------------------------------------------------------------------------- inlined from ctrl.py ---
-FPGA_IP   = "192.168.1.101"      # C_FPGA_IP in top_system.vhd, node 1
+SUBNET        = "192.168.3"
+
+KNOWN_SUBNETS = ["192.168.3", "192.168.1"]
+
+HOST_IP   = SUBNET + ".10"       # C_PC_IP: where audio is sent, and the ARP filter
+
+FPGA_IP   = SUBNET + ".101"      # C_FPGA_IP in top_system.vhd, node 1
 
 FPGA_PORT = 5005                 # any port: udp_rx_core does not filter on it
 
@@ -159,9 +215,18 @@ ZERO_DB = 0xA0
 
 PHANTOM_FRAME = 1
 
-def node_ip(n):
+def node_ip(n, subnet=None):
     """Node number -> board IP. Mirrors C_NODE in top_system.vhd."""
-    return "192.168.1.%d" % (100 + int(n))
+    return "%s.%d" % (subnet or SUBNET, 100 + int(n))
+
+def node_ips(n):
+    """Every address node n could be at, across all known subnets.
+
+    A board keeps whatever address its flashed image was built with, so during
+    a subnet migration the array can legitimately be split across two. Callers
+    that want to find a board rather than assume one should try these in order.
+    """
+    return ["%s.%d" % (sub, 100 + int(n)) for sub in KNOWN_SUBNETS]
 
 def node_stream_port(n):
     """Node number -> the port that board's audio arrives on.
@@ -172,6 +237,44 @@ def node_stream_port(n):
     loss report would be meaningless.
     """
     return 5004 + int(n)
+
+def find_node(n, timeout=0.6):
+    """Return the address node n is actually answering on, or None.
+
+    Listens on that node's stream port and reads the source address of the
+    first packet. That is authoritative - it is where the board really is -
+    and needs no ARP, no ping, and no assumption about the host's own subnet.
+
+    RECEIVING never needed this: capture() binds INADDR_ANY, so audio arrives
+    from any subnet already. SENDING does - a gain or phantom command goes TO an
+    address, so it has to be the right one. Use this when the board's subnet is
+    not known, e.g. part-way through a migration.
+    """
+    import socket as _s
+    sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+    sock.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", node_stream_port(n)))
+        sock.settimeout(timeout)
+        _, addr = sock.recvfrom(2048)
+        return addr[0]
+    except (OSError, _s.timeout):
+        return None
+    finally:
+        sock.close()
+
+def resolve_node(n, timeout=0.6):
+    """Node number -> the address to SEND control commands to.
+
+    Prefers the address the board is actually transmitting from; falls back to
+    the configured SUBNET if it is silent (a board being configured before it
+    streams, or one whose stream port is held by another process).
+
+    This is what makes control work on 192.168.1.x and 192.168.3.x without a
+    flag: a board built with an old image answers from its own address, and the
+    command follows it there.
+    """
+    return find_node(n, timeout) or node_ip(n)
 
 def gain_byte(db):
     """dB -> register value. +60 dB at 0x00, -0.375 dB per step."""
@@ -1312,13 +1415,17 @@ class PingLink(threading.Thread):
 um = _NS(MAGIC=MAGIC, HDR_LEN=HDR_LEN, FRAME_LEN=FRAME_LEN,
          FRAMES_PKT=FRAMES_PKT, PAYLOAD_LEN=PAYLOAD_LEN,
          CHANNELS=CHANNELS, SAMPLE_BYTES=SAMPLE_BYTES,
-         FULL_SCALE=FULL_SCALE, SAMPLE_RATE=SAMPLE_RATE)
+         FULL_SCALE=FULL_SCALE, SAMPLE_RATE=SAMPLE_RATE,
+         KNOWN_RATES=KNOWN_RATES, detect_rate=detect_rate)
 ctrl = _NS(FPGA_IP=FPGA_IP, FPGA_PORT=FPGA_PORT,
            STREAM_PORT=STREAM_PORT, MUTE=MUTE, ZERO_DB=ZERO_DB,
            PHANTOM_FRAME=PHANTOM_FRAME, gain_byte=gain_byte,
            gain_db=gain_db, send_gain=send_gain,
            send_flags=send_flags, phantom_state=phantom_state,
            phantom_reason=phantom_reason, decode=decode,
+           SUBNET=SUBNET, KNOWN_SUBNETS=KNOWN_SUBNETS,
+           HOST_IP=HOST_IP, node_ips=node_ips,
+           find_node=find_node, resolve_node=resolve_node,
            node_ip=node_ip, node_stream_port=node_stream_port)
 gdat2 = _NS(TALKER=TALKER, N_RAW=N_RAW, BUOYS=BUOYS, IMUS=IMUS,
             ALTIMETERS=ALTIMETERS, buoy_ip=buoy_ip,
@@ -1861,8 +1968,16 @@ class Mixer(tk.Frame):
             rms = pk = np.zeros(um.CHANNELS)
 
         pps = npk * (1000.0 / self.period)
+
+        # Show the rate this BOARD is actually running, not the module default.
+        # Each tab is a different board and they can legitimately differ - a
+        # 24K_* and a 96K_* image on the same array is a real state, and
+        # displaying one global constant for both would misreport one of them.
+        # Falls back to um.SAMPLE_RATE while the packet rate is still settling.
+        _fs, _ok = um.detect_rate([None] * int(npk), self.period / 1000.0)
+        _shown = int(_fs) if _ok else um.SAMPLE_RATE
         self.cv.itemconfigure(self.hdr, text="%s%d Hz   %5.0f pkt/s   lost %d"
-                              % (self.label, um.SAMPLE_RATE, pps, lost))
+                              % (self.label, _shown, pps, lost))
         self.cv.itemconfigure(self.sub, text="bar = RMS   white = held peak   "
                                              "faders write ADAU1978 reg 0x0A-0x0D over I2C")
 

@@ -34,8 +34,70 @@ WIRE_LEN     = 452                                    # incl. eth+ip+udp headers
 CHANNELS     = 16
 SAMPLE_BYTES = 3
 FULL_SCALE   = 1 << 23                                # 24-bit signed
-SAMPLE_RATE   = 96000
-EXPECTED_PPS = SAMPLE_RATE / FRAMES_PKT               # 6000 at 48 kHz
+# --------------------------------------------------------------- sample rate
+# MUST MATCH C_DECIMATE IN rtl/top_system.vhd.
+#
+#   C_DECIMATE = false  ->  96000   (the 96K_* images)
+#   C_DECIMATE = true   ->  24000   (the 24K_* images, 4x on-FPGA decimation)
+#
+# Nothing in the packet announces the rate - the layout is byte-identical either
+# way - so a mismatch is SILENT: WAVs play at the wrong pitch, every duration in
+# the report is out by 4x, and dropout timings are meaningless. check_sync.py
+# asserts this against the RTL; run it after flashing a different image.
+#
+# --rate on the command line overrides for a one-off capture.
+SAMPLE_RATE  = 24000
+EXPECTED_PPS = SAMPLE_RATE / FRAMES_PKT               # 3000 at 24 kHz
+
+# The rates any current image can produce. detect_rate() snaps to one of these.
+KNOWN_RATES = (96000, 24000)
+
+
+def set_sample_rate(fs):
+    """Override the module-wide rate. Used by --rate and by the GUI."""
+    global SAMPLE_RATE, EXPECTED_PPS
+    SAMPLE_RATE  = int(fs)
+    EXPECTED_PPS = SAMPLE_RATE / FRAMES_PKT
+
+
+def detect_rate(pkts, elapsed, tol=0.15, seqs=None):
+    """Infer the board's sample rate from the measured packet rate.
+
+    Every packet carries exactly FRAMES_PKT audio frames at both rates, so
+
+        fs = packets/second x FRAMES_PKT
+
+    is a direct measurement of what the FPGA is producing. It needs no help
+    from the bitstream and no configuration, which is the point: the payload is
+    byte-identical at 96 kHz and 24 kHz, so this is the only thing that
+    distinguishes them.
+
+    Returns (rate, confident). `confident` is False when the measurement is not
+    within `tol` of a known rate - a short or lossy capture - and the caller
+    should keep whatever rate it already had rather than trust this.
+
+    LOSS ONLY EVER LOWERS THE MEASURED RATE, which matters because the rates
+    are exactly 4x apart: a 96 kHz board losing 75% of its packets measures
+    24000 and would otherwise be reported as a healthy 24 kHz board. Pass
+    `seqs` (the 32-bit sequence numbers) to close that hole - the FPGA
+    increments them per packet SENT, so the span between first and last is how
+    many it sent regardless of how many arrived, and scaling by that recovers
+    the true rate. Without `seqs` the ambiguity is left to the caller, who
+    should be reading the loss report anyway.
+    """
+    if not pkts or elapsed <= 0:
+        return SAMPLE_RATE, False
+
+    n = len(pkts)
+    if seqs and len(seqs) >= 2:
+        span = (seqs[-1] - seqs[0]) & 0xFFFFFFFF
+        # A sane span means no counter wrap and no reset mid-capture.
+        if 0 < span < 10 * n + 1000:
+            n = span + 1
+
+    meas = (n / elapsed) * FRAMES_PKT
+    best = min(KNOWN_RATES, key=lambda r: abs(meas - r))
+    return (best, True) if abs(meas - best) <= best * tol else (meas, False)
 
 
 # ----------------------------------------------------------------- capture ---
@@ -59,7 +121,7 @@ def capture(port, seconds, bind):
     except socket.timeout:
         print("\nNo packets received in 3 s.")
         print("  - is the FPGA powered and the link up?")
-        print("  - is this PC on 192.168.1.0/24?")
+        print("  - is this PC on the array's subnet (see ctrl.SUBNET)?")
         print("  - Windows Firewall will silently drop inbound UDP: allow python,")
         print("    or test with the firewall off on the private profile.")
         return None, 0.0
@@ -401,11 +463,35 @@ def main():
     ap.add_argument("--wav", metavar="PREFIX", help="write per-channel WAV files")
     ap.add_argument("--align", action="store_true",
                     help="scan for a TDM bit-alignment offset")
+    ap.add_argument("--rate", type=int, default=None,
+                    help="sample rate override: 96000 for a 96K_* image, "
+                         "24000 for a 24K_* (decimating) image")
     args = ap.parse_args()
+    if args.rate:
+        set_sample_rate(args.rate)
 
     pkts, elapsed = capture(args.port, args.seconds, args.bind)
     if not pkts:
         return 1
+
+    # Detect the rate BEFORE anything derives a duration from it. --rate wins if
+    # given; otherwise the packet rate decides, so a 96K_* and a 24K_* image are
+    # both read correctly with no flag and no edit.
+    if not args.rate:
+        _seqs = []
+        for _p in pkts:
+            if len(_p) == PAYLOAD_LEN and _p[:4] == MAGIC:
+                _seqs.append(struct.unpack(">I", _p[4:8])[0])
+        _fs, _ok = detect_rate(pkts, elapsed, seqs=_seqs)
+        if _ok and _fs != SAMPLE_RATE:
+            print("  detected %d Hz (was %d) - following the board"
+                  % (_fs, SAMPLE_RATE))
+            set_sample_rate(_fs)
+        elif not _ok:
+            print("  WARNING: packet rate implies %.0f Hz, not close to any known"
+                  " rate %s." % (_fs, list(KNOWN_RATES)))
+            print("           Keeping %d Hz. Durations may be wrong; check for"
+                  " packet loss." % SAMPLE_RATE)
 
     samples, info = parse(pkts)
     exp, got, lost, resets = loss_report(info["seqs"])
@@ -426,6 +512,8 @@ def main():
           % (mbps_wire, mbps_wire))
     print("  effective fs       %.0f Hz per channel  (nominal %d)"
           % (pps * FRAMES_PKT, SAMPLE_RATE))
+
+
     print("  audio frames       %d  (%.3f s)" % (nsamp, nsamp / SAMPLE_RATE))
 
     print("\n" + "=" * 62)

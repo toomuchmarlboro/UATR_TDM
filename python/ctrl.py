@@ -38,14 +38,80 @@ import numpy as np
 sys.path.insert(0, __file__.rsplit("\\", 1)[0] if "\\" in __file__ else ".")
 import udp_monitor as um
 
-FPGA_IP   = "192.168.1.101"      # C_FPGA_IP in top_system.vhd, node 1
+# ---------------------------------------------------------------- addressing
+# THE SUBNET LIVES HERE, IN ONE PLACE.
+#
+# Changing the array's subnet is a two-sided edit: SUBNET below and C_FPGA_IP /
+# C_PC_IP in rtl/top_system.vhd, which also feed the compile-time IPv4 checksum
+# assertions. check_sync.py asserts the two sides agree, so they cannot drift
+# silently. Full procedure: docs/CHANGING_IP.md
+#
+# Moved 192.168.1.x -> 192.168.3.x on 2026-09-07. Boards flashed with older
+# images are still on 192.168.1.x, so BOTH are supported: SUBNET is the default
+# for outbound control, and KNOWN_SUBNETS is what the discovery helpers sweep.
+SUBNET        = "192.168.3"
+KNOWN_SUBNETS = ["192.168.3", "192.168.1"]
+
+HOST_IP   = SUBNET + ".10"       # C_PC_IP: where audio is sent, and the ARP filter
+
+FPGA_IP   = SUBNET + ".101"      # C_FPGA_IP in top_system.vhd, node 1
 FPGA_PORT = 5005                 # any port: udp_rx_core does not filter on it
 STREAM_PORT = 5005
 
 
-def node_ip(n):
+def node_ip(n, subnet=None):
     """Node number -> board IP. Mirrors C_NODE in top_system.vhd."""
-    return "192.168.1.%d" % (100 + int(n))
+    return "%s.%d" % (subnet or SUBNET, 100 + int(n))
+
+
+def node_ips(n):
+    """Every address node n could be at, across all known subnets.
+
+    A board keeps whatever address its flashed image was built with, so during
+    a subnet migration the array can legitimately be split across two. Callers
+    that want to find a board rather than assume one should try these in order.
+    """
+    return ["%s.%d" % (sub, 100 + int(n)) for sub in KNOWN_SUBNETS]
+
+
+def find_node(n, timeout=0.6):
+    """Return the address node n is actually answering on, or None.
+
+    Listens on that node's stream port and reads the source address of the
+    first packet. That is authoritative - it is where the board really is -
+    and needs no ARP, no ping, and no assumption about the host's own subnet.
+
+    RECEIVING never needed this: capture() binds INADDR_ANY, so audio arrives
+    from any subnet already. SENDING does - a gain or phantom command goes TO an
+    address, so it has to be the right one. Use this when the board's subnet is
+    not known, e.g. part-way through a migration.
+    """
+    import socket as _s
+    sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+    sock.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", node_stream_port(n)))
+        sock.settimeout(timeout)
+        _, addr = sock.recvfrom(2048)
+        return addr[0]
+    except (OSError, _s.timeout):
+        return None
+    finally:
+        sock.close()
+
+
+def resolve_node(n, timeout=0.6):
+    """Node number -> the address to SEND control commands to.
+
+    Prefers the address the board is actually transmitting from; falls back to
+    the configured SUBNET if it is silent (a board being configured before it
+    streams, or one whose stream port is held by another process).
+
+    This is what makes control work on 192.168.1.x and 192.168.3.x without a
+    flag: a board built with an old image answers from its own address, and the
+    command follows it there.
+    """
+    return find_node(n, timeout) or node_ip(n)
 
 
 def node_stream_port(n):
@@ -272,7 +338,7 @@ def self_test(ch, ip=FPGA_IP, stream_port=STREAM_PORT):
 
     print("  no change - the FPGA did not act on the packet.")
     print("  Things to check, in order:")
-    print("    - is the PC on 192.168.1.10 and the FPGA on %s?" % ip)
+    print("    - is the PC on %s and the FPGA on %s?" % (HOST_IP, ip))
     print("    - arp -a should map %s to de-ad-be-ef-00-%02d"
           % (ip, int(ip.rsplit(".", 1)[1]) - 100))
     print("    - rmii_rx / udp_rx_core have never been proven on hardware;")

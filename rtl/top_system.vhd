@@ -118,6 +118,18 @@ architecture rtl of top_system is
         );
     end component;
 
+    component decimator is
+        port (
+            clk       : in  std_logic;
+            rst       : in  std_logic;
+            data_in   : in  std_logic_vector(383 downto 0);
+            valid_in  : in  std_logic;
+            data_out  : out std_logic_vector(383 downto 0);
+            valid_out : out std_logic;
+            saturated : out std_logic
+        );
+    end component;
+
     component packet_formatter is
         port (
             clk_18m      : in  std_logic;
@@ -454,6 +466,33 @@ architecture rtl of top_system is
     -- ------------------------------------------------------------------
     constant C_LRCLK_RETIME : boolean := false;
 
+    -- ------------------------------------------------------------------
+    -- 96 kHz -> 24 kHz DECIMATION.
+    --
+    --   false - packet_formatter is fed straight from tdm16_merge at 96 kHz.
+    --           This is what every image up to and including the four NODE
+    --           builds shipped, and it is the configuration all 16 channels
+    --           are known to work on.
+    --   true  - a two-stage halfband FIR decimator sits between them, and the
+    --           stream becomes 24 kHz. Cuts the uplink 4x.
+    --
+    -- The wire format does NOT change: still 16 channels x 24-bit big-endian,
+    -- same 410-byte packet, same header, same byte-60 phantom readback. Only
+    -- the sample RATE changes, so host scripts need their rate constant
+    -- updated but no layout change. Packet rate drops ~12000/s -> ~3000/s.
+    --
+    -- Measured on the quantised cascade (python/design_decimator.py):
+    --   passband ripple 0-11 kHz   0.00015 dB
+    --   worst alias band          -102.5   dB   (below the ADC's 103 dB range)
+    --   group delay                 1.91   ms
+    --
+    -- Set false by default for the same reason C_LRCLK_RETIME is: this is a
+    -- substantial change to a working signal path, and it should be flipped on
+    -- its own, not alongside anything else. The 96 kHz images remain the
+    -- reference. See docs/DECIMATION.md.
+    -- ------------------------------------------------------------------
+    constant C_DECIMATE : boolean := true;
+
     -- Audio Domain (18.432 MHz)
     signal lrclk_int     : std_logic;
     signal clk_lr        : std_logic;               -- u_pll c3, phase shifted
@@ -462,6 +501,27 @@ architecture rtl of top_system is
     signal ch_data_B_int : std_logic_vector(191 downto 0);
     signal tdm16_out_int : std_logic_vector(383 downto 0);
     signal tdm16_val_int : std_logic;
+
+    -- Decimator output, and the muxed pair that actually feeds the formatter.
+    signal decim_data    : std_logic_vector(383 downto 0);
+    signal decim_valid   : std_logic;
+
+    -- Sticky arithmetic-saturation flag out of the decimator.
+    --
+    -- Currently unread, and Quartus says so (Warning 10036). Left connected and
+    -- `preserve`d rather than deleted: it is a can't-happen condition for a
+    -- unity-DC-gain filter with bounded input, so there is nothing to route it
+    -- to yet, but if it ever asserts it is the first thing worth probing over
+    -- JTAG. Every bit of dbg_status2 is already spoken for and the
+    -- phantom-power decode in docs/PHANTOM_POWER.md depends on bits 6:3
+    -- exactly, so it is NOT folded into a shared status bit - corrupting a
+    -- diagnostic the host already decodes would be worse than leaving this
+    -- unrouted.
+    signal decim_sat     : std_logic;
+    attribute preserve : boolean;
+    attribute preserve of decim_sat : signal is true;
+    signal fmt_data      : std_logic_vector(383 downto 0);
+    signal fmt_valid     : std_logic;
     
     -- Bridge / FIFO Signals
     signal packet_ready_int : std_logic;
@@ -1403,11 +1463,34 @@ begin
         tdm16_valid => tdm16_val_int
     );
 
+    -- ================= 96 kHz -> 24 kHz DECIMATION =================
+    -- Spliced between tdm16_merge and packet_formatter. Both interfaces are
+    -- identical (384-bit parallel + one-cycle strobe), so this is a pure
+    -- drop-in: no slot decoder, no encoder, no change to the packet layout.
+    --
+    -- The instance is always present; C_DECIMATE only selects which pair of
+    -- signals reaches the formatter. Quartus strips the whole block when the
+    -- constant is false, so a false build is bit-identical to the pre-existing
+    -- design rather than merely equivalent. See docs/DECIMATION.md.
+    u_decim : decimator port map (
+        clk       => clk_18m,
+        rst       => sys_rst,
+        data_in   => tdm16_out_int,
+        valid_in  => tdm16_val_int,
+        data_out  => decim_data,
+        valid_out => decim_valid,
+        saturated => decim_sat
+    );
+
+    fmt_data  <= decim_data  when C_DECIMATE else tdm16_out_int;
+    fmt_valid <= decim_valid when C_DECIMATE else tdm16_val_int;
+    -- ===============================================================
+
     u_fmt : packet_formatter port map (
         clk_18m      => clk_18m,
         rst          => sys_rst,
-        tdm16_valid  => tdm16_val_int,
-        tdm16_data   => tdm16_out_int,
+        tdm16_valid  => fmt_valid,
+        tdm16_data   => fmt_data,
         -- Raw SDATA edge counters, NOT the ADC register readbacks any more.
         --
         -- act_a_l/act_b_l were computed every 2.7 ms and then read by nothing:

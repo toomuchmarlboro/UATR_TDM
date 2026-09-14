@@ -47,3 +47,6 @@ __pycache__/
 *.rpd
 *.cmp.rdb
 TDM_UATR.csv
+
+# Claude Code session artifacts
+.claude/

@@ -940,5 +940,20 @@ while True:
 
 ---
 
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Faiz Akbar Parinduri, S.T.
+
+This covers the VHDL in `rtl/`, the host tools in `python/`, the testbenches in
+`sim/`, and the documentation. It does **not** cover third-party material
+redistributed here for convenience:
+
+- `ip/pll_audio` and `ip/async_fifo` are Altera/Intel megafunction output,
+  governed by the Quartus Prime license under which they were generated
+- `docs/adau1978.pdf` is the Analog Devices datasheet, © Analog Devices
+- `hardware/` contains the Souncard_Robomarine 1.0 schematic and netlist
+
+---
+
 *Analog Devices ADAU1978 Rev B. Microchip LAN8720A. Altera Cyclone IV E
 EP4CE6E22C8. Built with Quartus Prime 25.1std Lite.*

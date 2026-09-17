@@ -19,7 +19,7 @@ framing. It lives in its own module so neither can break the other.
     ulRaw[6]  u32    AHRS Yaw          yaw angle               float, deg
     ulRaw[7]  u32    Altimeter dist    distance to seabed      integer, mm
     ulRaw[8]  u32    Altimeter conf    confidence 0-100        integer, %
-    ulRaw[9]  u32    Digital I/O       bit0 = OPEN, bit1 = CLOSE
+    ulRaw[9]  u32    Digital I/O       bit0 = CLOSE, bit1 = OPEN  (see below)
     seq       u32    sequence
     cnt       u8     packet counter, wraps at 256
 
@@ -183,8 +183,17 @@ FIELDS = (
     ("Digital I/O",     "",     "bits"),
 )
 
-DIO_OPEN  = 0x01
-DIO_CLOSE = 0x02
+# BIT 1 IS OPEN AND BIT 0 IS CLOSED - the opposite of the field map above, and
+# established on the hardware: with the claw visibly open this read CLOSE, and
+# with it shut it read OPEN.
+#
+# SECOND SWAP IN THIS ONE ACTUATOR'S DOCUMENTATION. The command codes are
+# reversed too (see RMCMD_OPEN below - their ENABLE_1 closes), and the two are
+# independent: finding one was not grounds to assume the other, and correcting
+# the commands did not correct these. Both are now set from what the hardware
+# does. Neither should be "tidied" back to agree with the spec.
+DIO_OPEN  = 0x02
+DIO_CLOSE = 0x01
 
 # Index of each field, so callers name a field instead of hard-coding a number.
 # A second copy of the field order is how a decoder silently goes one position
@@ -397,6 +406,51 @@ def dio_text(raw):
     return "OPEN" if o else "CLOSE" if c else "idle"
 
 
+# ---------------------------------------------------------------- actuator ---
+# The COMMAND half of the actuator; dio_text above is the readback half. They
+# sit together because they are the two ends of one loop, and the readback is
+# the only thing that ever confirms a command.
+RMCMD_TALKER = "RMCMD"
+
+# CODE 5 OPENS, CODE 1 CLOSES. Established on the hardware, and it is the
+# OPPOSITE of what the manufacturer's own control station said:
+#
+#     Host_RMI.py shipped with its buttons reading "OPEN Valve
+#     (RMCMD_ENABLE_1)" and "CLOSE Valve (RMCMD_DISABLE_1)". Pressing OPEN
+#     closed the valve. Those labels have since been corrected in that file;
+#     the constants here follow the valve, not the label that came with it.
+#
+# So these names describe the EFFECT, not the vendor's mnemonic. Whatever
+# "enable output 1" means inside that firmware, what it does to the water is
+# close - and every caller reads these names rather than the bare code, so the
+# correction is made once, here, and cannot be half-applied.
+#
+# THE PREVIOUS COMMENT HERE REASONED FROM THE MNEMONICS and got it wrong, which
+# is the argument for not doing that: "enable/disable output 1" is a perfectly
+# coherent story that happens not to be what the hardware does.
+RMCMD_OPEN  = 5           # vendor's RMCMD_DISABLE_1
+RMCMD_CLOSE = 1           # vendor's RMCMD_ENABLE_1
+
+# THE READBACK WAS WRONG TOO, and has since been corrected - see DIO_OPEN and
+# DIO_CLOSE above. It was a genuinely separate claim: two independently
+# documented halves of one actuator, each reversed, neither implying the other.
+# Both were only settled by driving the claw and watching which bit moved.
+
+
+def rmcmd(code):
+    """Build one actuator command. -> "$RMCMD,<code>*HH\\r\\n".
+
+    BUILT, not pasted. The manufacturer's host carries these two sentences as
+    string literals with the checksums baked in, and a literal is a copy that
+    nothing checks. checksum() here is the same function already trusted to
+    VALIDATE every inbound sentence, so the two directions cannot end up
+    disagreeing about the convention - which is the failure that would make a
+    command silently ignored while the link looked perfectly healthy.
+    """
+    body = "%s,%d" % (RMCMD_TALKER, int(code))
+    return "$%s*%02X\r\n" % (body, checksum(body))
+
+
 # -------------------------------------------------------------------- link ---
 class Link(threading.Thread):
     """TCP transport. Reconnects on its own; never raises into the GUI.
@@ -434,6 +488,8 @@ class Link(threading.Thread):
         self._rt0 = time.time()
         self._rn = 0
         self.tail = ""              # raw text ring for the GUI
+        self.sent = 0               # commands written back to the far end
+        self.last_sent = ""
 
     # -- public ------------------------------------------------------------
     def snapshot(self):
@@ -441,7 +497,45 @@ class Link(threading.Thread):
             return dict(state=self.state, peer=self.peer, last=self.last,
                         lines=self.lines, good=self.good,
                         csum_err=self.csum_err, parse_err=self.parse_err,
-                        lost=self.lost, rate=self.rate, tail=self.tail)
+                        lost=self.lost, rate=self.rate, tail=self.tail,
+                        sent=self.sent, last_sent=self.last_sent)
+
+    def send(self, text):
+        """Write one sentence to the far end. -> (ok, detail). Never raises.
+
+        THE ONLY WRITE PATH IN THIS MODULE. Everything else here reads, and a
+        command that moves hardware must not be able to take the telemetry link
+        down with it - hence a return value rather than an exception. The
+        caller is a GUI button; the link is the whole transport.
+
+        Goes out on the SAME socket the sentences arrive on, which is what the
+        manufacturer's host does in its TCP mode. Not a second connection: the
+        aux_vcu accepts commands on the one it is already streaming over, and
+        plenty of embedded TCP servers take a single client, so dialling again
+        would be refused or would displace the stream.
+
+        UNACKNOWLEDGED. The far end sends no reply, so ok=True means the bytes
+        reached the kernel - not that the actuator moved, and not that the
+        firmware understood the code. ulRaw[9], via dio_text(), is the only
+        evidence of that.
+        """
+        data = text.encode("ascii")
+        # The reader thread owns self.sock and clears it on disconnect, so take
+        # the reference under the lock and send outside it: sendall must not
+        # hold the lock the reader wants, and a socket closed in the gap just
+        # raises OSError - already the failure path, not a new one.
+        with self.lock:
+            s = self.sock
+        if s is None:
+            return False, "not connected"
+        try:
+            s.sendall(data)
+        except OSError as e:
+            return False, str(e)
+        with self.lock:
+            self.sent += 1
+            self.last_sent = text.strip()
+        return True, text.strip()
 
     def close(self):
         self.stop = True
@@ -697,6 +791,22 @@ def _selftest():
 
     nocsum = "$%s" % body
     assert parse(nocsum)["csum_ok"] is None and parse(nocsum)["ok"]
+
+    # The actuator command, pinned byte-for-byte against what the
+    # manufacturer's control station sends. Those two literals are the entire
+    # specification we have for this direction, so they are asserted here
+    # rather than left to a comment - and asserting them is what lets rmcmd()
+    # COMPUTE the checksum instead of copying it. A wrong checksum would be
+    # rejected silently by the firmware, with the telemetry still flowing.
+    # OPEN is code 5 and CLOSE is code 1 - the opposite of the vendor's own
+    # labels, corrected against the hardware. Asserted in this direction on
+    # purpose: a future edit that "tidies" these back into numerical order
+    # would silently re-flip the valve, and this is what stops it.
+    assert rmcmd(RMCMD_OPEN) == "$RMCMD,5*4C\r\n", rmcmd(RMCMD_OPEN)
+    assert rmcmd(RMCMD_CLOSE) == "$RMCMD,1*48\r\n", rmcmd(RMCMD_CLOSE)
+    # Same XOR convention as the telemetry it travels beside, not a second one.
+    assert checksum("RMCMD,1") == 0x48
+    assert checksum("RMCMD,5") == 0x4C
 
     assert not parse("$%s,1,2,3*00" % TALKER)["ok"]        # too few fields
     assert not parse("garbage")["ok"]

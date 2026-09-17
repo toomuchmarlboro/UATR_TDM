@@ -67,6 +67,14 @@ READING THE TELEMETRY TAB
   Instruments compass and horizon for the SELECTED buoy. The caption says which
               device is driving them - the IMU when it is up, otherwise the
               aux_vcu, which relays the same attitude twenty times slower.
+  Actuator    OPEN/CLOSE for the selected buoy, and the ONLY control in this
+              application that moves something in the water. It writes $RMCMD
+              back up the same connection the telemetry arrives on. The aux_vcu
+              does NOT acknowledge it, so the "sent" line means only that the
+              bytes left this host; the "readback" line beside it is the
+              Digital I/O field, and that is the only evidence the actuator
+              moved. They are allowed to disagree - when they do, believe the
+              readback.
   Field table every $GDAT2 field with the bytes that produced it, so a decode
               can be checked without a capture. The "live" column is the one
               that stops a number being believed just because it is well
@@ -237,6 +245,43 @@ def node_stream_port(n):
     loss report would be meaningless.
     """
     return 5004 + int(n)
+
+IMAGE_RATE = 24000               # C_DECIMATE = true, 4x on-FPGA decimation
+
+def node_image(n, subnet=None):
+    """Board number -> the .jic that must be flashed on it.
+
+    Mirrors build_all.sh's "{rate}K_NODE{n}_{ip}.jic" naming, derived rather
+    than listed so it cannot fall out of step with node_ip(). Exists so a
+    mismatch can name the FILE to reflash: "expected 192.168.3.103" tells an
+    operator what is wrong, and this tells them what to do about it.
+    """
+    return "%dK_NODE%d_%s.jic" % (IMAGE_RATE // 1000, int(n),
+                                  node_ip(n, subnet).replace(".", "-"))
+
+def node_image_fault(n, src=None, fs=None, subnet=None):
+    """Is board n running its own image? -> "" if yes, else what is wrong.
+
+    Takes what was OBSERVED - the source address of its packets, and the rate
+    measured from them - and compares it against what the flashed image fixes.
+    Both arguments are optional because both are learned at different times: a
+    board that has not sent anything yet is not a mismatch, it is unknown, and
+    reporting those as the same thing is how a quiet board gets read as a
+    misflashed one.
+
+    ADDRESS IS CHECKED BEFORE RATE, because a wrong address explains a wrong
+    rate - the 96K_* and 192.168.1.x images are different files - and reporting
+    both would present one misflash as two faults.
+    """
+    want_ip = node_ip(n, subnet)
+    if src is not None and src != want_ip:
+        return ("WRONG BOARD: %s answers on node %d's port, expected %s. "
+                "Reflash %s" % (src, int(n), want_ip, node_image(n, subnet)))
+    if fs is not None and int(fs) != IMAGE_RATE:
+        return ("WRONG RATE: %d Hz, expected %d. This board is carrying a "
+                "96K_* image. Reflash %s"
+                % (int(fs), IMAGE_RATE, node_image(n, subnet)))
+    return ""
 
 def find_node(n, timeout=0.6):
     """Return the address node n is actually answering on, or None.
@@ -444,9 +489,9 @@ FIELDS = (
     ("Digital I/O",     "",     "bits"),
 )
 
-DIO_OPEN  = 0x01
+DIO_OPEN  = 0x02
 
-DIO_CLOSE = 0x02
+DIO_CLOSE = 0x01
 
 I_LEAK, I_VBUS, I_DEPTH, I_DTEMP, I_ROLL, I_PITCH, I_YAW, \
     I_ALT_MM, I_ALT_PCT, I_DIO = range(N_RAW)
@@ -624,6 +669,25 @@ def dio_text(raw):
         return "OPEN+CLOSE (invalid)"
     return "OPEN" if o else "CLOSE" if c else "idle"
 
+RMCMD_TALKER = "RMCMD"
+
+RMCMD_OPEN  = 5           # vendor's RMCMD_DISABLE_1
+
+RMCMD_CLOSE = 1           # vendor's RMCMD_ENABLE_1
+
+def rmcmd(code):
+    """Build one actuator command. -> "$RMCMD,<code>*HH\\r\\n".
+
+    BUILT, not pasted. The manufacturer's host carries these two sentences as
+    string literals with the checksums baked in, and a literal is a copy that
+    nothing checks. checksum() here is the same function already trusted to
+    VALIDATE every inbound sentence, so the two directions cannot end up
+    disagreeing about the convention - which is the failure that would make a
+    command silently ignored while the link looked perfectly healthy.
+    """
+    body = "%s,%d" % (RMCMD_TALKER, int(code))
+    return "$%s*%02X\r\n" % (body, checksum(body))
+
 class Link(threading.Thread):
     """TCP transport. Reconnects on its own; never raises into the GUI.
 
@@ -660,6 +724,8 @@ class Link(threading.Thread):
         self._rt0 = time.time()
         self._rn = 0
         self.tail = ""              # raw text ring for the GUI
+        self.sent = 0               # commands written back to the far end
+        self.last_sent = ""
 
     # -- public ------------------------------------------------------------
     def snapshot(self):
@@ -667,7 +733,45 @@ class Link(threading.Thread):
             return dict(state=self.state, peer=self.peer, last=self.last,
                         lines=self.lines, good=self.good,
                         csum_err=self.csum_err, parse_err=self.parse_err,
-                        lost=self.lost, rate=self.rate, tail=self.tail)
+                        lost=self.lost, rate=self.rate, tail=self.tail,
+                        sent=self.sent, last_sent=self.last_sent)
+
+    def send(self, text):
+        """Write one sentence to the far end. -> (ok, detail). Never raises.
+
+        THE ONLY WRITE PATH IN THIS MODULE. Everything else here reads, and a
+        command that moves hardware must not be able to take the telemetry link
+        down with it - hence a return value rather than an exception. The
+        caller is a GUI button; the link is the whole transport.
+
+        Goes out on the SAME socket the sentences arrive on, which is what the
+        manufacturer's host does in its TCP mode. Not a second connection: the
+        aux_vcu accepts commands on the one it is already streaming over, and
+        plenty of embedded TCP servers take a single client, so dialling again
+        would be refused or would displace the stream.
+
+        UNACKNOWLEDGED. The far end sends no reply, so ok=True means the bytes
+        reached the kernel - not that the actuator moved, and not that the
+        firmware understood the code. ulRaw[9], via dio_text(), is the only
+        evidence of that.
+        """
+        data = text.encode("ascii")
+        # The reader thread owns self.sock and clears it on disconnect, so take
+        # the reference under the lock and send outside it: sendall must not
+        # hold the lock the reader wants, and a socket closed in the gap just
+        # raises OSError - already the failure path, not a new one.
+        with self.lock:
+            s = self.sock
+        if s is None:
+            return False, "not connected"
+        try:
+            s.sendall(data)
+        except OSError as e:
+            return False, str(e)
+        with self.lock:
+            self.sent += 1
+            self.last_sent = text.strip()
+        return True, text.strip()
 
     def close(self):
         self.stop = True
@@ -1426,6 +1530,8 @@ ctrl = _NS(FPGA_IP=FPGA_IP, FPGA_PORT=FPGA_PORT,
            SUBNET=SUBNET, KNOWN_SUBNETS=KNOWN_SUBNETS,
            HOST_IP=HOST_IP, node_ips=node_ips,
            find_node=find_node, resolve_node=resolve_node,
+           IMAGE_RATE=IMAGE_RATE, node_image=node_image,
+           node_image_fault=node_image_fault,
            node_ip=node_ip, node_stream_port=node_stream_port)
 gdat2 = _NS(TALKER=TALKER, N_RAW=N_RAW, BUOYS=BUOYS, IMUS=IMUS,
             ALTIMETERS=ALTIMETERS, buoy_ip=buoy_ip,
@@ -1435,6 +1541,8 @@ gdat2 = _NS(TALKER=TALKER, N_RAW=N_RAW, BUOYS=BUOYS, IMUS=IMUS,
             DEFAULT_PORT=DEFAULT_PORT, FIELDS=FIELDS,
             PLAUSIBLE=PLAUSIBLE, implausible=implausible,
             dio_text=dio_text, parse=parse, build=build,
+            rmcmd=rmcmd, RMCMD_OPEN=RMCMD_OPEN,
+            RMCMD_CLOSE=RMCMD_CLOSE,
             f32_bits=f32_bits, bits_f32=bits_f32, Link=Link)
 imu_test = _NS(AxisWindow=AxisWindow, wrapped_span=wrapped_span)
 ping1d = _NS(PingLink=PingLink, PING_PORT=PING_PORT,
@@ -1575,13 +1683,43 @@ class Mixer(tk.Frame):
         node_ip() until the first packet arrives, and never overrides an
         explicit --ip.
 
-        This is what makes the GUI correct on a mixed array: a board still
-        running a 192.168.1.x image is controlled at 192.168.1.x even though
-        ctrl.SUBNET says 192.168.3, with no flag and no configuration.
+        FOLLOWING THE BOARD IS NOT THE SAME AS AGREEING WITH IT, and the two
+        were the same thing here until the array was frozen on one image per
+        board. The address a board answers from is still the only one its
+        control path listens on, so commands go there or they go nowhere -
+        that much is unchanged. What is new is that there is now a documented
+        right answer to compare it against, so a board that is not where its
+        .jic says stays controllable AND gets reported. See _image_fault.
         """
         if self.ip_fixed:
             return self._ip_cfg
         return getattr(self.rx, "src", None) or self._ip_cfg
+
+    @property
+    def image(self):
+        """The .jic this tab's board must be flashed with. "" if --ip overrode.
+
+        Shown on every tab, not just on a fault. Four identical panels and a
+        board that silently carries the wrong image is exactly the situation
+        the filename convention was built for, and naming the file here is what
+        lets a wrong meter be traced to a wrong flash without leaving the GUI.
+        """
+        if self.node is None or self.ip_fixed:
+            return ""
+        return ctrl.node_image(self.node)
+
+    def _image_fault(self, fs):
+        """-> "" when this board is running its own image, else what is wrong.
+
+        `fs` is the measured rate, or None while it is still settling - an
+        unconfident measurement must not be reported as a wrong image.
+        """
+        if self.node is None or self.ip_fixed:
+            # --ip was given: the operator is deliberately pointing this window
+            # at something, and secondguessing that is not this check's job.
+            return ""
+        return ctrl.node_image_fault(self.node, src=getattr(self.rx, "src", None),
+                                     fs=fs)
 
     def __init__(self, master, rx, fps, hold, ip, label=""):
         super().__init__(master, bg=BG)
@@ -2016,11 +2154,22 @@ class Mixer(tk.Frame):
         # subnet on a mixed array. Showing the stale one would say
         # 192.168.3.103 while control correctly went to 192.168.1.103, which is
         # exactly the kind of quiet disagreement this header exists to prevent.
-        self.cv.itemconfigure(self.hdr, text="%s%s:%d   %d Hz   %5.0f pkt/s   lost %d"
-                              % (self.label, self.ip, getattr(self, "port", 0),
-                                 _shown, pps, lost))
-        self.cv.itemconfigure(self.sub, text="bar = RMS   white = held peak   "
-                                             "faders write ADAU1978 reg 0x0A-0x0D over I2C")
+        # Only a CONFIDENT measurement is worth comparing against the image:
+        # detect_rate returns ok=False while the window is still short, and
+        # feeding that in would announce a wrong image for the first second of
+        # every run.
+        fault = self._image_fault(_shown if _ok else None)
+        self.cv.itemconfigure(
+            self.hdr,
+            text="%s%s:%d   %d Hz   %5.0f pkt/s   lost %d%s"
+                 % (self.label, self.ip, getattr(self, "port", 0),
+                    _shown, pps, lost, "    " + fault if fault else ""),
+            fill=RED if fault else TEXT)
+        self.cv.itemconfigure(
+            self.sub,
+            text="%sbar = RMS   white = held peak   "
+                 "faders write ADAU1978 reg 0x0A-0x0D over I2C"
+                 % (self.image + "   " if self.image else ""))
 
         step = self.period / 1000.0
         m = self.m
@@ -2680,6 +2829,8 @@ class Telemetry(tk.Frame):
                                 font=("Consolas", 8), justify="left")
         self.att_src.pack(side="left", anchor="s", pady=(0, 18))
 
+        self._build_actuator(inst)
+
         self.stats = tk.Label(self, text="", bg=BG, fg=DIM, anchor="w",
                               font=("Consolas", 9), justify="left")
         self.stats.pack(fill="x", padx=12, pady=(8, 4))
@@ -2735,6 +2886,108 @@ class Telemetry(tk.Frame):
                               font=("Consolas", 8), borderwidth=0,
                               highlightthickness=0, wrap="none")
         self.rawbox.pack(fill="both", expand=True, padx=12, pady=(2, 10))
+
+    # ----------------------------------------------------------- actuator --
+    def _build_actuator(self, parent):
+        """OPEN/CLOSE for the SELECTED buoy, with its readback beside it.
+
+        The only control in this application that moves something in the water.
+        Three deliberate choices follow from that:
+
+        NOT IN THE TOP BAR. That bar is link plumbing - connect, disconnect,
+        watch all - and a control that drives an actuator sitting among them is
+        one slip away from being hit while reaching for "disconnect".
+
+        THE READBACK IS REPEATED HERE, duplicating the Digital I/O row of the
+        table further down. Duplication is the point: a command whose
+        confirmation is twenty rows away gets sent and then not checked.
+
+        WHAT WAS SENT AND WHAT THE HARDWARE SAYS ARE TWO SEPARATE LINES, and
+        they are allowed to disagree. $RMCMD is unacknowledged, so "sent" only
+        ever means the bytes left this host - the readback is the evidence, and
+        collapsing them into one "valve: OPEN" would manufacture a confirmation
+        that nothing actually made.
+        """
+        self._I_DIO = self._field_index("Digital I/O")
+
+        act = tk.Frame(parent, bg=BG)
+        act.pack(side="right", anchor="n", padx=(10, 0))
+        self.act_title = tk.Label(act, text="ACTUATOR", bg=BG, fg=TEXT,
+                                  anchor="e", font=("Consolas", 9, "bold"))
+        self.act_title.pack(fill="x")
+
+        btns = tk.Frame(act, bg=BG)
+        btns.pack(fill="x", pady=3)
+        self.act_open = tk.Button(
+            btns, text="OPEN", bg=GRID, fg=TEXT, font=("Consolas", 9),
+            borderwidth=0, activebackground=GREEN, padx=16, state="disabled",
+            command=lambda: self._send_rmcmd(gdat2.RMCMD_OPEN, "OPEN"))
+        self.act_open.pack(side="left", padx=(0, 5))
+        self.act_close = tk.Button(
+            btns, text="CLOSE", bg=GRID, fg=TEXT, font=("Consolas", 9),
+            borderwidth=0, activebackground=AMBER, padx=14, state="disabled",
+            command=lambda: self._send_rmcmd(gdat2.RMCMD_CLOSE, "CLOSE"))
+        self.act_close.pack(side="left")
+
+        self.act_state = tk.Label(act, text="readback: -", bg=BG, fg=DIM,
+                                  anchor="e", font=("Consolas", 9))
+        self.act_state.pack(fill="x")
+        self.act_sent = tk.Label(act, text="", bg=BG, fg=DIM, anchor="e",
+                                 font=("Consolas", 8))
+        self.act_sent.pack(fill="x")
+
+    def _send_rmcmd(self, code, what):
+        """Send one actuator command to the selected buoy. Never raises.
+
+        Down the link already streaming that buoy's telemetry, so the command
+        and the readback that confirms it share one connection - there is no
+        case where the command went to a unit the readback did not come from.
+        """
+        lk = self.link
+        if lk is None:
+            # Reachable despite the buttons being disabled without a link: the
+            # link can drop between the tick that enabled them and the click.
+            self.act_sent.config(text="no link to %s"
+                                      % self.host.get().strip(), fg=RED)
+            return
+        line = gdat2.rmcmd(code)
+        ok, detail = lk.send(line)
+        # Names the ACTION as well as the bytes. The code and the effect are
+        # not in the order anyone expects - 5 opens, 1 closes - so a log line
+        # showing only "$RMCMD,5*4C" invites a reader who remembers the
+        # vendor's mnemonics to conclude the wrong thing happened.
+        self.act_sent.config(
+            text="%s: sent %s" % (what, line.strip()) if ok
+            else "%s failed: %s" % (what, detail),
+            fg=DIM if ok else RED)
+
+    def _update_actuator(self, now):
+        lk = self.link
+        s = lk.snapshot() if lk else None
+        r = s["last"] if s else None
+
+        self.act_open.config(state="normal" if lk else "disabled")
+        self.act_close.config(state="normal" if lk else "disabled")
+        # Name the target on the control itself. The buoy selector is at the
+        # far end of the tab, and "which unit is this about to move" is not a
+        # question to answer by looking somewhere else.
+        self.act_title.config(
+            text="ACTUATOR  %s" % (self.buoy.get() if lk else "no link"),
+            fg=TEXT if lk else DIM)
+
+        if r is None or (now - r["t"]) > 1.0:
+            # A state from a stale link is the one reading that must never show
+            # as current: it is the last thing the buoy said before it went
+            # quiet, which is not where the actuator is now.
+            self.act_state.config(
+                text="readback: stale" if lk else "readback: -",
+                fg=AMBER if lk else DIM)
+            return
+        txt = gdat2.dio_text(r["raw"][self._I_DIO])
+        self.act_state.config(
+            text="readback: %s" % txt,
+            fg=RED if "invalid" in txt else
+            GREEN if txt in ("OPEN", "CLOSE") else DIM)
 
     # -------------------------------------------------------------- logic --
     def toggle(self):
@@ -2813,6 +3066,7 @@ class Telemetry(tk.Frame):
     def tick(self):
         self._update_overview()
         self._update_instruments(time.time())
+        self._update_actuator(time.time())
 
         # The detail table follows the selected host, and the liveness trackers
         # below are per-field evidence about ONE unit. Switching buoy without
@@ -3239,16 +3493,28 @@ class App(tk.Tk):
         # the loss figure would be meaningless for both.
         #
         # --port / --ip still override, for pointing one window at one board.
-        # CONTROL IP FOLLOWS THE BOARD, IT IS NOT ASSUMED.
         #
-        # Receiving never needed this - the socket binds INADDR_ANY, so audio
+        # EACH TAB IS FIXED TO ONE BOARD, and the .jic flashed on that board is
+        # what fixes it:
+        #
+        #     24K_NODE1_192-168-3-101.jic  ->  AFE 1, port 5005
+        #     24K_NODE2_192-168-3-102.jic  ->  AFE 2, port 5006
+        #     24K_NODE3_192-168-3-103.jic  ->  AFE 3, port 5007
+        #     24K_NODE4_192-168-3-104.jic  ->  AFE 4, port 5008
+        #
+        # Address, port and rate all descend from C_NODE and C_DECIMATE in that
+        # image, so none of the three is configurable from here and all three
+        # are checkable. Each tab states its expected image and turns its header
+        # red when the board answering does not match it - see Mixer._image_fault.
+        #
+        # CONTROL STILL FOLLOWS THE BOARD rather than assuming the address.
+        # Receiving never needed it - the socket binds INADDR_ANY, so audio
         # arrives whatever subnet the board is on. SENDING does: a gain or
         # phantom command goes TO an address, and a board only ever answers on
-        # the address its own flashed image was built with. An array part-way
-        # through the 192.168.1.x -> 192.168.3.x migration legitimately has
-        # boards on both, and a static ctrl.node_ip() would address all of them
-        # on the configured subnet - faders would appear to work and change
-        # nothing on the boards that are elsewhere.
+        # the one its own image was built with, so a misflashed board addressed
+        # at where it OUGHT to be would show working faders that change nothing.
+        # Reporting the mismatch and still reaching the board beats being right
+        # about the address and talking to no one.
         #
         # The Receiver learns the address from the packets it is already
         # taking, so no extra socket is opened. That matters: probing with a

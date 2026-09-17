@@ -135,7 +135,10 @@ PLAUSIBLE = (
 )
 assert len(PLAUSIBLE) == len(FIELDS) == N_RAW, "PLAUSIBLE must track FIELDS"
 
-DIO_OPEN, DIO_CLOSE = 0x01, 0x02
+# Bit 1 is OPEN and bit 0 is CLOSED, the opposite of the manufacturer's field
+# map and established on the hardware. Must agree with gdat2.py, which carries
+# the reasoning; this file keeps its own copy only because it is standalone.
+DIO_OPEN, DIO_CLOSE = 0x02, 0x01
 DEFAULT_WINDOW_S = 3.0
 STILL_MAX, MOVING_MIN = 5.0, 0.20
 _HEX = set("0123456789abcdefABCDEF")

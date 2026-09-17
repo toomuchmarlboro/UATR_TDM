@@ -74,6 +74,64 @@ def node_ips(n):
     return ["%s.%d" % (sub, 100 + int(n)) for sub in KNOWN_SUBNETS]
 
 
+# ------------------------------------------------------- the shipping array --
+# WHAT IS FLASHED ON EACH BOARD, which is a stronger statement than node_ip()
+# alone: it fixes the rate as well as the address, and names the file.
+#
+#     output_files/24K_NODE1_192-168-3-101.jic   ->  board 1
+#     output_files/24K_NODE2_192-168-3-102.jic   ->  board 2
+#     output_files/24K_NODE3_192-168-3-103.jic   ->  board 3
+#     output_files/24K_NODE4_192-168-3-104.jic   ->  board 4
+#
+# Both live here because both are baked into the bitstream and neither can be
+# changed from the host: C_NODE fixes the address and C_DECIMATE fixes the
+# rate. A board is therefore either running its own image or it is not, and
+# that is a checkable claim rather than a configuration.
+#
+# output_files/ also holds 96K_* images and a 192.168.1.x variant of each 24K
+# image. Those are the pre-migration and pre-decimation builds; they are not
+# what the array runs. A board found answering as one of them is a board that
+# was flashed from the wrong file - see node_image_fault.
+IMAGE_RATE = 24000               # C_DECIMATE = true, 4x on-FPGA decimation
+
+
+def node_image(n, subnet=None):
+    """Board number -> the .jic that must be flashed on it.
+
+    Mirrors build_all.sh's "{rate}K_NODE{n}_{ip}.jic" naming, derived rather
+    than listed so it cannot fall out of step with node_ip(). Exists so a
+    mismatch can name the FILE to reflash: "expected 192.168.3.103" tells an
+    operator what is wrong, and this tells them what to do about it.
+    """
+    return "%dK_NODE%d_%s.jic" % (IMAGE_RATE // 1000, int(n),
+                                  node_ip(n, subnet).replace(".", "-"))
+
+
+def node_image_fault(n, src=None, fs=None, subnet=None):
+    """Is board n running its own image? -> "" if yes, else what is wrong.
+
+    Takes what was OBSERVED - the source address of its packets, and the rate
+    measured from them - and compares it against what the flashed image fixes.
+    Both arguments are optional because both are learned at different times: a
+    board that has not sent anything yet is not a mismatch, it is unknown, and
+    reporting those as the same thing is how a quiet board gets read as a
+    misflashed one.
+
+    ADDRESS IS CHECKED BEFORE RATE, because a wrong address explains a wrong
+    rate - the 96K_* and 192.168.1.x images are different files - and reporting
+    both would present one misflash as two faults.
+    """
+    want_ip = node_ip(n, subnet)
+    if src is not None and src != want_ip:
+        return ("WRONG BOARD: %s answers on node %d's port, expected %s. "
+                "Reflash %s" % (src, int(n), want_ip, node_image(n, subnet)))
+    if fs is not None and int(fs) != IMAGE_RATE:
+        return ("WRONG RATE: %d Hz, expected %d. This board is carrying a "
+                "96K_* image. Reflash %s"
+                % (int(fs), IMAGE_RATE, node_image(n, subnet)))
+    return ""
+
+
 def find_node(n, timeout=0.6):
     """Return the address node n is actually answering on, or None.
 

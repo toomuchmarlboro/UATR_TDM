@@ -217,6 +217,14 @@ READING THE TELEMETRY TAB
   Instruments compass and horizon for the SELECTED buoy. The caption says which
               device is driving them - the IMU when it is up, otherwise the
               aux_vcu, which relays the same attitude twenty times slower.
+  Actuator    OPEN/CLOSE for the selected buoy, and the ONLY control in this
+              application that moves something in the water. It writes $RMCMD
+              back up the same connection the telemetry arrives on. The aux_vcu
+              does NOT acknowledge it, so the "sent" line means only that the
+              bytes left this host; the "readback" line beside it is the
+              Digital I/O field, and that is the only evidence the actuator
+              moved. They are allowed to disagree - when they do, believe the
+              readback.
   Field table every $GDAT2 field with the bytes that produced it, so a decode
               can be checked without a capture. The "live" column is the one
               that stops a number being believed just because it is well
@@ -304,6 +312,7 @@ def build():
     ct_names = ["SUBNET", "KNOWN_SUBNETS", "HOST_IP",
                 "FPGA_IP", "FPGA_PORT", "STREAM_PORT", "MUTE", "ZERO_DB",
                 "PHANTOM_FRAME", "node_ip", "node_ips", "node_stream_port",
+                "IMAGE_RATE", "node_image", "node_image_fault",
                 "find_node", "resolve_node", "gain_byte",
                 "gain_db", "send_gain", "send_flags", "phantom_state",
                 "phantom_reason", "decode"]
@@ -318,7 +327,8 @@ def build():
                 "DEFAULT_HOST", "FIELDS", "DIO_OPEN", "DIO_CLOSE", "I_LEAK",
                 "AHRS_IDX", "PLAUSIBLE", "implausible", "checksum", "build",
                 "f32_bits", "bits_f32", "_HEX", "decode_field", "parse",
-                "_int_or_none", "dio_text", "Link"]
+                "_int_or_none", "dio_text",
+                "RMCMD_TALKER", "RMCMD_OPEN", "RMCMD_CLOSE", "rmcmd", "Link"]
     it_names = ["DEFAULT_WINDOW_S", "STILL_MAX", "MOVING_MIN", "wrapped_span",
                 "AxisWindow"]
     # ping1d's module-level names are all prefixed (ping_build, PingLink,
@@ -373,6 +383,8 @@ def build():
         "           SUBNET=SUBNET, KNOWN_SUBNETS=KNOWN_SUBNETS,\n"
         "           HOST_IP=HOST_IP, node_ips=node_ips,\n"
         "           find_node=find_node, resolve_node=resolve_node,\n"
+        "           IMAGE_RATE=IMAGE_RATE, node_image=node_image,\n"
+        "           node_image_fault=node_image_fault,\n"
         "           node_ip=node_ip, node_stream_port=node_stream_port)\n"
         "gdat2 = _NS(TALKER=TALKER, N_RAW=N_RAW, BUOYS=BUOYS, IMUS=IMUS,\n"
         "            ALTIMETERS=ALTIMETERS, buoy_ip=buoy_ip,\n"
@@ -382,6 +394,8 @@ def build():
         "            DEFAULT_PORT=DEFAULT_PORT, FIELDS=FIELDS,\n"
         "            PLAUSIBLE=PLAUSIBLE, implausible=implausible,\n"
         "            dio_text=dio_text, parse=parse, build=build,\n"
+        "            rmcmd=rmcmd, RMCMD_OPEN=RMCMD_OPEN,\n"
+        "            RMCMD_CLOSE=RMCMD_CLOSE,\n"
         "            f32_bits=f32_bits, bits_f32=bits_f32, Link=Link)\n"
         "imu_test = _NS(AxisWindow=AxisWindow, wrapped_span=wrapped_span)\n"
         "ping1d = _NS(PingLink=PingLink, PING_PORT=PING_PORT,\n"
